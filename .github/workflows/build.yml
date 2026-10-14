@@ -1,0 +1,62 @@
+name: Build IPA
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build NightLapse
+        id: b1
+        continue-on-error: true
+        shell: bash
+        run: |
+          xcodebuild -project NightLapse.xcodeproj -scheme NightLapse \
+            -configuration Release -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee build1.log
+
+      - name: Package IPA
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p out
+          APP="build/Build/Products/Release-iphoneos/NightLapse.app"
+          if [ -d "$APP" ]; then
+            rm -rf Payload
+            mkdir Payload
+            cp -R "$APP" Payload/
+            zip -qr out/NightLapse.ipa Payload
+          fi
+          ls -la out
+
+      - name: Errors summary
+        if: always()
+        shell: bash
+        run: |
+          echo '### Ошибки сборки (если есть)' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -h "error:" build1.log 2>/dev/null | sort -u | head -40 >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ipa
+          path: out/*.ipa
+
+      - name: Fail if build failed
+        if: steps.b1.outcome == 'failure'
+        run: exit 1
