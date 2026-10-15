@@ -113,7 +113,11 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     // Выдержка не запоминается: при каждом запуске стоит значение по умолчанию
     static let defaultExposure: Double = 1
     /// Шаги выдержки: доли секунды, потом целые секунды
-    static let exposureSteps: [Double] = [1.0 / 30, 1.0 / 15, 1.0 / 8, 1.0 / 4, 1.0 / 2] + (1...120).map { Double($0) }
+    static let exposureSteps: [Double] = {
+        let fractions: [Double] = [0.0333333, 0.0666667, 0.125, 0.25, 0.5]
+        let whole: [Double] = (1...120).map { (i: Int) -> Double in Double(i) }
+        return fractions + whole
+    }()
     @Published var exposureSeconds: Double
 
     // Остальные настройки запоминаются между запусками
