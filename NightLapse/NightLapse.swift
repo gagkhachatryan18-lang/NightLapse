@@ -79,6 +79,7 @@ struct LapseConfig {
 }
 
 struct CamSettings {
+    var dur: Double
     var iso: Float
     var temp: Float
     var focus: Float
@@ -109,8 +110,13 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     private let ud = UserDefaults.standard
     private var device: AVCaptureDevice?
 
-    // Настройки (запоминаются между запусками)
-    @Published var exposureSeconds: Double { didSet { ud.set(exposureSeconds, forKey: "exp") } }
+    // Выдержка не запоминается: при каждом запуске стоит значение по умолчанию
+    static let defaultExposure: Double = 1
+    /// Шаги выдержки: доли секунды, потом целые секунды
+    static let exposureSteps: [Double] = [1.0 / 30, 1.0 / 15, 1.0 / 8, 1.0 / 4, 1.0 / 2] + (1...120).map { Double($0) }
+    @Published var exposureSeconds: Double
+
+    // Остальные настройки запоминаются между запусками
     @Published var pauseSeconds: Double { didSet { ud.set(pauseSeconds, forKey: "pause") } }
     @Published var iso: Float { didSet { ud.set(iso, forKey: "iso") } }
     @Published var wbTemp: Float { didSet { ud.set(wbTemp, forKey: "wb") } }
@@ -134,7 +140,11 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     @Published var availableLenses: [LensKind] = [.wide]
     @Published var minISO: Float = 50
     @Published var maxISO: Float = 3200
-    @Published var subExposure: Double = 1
+    @Published var subExposure: Double = 1   // максимальная выдержка сенсора
+    @Published var minSensorExposure: Double = 0.0001
+
+    /// Реальная выдержка одного подкадра: короче максимума сенсора, если выдержка кадра меньше
+    var sensorExposure: Double { min(max(exposureSeconds, minSensorExposure), max(subExposure, 0.0001)) }
 
     // Состояние
     @Published var phase: Phase = .idle
@@ -151,7 +161,17 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     @Published var testCount = 0
     @Published var pauses = 0
 
-    var subFramesPerFrame: Int { max(1, Int((exposureSeconds / max(subExposure, 0.01)).rounded())) }
+    var subFramesPerFrame: Int { max(1, Int((exposureSeconds / max(sensorExposure, 0.0001)).rounded())) }
+
+    func exposureUp() {
+        if let n = Self.exposureSteps.first(where: { $0 > exposureSeconds + 0.0001 }) { exposureSeconds = n }
+        applyCamera()
+    }
+
+    func exposureDown() {
+        if let n = Self.exposureSteps.last(where: { $0 < exposureSeconds - 0.0001 }) { exposureSeconds = n }
+        applyCamera()
+    }
 
     // Только main
     private var configured = false
@@ -168,6 +188,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     private var suspended = false
     private var cfg = LapseConfig()
     private var curISO: Float = 800
+    private var curDur: CMTime = CMTime(seconds: 1, preferredTimescale: 1_000_000)
     private var warmupLeft = 0
     private var calibLeft = 0
     private var calibSkip = 0
@@ -189,7 +210,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
     override init() {
         let d = UserDefaults.standard
-        exposureSeconds = d.dbl("exp", 30)
+        exposureSeconds = LapseEngine.defaultExposure
         pauseSeconds = d.dbl("pause", 2)
         iso = Float(d.dbl("iso", 800))
         wbTemp = Float(d.dbl("wb", 4500))
@@ -263,7 +284,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     }
 
     private func currentSettings() -> CamSettings {
-        CamSettings(iso: iso, temp: wbTemp, focus: focus, wbAuto: wbAuto, focusAuto: focusAuto)
+        CamSettings(dur: exposureSeconds, iso: iso, temp: wbTemp, focus: focus, wbAuto: wbAuto, focusAuto: focusAuto)
     }
 
     func changeCamera() {
@@ -299,7 +320,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
     private func warmupFrames() -> Int {
         guard focusAuto else { return 2 }
-        return min(12, max(3, Int((3.0 / max(subExposure, 0.05)).rounded(.up))))
+        return min(12, max(3, Int((3.0 / max(sensorExposure, 0.05)).rounded(.up))))
     }
 
     func testFrame() {
@@ -566,6 +587,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
         let fmt = dev.activeFormat
         let sub = CMTimeGetSeconds(fmt.maxExposureDuration)
+        let subMin = CMTimeGetSeconds(fmt.minExposureDuration)
         let lo = fmt.minISO, hi = fmt.maxISO
         appliedFocusAuto = nil
         applyOnQueue(settings, forceFocus: true)
@@ -575,6 +597,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             self.maxISO = hi
             if self.iso < lo || self.iso > hi { self.iso = min(max(self.iso, lo), hi) }
             self.subExposure = sub
+            self.minSensorExposure = subMin
         }
     }
 
@@ -584,8 +607,13 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         defer { dev.unlockForConfiguration() }
         let fmt = dev.activeFormat
 
+        // Выдержка сенсора: максимум формата, или короче, если выдержка кадра меньше секунды
+        let lo = CMTimeGetSeconds(fmt.minExposureDuration)
+        let hi = CMTimeGetSeconds(fmt.maxExposureDuration)
+        let dur = CMTime(seconds: min(max(s.dur, lo), hi), preferredTimescale: 1_000_000)
+        curDur = dur
         if dev.isExposureModeSupported(.custom) {
-            dev.setExposureModeCustom(duration: fmt.maxExposureDuration,
+            dev.setExposureModeCustom(duration: dur,
                                       iso: min(max(s.iso, fmt.minISO), fmt.maxISO),
                                       completionHandler: nil)
         }
@@ -663,7 +691,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         curISO = v
         if let dev = device, (try? dev.lockForConfiguration()) != nil {
             if dev.isExposureModeSupported(.custom) {
-                dev.setExposureModeCustom(duration: dev.activeFormat.maxExposureDuration, iso: v, completionHandler: nil)
+                dev.setExposureModeCustom(duration: curDur, iso: v, completionHandler: nil)
             }
             dev.unlockForConfiguration()
         }
@@ -1071,7 +1099,16 @@ struct ContentView: View {
     private var planLine: String {
         let interval = e.exposureSeconds + e.pauseSeconds
         let minutes = Double(e.fps * 10) * interval / 60
-        return "Кадр каждые \(Int(interval)) с · 10 с видео ≈ \(Int(minutes.rounded())) мин съёмки"
+        let every = interval < 10 ? String(format: "%.1f с", interval) : "\(Int(interval)) с"
+        return "Кадр каждые \(every) · 10 с видео ≈ \(String(format: minutes < 10 ? "%.1f" : "%.0f", minutes)) мин съёмки"
+    }
+
+    /// 1/8 с, 0.5 с, 17 с
+    private func expText(_ v: Double) -> String {
+        if v >= 1 { return v == v.rounded() ? "\(Int(v)) с" : String(format: "%.1f с", v) }
+        let d = (1 / v).rounded()
+        if abs(1 / d - v) < 0.0005 { return "1/\(Int(d)) с" }
+        return String(format: "%.3f с", v)
     }
 
     private var settings: some View {
@@ -1096,8 +1133,9 @@ struct ContentView: View {
             }
 
             Section("Экспозиция") {
-                Stepper("Выдержка кадра: \(Int(e.exposureSeconds)) с", value: $e.exposureSeconds, in: 1...120, step: 1)
-                Text("Сенсор \(String(format: "%.2f", e.subExposure)) с × \(e.subFramesPerFrame) подкадров")
+                Stepper("Выдержка кадра: \(expText(e.exposureSeconds))",
+                        onIncrement: { e.exposureUp() }, onDecrement: { e.exposureDown() })
+                Text("Сенсор \(expText(e.sensorExposure)) × \(e.subFramesPerFrame) подкадров")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Toggle("Авто ISO", isOn: $e.isoAuto)
@@ -1187,15 +1225,21 @@ struct ContentView: View {
             case .idle:
                 Button { onSwitch() } label: {
                     Label("Кадр дня", systemImage: "photo.on.rectangle.angled")
+                        .lineLimit(1)
+                        .fixedSize()
                 }
                 .buttonStyle(.bordered)
                 .tint(.orange)
                 Button { e.testFrame() } label: {
                     Label("Тест", systemImage: "camera.aperture")
+                        .lineLimit(1)
+                        .fixedSize()
                 }
                 .buttonStyle(.bordered)
                 Button { e.start() } label: {
-                    Label("Старт", systemImage: "record.circle").frame(maxWidth: .infinity)
+                    Label("Старт", systemImage: "record.circle")
+                        .lineLimit(1)
+                        .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
             case .test, .waiting:
