@@ -12,6 +12,7 @@ import ImageIO
 import Photos
 import Vision
 import UserNotifications
+import PhotosUI
 
 
 // MARK: - Типы
@@ -48,9 +49,15 @@ enum OverlayMode: String, CaseIterable, Identifiable {
 }
 
 enum TargetMode: String, CaseIterable, Identifiable {
-    case previous, first
+    case previous, first, gallery
     var id: String { rawValue }
-    var title: String { self == .previous ? "Предыдущий" : "Эталон" }
+    var title: String {
+        switch self {
+        case .previous: return "Предыдущий"
+        case .first: return "Эталон"
+        case .gallery: return "Из галереи"
+        }
+    }
 }
 
 /// Положение телефона в момент съёмки
@@ -156,6 +163,8 @@ final class Store: ObservableObject {
     }
     @Published var photos: [Photo] = []
     @Published var meta = ProjectMeta()
+    /// Меняется, когда выбрано новое фото-призрак из галереи
+    @Published var ghostVersion = 0
 
     private let root: URL
 
@@ -172,6 +181,21 @@ final class Store: ObservableObject {
     var dir: URL { root.appendingPathComponent(current, isDirectory: true) }
 
     var refPhoto: Photo? { photos.first { $0.name == meta.ref } ?? photos.first }
+
+    /// Фото из галереи, которое показывается призраком (своё у каждого проекта)
+    var ghostURL: URL { dir.appendingPathComponent("ghost.img") }
+    var hasGhost: Bool { FileManager.default.fileExists(atPath: ghostURL.path) }
+
+    func setGhost(_ data: Data) -> Bool {
+        do { try data.write(to: ghostURL) } catch { return false }
+        ghostVersion += 1
+        return true
+    }
+
+    func removeGhost() {
+        try? FileManager.default.removeItem(at: ghostURL)
+        ghostVersion += 1
+    }
 
     func target(_ mode: TargetMode) -> Photo? {
         mode == .previous ? photos.last : refPhoto
@@ -256,9 +280,10 @@ final class DailyCamera: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
     private weak var previewLayer: AVCaptureVideoPreviewLayer?
     private var ext = "heic"
 
-    @Published var lens: Lens = .wide
+    // Объектив и фокус запоминаются между запусками
+    @Published var lens: Lens = Lens(rawValue: UserDefaults.standard.string(forKey: "dfLens") ?? "") ?? .wide
     @Published var available: [Lens] = [.wide]
-    @Published var infinityFocus = false
+    @Published var infinityFocus = UserDefaults.standard.bool(forKey: "dfInfinity")
     @Published var busy = false
 
     var onPhoto: ((Data, String) -> Void)?
@@ -282,6 +307,7 @@ final class DailyCamera: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
 
     func select(_ l: Lens) {
         lens = l
+        UserDefaults.standard.set(l.rawValue, forKey: "dfLens")
         let inf = infinityFocus
         q.async {
             guard let dev = AVCaptureDevice.default(l.type, for: .video, position: .back)
@@ -305,6 +331,7 @@ final class DailyCamera: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
 
     func setInfinity(_ on: Bool) {
         infinityFocus = on
+        UserDefaults.standard.set(on, forKey: "dfInfinity")
         q.async { self.applyFocus(on) }
     }
 
@@ -482,9 +509,10 @@ struct CameraView: View {
     @State private var pending: Shot?
     @State private var newProject = false
     @State private var newName = ""
+    @State private var pickedItem: PhotosPickerItem?
 
     private var overlayKey: String {
-        "\(store.current)|\(mode.rawValue)|\(target.rawValue)|\(store.photos.count)|\(store.meta.ref ?? "")"
+        "\(store.current)|\(mode.rawValue)|\(target.rawValue)|\(store.photos.count)|\(store.meta.ref ?? "")|\(store.ghostVersion)"
     }
 
     var body: some View {
@@ -509,6 +537,7 @@ struct CameraView: View {
             cam.onPhoto = { data, ext in handle(data, ext) }
         }
         .task(id: overlayKey) { await refreshOverlay() }
+        .onChange(of: pickedItem) { loadPicked() }
         .alert("Новый проект", isPresented: $newProject) {
             TextField("Название", text: $newName)
             Button("Создать") {
@@ -561,7 +590,7 @@ struct CameraView: View {
 
     /// Насколько положение телефона отличается от того, при котором снят выбранный кадр
     private var hud: (tilt: Double, head: Double)? {
-        guard motion.ok, let p = store.target(target), let s = store.meta.shots[p.name] else { return nil }
+        guard motion.ok, target != .gallery, let p = store.target(target), let s = store.meta.shots[p.name] else { return nil }
         let t = qAngle(motion.q, s.q)
         let g = gAngle(motion.g, s.g)
         return (g, sqrt(max(t * t - g * g, 0)))
@@ -605,6 +634,23 @@ struct CameraView: View {
                     ForEach(TargetMode.allCases) { Text($0.title).tag($0) }
                 }
                 .pickerStyle(.segmented)
+                if target == .gallery {
+                    HStack {
+                        PhotosPicker(selection: $pickedItem, matching: .images) {
+                            Label(store.hasGhost ? "Другое фото" : "Выбрать фото", systemImage: "photo.on.rectangle")
+                                .lineLimit(1)
+                        }
+                        .buttonStyle(.bordered)
+                        if store.hasGhost {
+                            Button(role: .destructive) { store.removeGhost() } label: {
+                                Image(systemName: "trash")
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                    }
+                    .font(.footnote)
+                    .id(store.ghostVersion)
+                }
             }
 
             Picker("Объектив", selection: lensBinding) {
@@ -670,16 +716,35 @@ struct CameraView: View {
     // MARK: Логика
 
     @MainActor private func refreshOverlay() async {
-        guard mode != .off, let p = store.target(target) else {
+        let source: URL?
+        if target == .gallery {
+            source = store.hasGhost ? store.ghostURL : nil
+        } else {
+            source = store.target(target)?.url
+        }
+        guard mode != .off, let url = source else {
             overlayImage = nil
             return
         }
-        let url = p.url
         let m = mode
         let img = await Task.detached(priority: .userInitiated) {
             m == .edges ? OverlayMaker.edges(url) : OverlayMaker.ghost(url)
         }.value
         overlayImage = img
+    }
+
+    /// Фото из галереи становится призраком текущего проекта
+    private func loadPicked() {
+        guard let item = pickedItem else { return }
+        Task { @MainActor in
+            let data = try? await item.loadTransferable(type: Data.self)
+            pickedItem = nil
+            if let d = data, UIImage(data: d) != nil, store.setGhost(d) {
+                flash("Призрак из галереи готов")
+            } else {
+                flash("Не удалось открыть фото")
+            }
+        }
     }
 
     private func handle(_ data: Data, _ ext: String) {
