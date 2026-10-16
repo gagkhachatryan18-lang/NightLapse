@@ -362,6 +362,35 @@ final class DailyCamera: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
         }
     }
 
+    /// Яркость, как солнце в Камере iPhone (EV, сбрасывается при запуске)
+    @Published var bias: Float = 0
+
+    /// Касание кадра: фокус и замер яркости в этой точке
+    func focusTap(_ p: CGPoint) {
+        if infinityFocus {
+            infinityFocus = false
+            UserDefaults.standard.set(false, forKey: "dfInfinity")
+        }
+        q.async {
+            guard let dev = self.device, (try? dev.lockForConfiguration()) != nil else { return }
+            defer { dev.unlockForConfiguration() }
+            if dev.isFocusPointOfInterestSupported { dev.focusPointOfInterest = p }
+            if dev.isFocusModeSupported(.autoFocus) { dev.focusMode = .autoFocus }
+            if dev.isExposurePointOfInterestSupported { dev.exposurePointOfInterest = p }
+            if dev.isExposureModeSupported(.continuousAutoExposure) { dev.exposureMode = .continuousAutoExposure }
+        }
+    }
+
+    func nudgeBias(_ delta: Float) {
+        bias = ((min(max(bias + delta, -2), 2)) * 10).rounded() / 10
+        let b = bias
+        q.async {
+            guard let dev = self.device, (try? dev.lockForConfiguration()) != nil else { return }
+            defer { dev.unlockForConfiguration() }
+            dev.setExposureTargetBias(min(max(b, dev.minExposureTargetBias), dev.maxExposureTargetBias), completionHandler: nil)
+        }
+    }
+
     func setInfinity(_ on: Bool) {
         infinityFocus = on
         UserDefaults.standard.set(on, forKey: "dfInfinity")
@@ -475,10 +504,44 @@ final class Motion: ObservableObject {
 struct DFPreview: UIViewRepresentable {
     let cam: DailyCamera
 
+    var onTap: (CGPoint, CGPoint) -> Void = { _, _ in }
+    var onPan: (CGFloat) -> Void = { _ in }
+
     final class PView: UIView {
         weak var cam: DailyCamera?
+        var onTap: ((CGPoint, CGPoint) -> Void)?
+        var onPan: ((CGFloat) -> Void)?
+        private var lastY: CGFloat = 0
         override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
         var pl: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
+
+        override init(frame: CGRect) {
+            super.init(frame: frame)
+            addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(tapped(_:))))
+            let pan = UIPanGestureRecognizer(target: self, action: #selector(panned(_:)))
+            pan.maximumNumberOfTouches = 1
+            addGestureRecognizer(pan)
+        }
+
+        required init?(coder: NSCoder) {
+            fatalError("init(coder:) has not been implemented")
+        }
+
+        @objc func tapped(_ g: UITapGestureRecognizer) {
+            let v = g.location(in: self)
+            onTap?(pl.captureDevicePointConverted(fromLayerPoint: v), v)
+        }
+
+        @objc func panned(_ g: UIPanGestureRecognizer) {
+            let y = g.translation(in: self).y
+            switch g.state {
+            case .began: lastY = y
+            case .changed:
+                onPan?(y - lastY)
+                lastY = y
+            default: break
+            }
+        }
 
         override func layoutSubviews() {
             super.layoutSubviews()
@@ -489,6 +552,8 @@ struct DFPreview: UIViewRepresentable {
     func makeUIView(context: Context) -> PView {
         let v = PView()
         v.cam = cam
+        v.onTap = onTap
+        v.onPan = onPan
         v.pl.session = cam.session
         v.pl.videoGravity = .resizeAspect
         v.backgroundColor = .black
@@ -496,7 +561,10 @@ struct DFPreview: UIViewRepresentable {
         return v
     }
 
-    func updateUIView(_ uiView: PView, context: Context) {}
+    func updateUIView(_ uiView: PView, context: Context) {
+        uiView.onTap = onTap
+        uiView.onPan = onPan
+    }
 }
 
 struct GridLines: Shape {
@@ -568,6 +636,8 @@ struct CameraView: View {
     @State private var newProject = false
     @State private var newName = ""
     @State private var pickedItem: PhotosPickerItem?
+    @State private var focusMark: CGPoint?
+    @State private var markTick = 0
 
     private var overlayKey: String {
         "\(store.current)|\(mode.rawValue)|\(target.rawValue)|\(store.photos.count)|\(store.meta.ref ?? "")|\(store.ghostVersion)"
@@ -612,9 +682,19 @@ struct CameraView: View {
 
     private var viewfinder: some View {
         ZStack {
-            DFPreview(cam: cam)
+            DFPreview(cam: cam,
+                      onTap: { dp, vp in
+                          cam.focusTap(dp)
+                          focusMark = vp
+                          keepMark()
+                      },
+                      onPan: { dy in
+                          cam.nudgeBias(Float(-dy) / 120)
+                          keepMark()
+                      })
             // Призрак и сетка ложатся ровно на картинку камеры (кадр 4:3), фото другой формы обрезается по центру
             overlayLayer
+            focusLayer
             if mode != .off, let img = overlayImage,
                (img.size.width > img.size.height) == cam.previewPortrait {
                 VStack {
@@ -649,6 +729,35 @@ struct CameraView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.black)
         .clipShape(RoundedRectangle(cornerRadius: 12))
+    }
+
+    /// Жёлтая рамка фокуса и солнце яркости
+    @ViewBuilder private var focusLayer: some View {
+        if let m = focusMark {
+            GeometryReader { _ in
+                ZStack {
+                    RoundedRectangle(cornerRadius: 3)
+                        .stroke(Color.yellow, lineWidth: 1.5)
+                        .frame(width: 72, height: 72)
+                        .position(m)
+                    VStack(spacing: 2) {
+                        Image(systemName: "sun.max.fill")
+                        Text(String(format: "%+.1f", cam.bias)).font(.caption2.monospacedDigit())
+                    }
+                    .foregroundStyle(Color.yellow)
+                    .position(x: m.x + 58, y: m.y)
+                }
+            }
+            .allowsHitTesting(false)
+        }
+    }
+
+    private func keepMark() {
+        markTick += 1
+        let t = markTick
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+            if markTick == t { focusMark = nil }
+        }
     }
 
     /// Призрак и сетка ровно на месте картинки камеры
