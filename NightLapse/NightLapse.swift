@@ -64,6 +64,7 @@ enum Phase { case idle, test, waiting, recording, paused, saving }
 
 struct LapseConfig {
     var subNeeded = 30
+    var exposure = 1.0
     var pause = 2.0
     var lighten = false
     var gain: Float = 1
@@ -80,6 +81,7 @@ struct LapseConfig {
 
 struct CamSettings {
     var dur: Double
+    var ev: Float
     var iso: Float
     var temp: Float
     var focus: Float
@@ -202,6 +204,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     private var tmp: [Float] = []
     private var width = 0, height = 0
     private var subCount = 0
+    private var accStart: CMTime = .invalid
     private var inPause = false
     private var phaseStart: CMTime = .invalid
     private var writer: AVAssetWriter?
@@ -288,7 +291,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     }
 
     private func currentSettings() -> CamSettings {
-        CamSettings(dur: exposureSeconds, iso: iso, temp: wbTemp, focus: focus, wbAuto: wbAuto, focusAuto: focusAuto)
+        CamSettings(dur: exposureSeconds, ev: Float(evComp), iso: iso, temp: wbTemp, focus: focus, wbAuto: wbAuto, focusAuto: focusAuto)
     }
 
     func changeCamera() {
@@ -335,10 +338,10 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         subDone = 0
         status = c.isoAuto ? "Подбор ISO..." : "Тестовый кадр..."
         UIApplication.shared.isIdleTimerDisabled = true
-        applyCamera(forceFocus: focusAuto)
+        let s = currentSettings()
+        let ff = focusAuto
         queue.async {
             self.cfg = c
-            self.curISO = c.iso
             self.subCount = 0
             self.inPause = false
             self.suspended = false
@@ -346,6 +349,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             self.calibLeft = c.isoAuto ? 4 : 0
             self.calibSkip = 0
             self.mode = .test
+            self.beginCaptureExposure(s, forceFocus: ff)
         }
     }
 
@@ -378,10 +382,10 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         phase = .recording
         status = c.isoAuto ? "Подбор ISO..." : "Съёмка"
         UIApplication.shared.isIdleTimerDisabled = true
-        applyCamera(forceFocus: focusAuto)
+        let s = currentSettings()
+        let ff = focusAuto
         queue.async {
             self.cfg = c
-            self.curISO = c.iso
             self.subCount = 0
             self.inPause = false
             self.suspended = false
@@ -393,6 +397,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             self.videoIndex = 0
             self.outIndex = 0
             self.mode = .record
+            self.beginCaptureExposure(s, forceFocus: ff)
         }
     }
 
@@ -411,7 +416,11 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             startAt = nil
             finished("Отменено")
         case .test:
-            queue.async { self.mode = .off }
+            let s = currentSettings()
+            queue.async {
+                self.mode = .off
+                self.applyOnQueue(s)
+            }
             subDone = 0
             finished("Отменено")
         default:
@@ -507,7 +516,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     }
 
     private func makeConfig(name: String) -> LapseConfig {
-        LapseConfig(subNeeded: subFramesPerFrame, pause: pauseSeconds, lighten: lighten,
+        LapseConfig(subNeeded: subFramesPerFrame, exposure: exposureSeconds, pause: pauseSeconds, lighten: lighten,
                     gain: isoAuto ? 1 : gain, fps: Int32(fps), vertical: vertical,
                     saveVideo: saveVideo, saveFrames: saveFrames, name: name,
                     warmup: warmupFrames(), isoAuto: isoAuto, ev: Float(evComp), iso: iso)
@@ -611,15 +620,23 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         defer { dev.unlockForConfiguration() }
         let fmt = dev.activeFormat
 
-        // Выдержка сенсора: максимум формата, или короче, если выдержка кадра меньше секунды
-        let lo = CMTimeGetSeconds(fmt.minExposureDuration)
-        let hi = CMTimeGetSeconds(fmt.maxExposureDuration)
-        let dur = CMTime(seconds: min(max(s.dur, lo), hi), preferredTimescale: 1_000_000)
-        curDur = dur
-        if dev.isExposureModeSupported(.custom) {
-            dev.setExposureModeCustom(duration: dur,
-                                      iso: min(max(s.iso, fmt.minISO), fmt.maxISO),
+        if mode == .off {
+            // До старта превью с автоэкспозицией, чтобы было видно, что в кадре. Коррекция EV видна сразу
+            if dev.isExposureModeSupported(.continuousAutoExposure) {
+                dev.exposureMode = .continuousAutoExposure
+            }
+            dev.setExposureTargetBias(min(max(s.ev, dev.minExposureTargetBias), dev.maxExposureTargetBias),
                                       completionHandler: nil)
+        } else if dev.isExposureModeSupported(.custom) {
+            // Во время съёмки: ручная выдержка сенсора. В авто ISO выдержку и ISO ведёт подстройка
+            if !cfg.isoAuto {
+                let lo = CMTimeGetSeconds(fmt.minExposureDuration)
+                let hi = CMTimeGetSeconds(fmt.maxExposureDuration)
+                curDur = CMTime(seconds: min(max(s.dur, lo), hi), preferredTimescale: 1_000_000)
+                curISO = min(max(s.iso, fmt.minISO), fmt.maxISO)
+            }
+            dev.setExposureTargetBias(0, completionHandler: nil)
+            dev.setExposureModeCustom(duration: curDur, iso: curISO, completionHandler: nil)
         }
 
         // Фокус трогаем только при изменении, иначе автофокус будет сканировать при каждом движении ползунка
@@ -653,6 +670,15 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         }
     }
 
+    /// Переход от превью к съёмке. В авто ISO стартуем с яркости, которую уже подобрала автоэкспозиция превью
+    private func beginCaptureExposure(_ s: CamSettings, forceFocus: Bool) {
+        if cfg.isoAuto, let dev = device {
+            let light = Double(dev.iso) * max(CMTimeGetSeconds(dev.exposureDuration), 0.00001)
+            setExposure(light: light)
+        }
+        applyOnQueue(s, forceFocus: forceFocus)
+    }
+
     // MARK: Авто ISO (queue)
 
     private func meanLuma(_ pb: CVPixelBuffer) -> Float {
@@ -679,27 +705,40 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         return cnt > 0 ? Float(sum / cnt) : 0
     }
 
-    /// Целевая яркость: 118 (средне-серый) со сдвигом на коррекцию в EV. Связь ISO и яркости считаем в линейном свете (гамма 2.2)
-    private func nextISO(mean: Float, limit: Double) -> (iso: Float, factor: Double) {
-        guard let dev = device else { return (curISO, 1) }
+    /// Сколько света нужно добавить или убрать. Целевая яркость: 118 (средне-серый) со сдвигом на коррекцию в EV.
+    /// Считаем в линейном свете (гамма 2.2)
+    private func lightFactor(mean: Float, limit: Double) -> Double {
         let target = 118.0 * pow(pow(2.0, Double(cfg.ev)), 1.0 / 2.2)
-        var f = pow(target / max(Double(mean), 1.0), 2.2)
-        f = min(max(f, 1.0 / limit), limit)
-        let fmt = dev.activeFormat
-        let cur = max(curISO, 1)
-        let n = min(max(Float(Double(cur) * f), fmt.minISO), fmt.maxISO)
-        return (n, Double(n / cur))
+        let f = pow(target / max(Double(mean), 1.0), 2.2)
+        return min(max(f, 1.0 / limit), limit)
     }
 
-    private func applyISO(_ v: Float) {
-        curISO = v
-        if let dev = device, (try? dev.lockForConfiguration()) != nil {
+    /// Свет = ISO × выдержка. Сначала самая длинная выдержка (до выдержки кадра) и самое низкое ISO.
+    /// Если даже на минимальном ISO слишком светло, выдержка сенсора укорачивается.
+    /// Возвращает, во сколько раз реально изменился свет
+    @discardableResult
+    private func setExposure(light: Double) -> Double {
+        guard let dev = device else { return 1 }
+        let fmt = dev.activeFormat
+        let lo = CMTimeGetSeconds(fmt.minExposureDuration)
+        let hi = min(CMTimeGetSeconds(fmt.maxExposureDuration), max(cfg.exposure, lo))
+        let old = Double(curISO) * CMTimeGetSeconds(curDur)
+        let d = min(hi, max(lo, light / Double(fmt.minISO)))
+        let i = min(max(Float(light / d), fmt.minISO), fmt.maxISO)
+        curDur = CMTime(seconds: d, preferredTimescale: 1_000_000)
+        curISO = i
+        if (try? dev.lockForConfiguration()) != nil {
             if dev.isExposureModeSupported(.custom) {
-                dev.setExposureModeCustom(duration: curDur, iso: v, completionHandler: nil)
+                dev.setExposureModeCustom(duration: curDur, iso: i, completionHandler: nil)
             }
             dev.unlockForConfiguration()
         }
-        DispatchQueue.main.async { self.iso = v }
+        DispatchQueue.main.async { self.iso = i }
+        return old > 0 ? (Double(i) * d) / old : 1
+    }
+
+    private func currentLight() -> Double {
+        Double(curISO) * CMTimeGetSeconds(curDur)
     }
 
     /// Быстрая подстройка в начале: меряем яркость сырого подкадра и подбираем ISO за несколько шагов
@@ -708,12 +747,11 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             calibSkip -= 1
             return
         }
-        let r = nextISO(mean: meanLuma(pb), limit: 16)
+        let f = lightFactor(mean: meanLuma(pb), limit: 16)
         calibLeft -= 1
-        if abs(r.factor - 1) < 0.08 {
+        if abs(f - 1) < 0.08 || abs(setExposure(light: currentLight() * f) - 1) < 0.02 {
             calibLeft = 0
         } else {
-            applyISO(r.iso)
             calibSkip = 2
         }
         if calibLeft == 0 {
@@ -727,9 +765,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
     /// После каждого кадра: плавная подстройка, не больше 1/3 EV за кадр, чтобы не было скачков яркости
     private func autoISOStep(mean: Float) {
-        let r = nextISO(mean: mean, limit: 1.26)
-        if abs(r.factor - 1) > 0.02 {
-            applyISO(r.iso)
+        let f = lightFactor(mean: mean, limit: 1.26)
+        if abs(f - 1) > 0.02, abs(setExposure(light: currentLight() * f) - 1) > 0.005 {
             warmupLeft = max(warmupLeft, 1)
         }
     }
@@ -751,11 +788,16 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             calibrate(pb)
             return
         }
+        if subCount == 0 { accStart = t }
         accumulate(pb)
         subCount += 1
-        let sc = subCount
-        DispatchQueue.main.async { self.subDone = sc }
-        guard subCount >= cfg.subNeeded else { return }
+        // Кадр готов, когда набрана выдержка кадра (подкадры могут быть короче, если днём выдержка укорочена)
+        let sub = CMTimeGetSeconds(curDur)
+        let got = CMTimeGetSeconds(t - accStart) + sub
+        let total = cfg.subNeeded
+        let done = min(total, Int((got / max(cfg.exposure, 0.001) * Double(total)).rounded(.down)))
+        DispatchQueue.main.async { self.subDone = done }
+        guard got >= cfg.exposure - sub * 0.5 else { return }
 
         let n = subCount
         subCount = 0
@@ -766,6 +808,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
         if mode == .test {
             mode = .off
+            DispatchQueue.main.async { self.applyCamera() }
             let img = frame.flatMap { makeThumb($0, maxSide: 2000) }
             let note = cfg.isoAuto ? "Тест готов. ISO подобран: \(Int(curISO))" : "Тест готов: проверь яркость и резкость"
             DispatchQueue.main.async {
@@ -929,6 +972,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
     private func finishOnQueue() {
         mode = .off
+        DispatchQueue.main.async { self.applyCamera() }
         suspended = false
         let frames = outIndex
         let framesSaved = framesDir != nil
@@ -1046,6 +1090,7 @@ struct ContentView: View {
         .onChange(of: e.uhd) { e.changeCamera() }
         .onChange(of: e.focusAuto) { e.focusModeChanged() }
         .onChange(of: e.wbAuto) { e.applyCamera() }
+        .onChange(of: e.evComp) { e.applyCamera() }
         .sheet(isPresented: $showTest) { testSheet }
     }
 
@@ -1228,9 +1273,8 @@ struct ContentView: View {
             switch e.phase {
             case .idle:
                 Button { onSwitch() } label: {
-                    Label("Кадр дня", systemImage: "photo.on.rectangle.angled")
-                        .lineLimit(1)
-                        .fixedSize()
+                    Image(systemName: "photo.on.rectangle.angled")
+                        .accessibilityLabel("Кадр дня")
                 }
                 .buttonStyle(.bordered)
                 .tint(.orange)
