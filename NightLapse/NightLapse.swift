@@ -260,6 +260,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     @Published var coolBreaks: Bool { didSet { ud.set(coolBreaks, forKey: "coolBreaks") } }
     @Published var cooling = false
     @Published var coolCount = 0
+    /// Сколько секунд сейчас добавлено к паузе из-за нагрева
+    @Published var coolExtra: Double = 0
     @Published var isoAuto: Bool { didSet { ud.set(isoAuto, forKey: "isoAuto") } }
     @Published var wbAuto: Bool { didSet { ud.set(wbAuto, forKey: "wbAuto") } }
     @Published var focusAuto: Bool { didSet { ud.set(focusAuto, forKey: "focusAuto") } }
@@ -332,6 +334,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     private var subCount = 0
     private var accStart: CMTime = .invalid
     private var inPause = false
+    private var extraPause: Double = 0
     private var phaseStart: CMTime = .invalid
     private var writer: AVAssetWriter?
     private var writerInput: AVAssetWriterInput?
@@ -596,6 +599,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         elapsed = 0
         pauses = 0
         coolCount = 0
+        cooling = false
+        setExtra(0)
         let now = Date()
         recStart = now
         autoStopAt = autoStopMin > 0 ? now.addingTimeInterval(Double(autoStopMin) * 60) : nil
@@ -627,8 +632,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         guard phase == .recording || phase == .paused else { return }
         if cooling {
             cooling = false
-            coolStart = nil
-            queue.async { if !self.session.isRunning { self.session.startRunning() } }
+            setExtra(0)
         }
         phase = .saving
         status = "Сохраняю..."
@@ -707,7 +711,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
     /// Съёмка продолжается сама, когда приложение снова на экране и камера свободна
     private func tryResume() {
-        guard phase == .paused, !inBackground, !cooling, !session.isInterrupted else { return }
+        guard phase == .paused, !inBackground, !session.isInterrupted else { return }
         phase = .recording
         status = isoAuto ? "Продолжаю: подбор ISO..." : "Съёмка продолжена"
         subDone = 0
@@ -775,59 +779,39 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
     // MARK: Охлаждение (main)
 
-    private var coolStart: Date?
-
-    /// Сильный нагрев: камера выключается между кадрами, пока телефон не остынет.
-    /// Потом съёмка продолжается с той же паузой и настройками, что выставлены
+    /// Сильный нагрев: к паузе между кадрами добавляется время, пока телефон не остынет.
+    /// Камера при этом не выключается, кадры просто не обрабатываются. Остыл - пауза снова твоя
     private func checkCooling(_ state: ProcessInfo.ThermalState, _ now: Date) {
-        if !cooling {
-            guard coolBreaks, phase == .recording, state == .serious || state == .critical else { return }
-            cooling = true
-            coolCount += 1
-            coolStart = now
-            status = "Телефон нагрелся: пауза, пока остынет"
-            queue.async {
-                self.suspended = true
-                self.subCount = 0
-                self.inPause = false
-                if self.session.isRunning { self.session.stopRunning() }
+        guard coolBreaks, phase == .recording || phase == .paused else {
+            if cooling {
+                cooling = false
+                setExtra(0)
             }
             return
         }
-        let waited = now.timeIntervalSince(coolStart ?? now)
-        let cool = state == .nominal || state == .fair
-        // Минимум 1 минута отдыха, максимум 15 минут
-        guard (cool && waited >= 60) || waited >= 900 else {
-            if phase == .recording {
-                status = "Охлаждение: \(hms(waited)). Съёмка продолжится сама"
+        let isHot = state == .serious || state == .critical
+        if isHot {
+            // Добавка = ещё один интервал (не меньше 5 с), при критическом нагреве - втрое больше
+            let base = max(exposureSeconds + pauseSeconds, 5).rounded()
+            let x = state == .critical ? base * 3 : base
+            if !cooling {
+                cooling = true
+                coolCount += 1
             }
-            return
+            if x != coolExtra {
+                setExtra(x)
+                if phase == .recording { status = "Телефон нагрелся: пауза +\(Int(x)) с, пока не остынет" }
+            }
+        } else if cooling {
+            cooling = false
+            setExtra(0)
+            if phase == .recording { status = "Остыл, пауза снова \(Int(pauseSeconds)) с" }
         }
-        endCooling()
     }
 
-    private func endCooling() {
-        guard cooling else { return }
-        cooling = false
-        coolStart = nil
-        guard phase == .recording else {
-            // Съёмка на паузе по другой причине: камера включится при её продолжении
-            queue.async { if !self.session.isRunning && !self.closed { self.session.startRunning() } }
-            return
-        }
-        status = "Остыл, продолжаю съёмку"
-        let s = currentSettings()
-        let warm = warmupFrames()
-        queue.async {
-            if !self.session.isRunning { self.session.startRunning() }
-            self.applyOnQueue(s, forceFocus: s.focusAuto)
-            self.subCount = 0
-            self.inPause = false
-            self.warmupLeft = warm
-            self.calibLeft = 0
-            self.calibSkip = 0
-            self.suspended = false
-        }
+    private func setExtra(_ x: Double) {
+        coolExtra = x
+        queue.async { self.extraPause = x }
     }
 
     private func updateFree() {
@@ -1068,7 +1052,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         }
         let t = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         if inPause {
-            if CMTimeGetSeconds(t - phaseStart) < cfg.pause { return }
+            if CMTimeGetSeconds(t - phaseStart) < cfg.pause + extraPause { return }
             inPause = false
         }
         if cfg.isoAuto && calibLeft > 0 {
@@ -1107,7 +1091,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             return
         }
 
-        inPause = cfg.pause > 0
+        inPause = cfg.pause + extraPause > 0
         if let f = frame {
             writeFrame(f)
             if cfg.isoAuto { autoISOStep(mean: mean) }
@@ -1577,7 +1561,7 @@ struct ContentView: View {
     private var statusLine: String {
         var s = e.phase == .waiting ? "Старт через \(hms(e.countdown))" : e.status
         if e.pauses > 0 && (e.phase == .recording || e.phase == .paused) { s += " · пауз: \(e.pauses)" }
-        if e.coolCount > 0 && (e.phase == .recording || e.phase == .paused) { s += " · охлаждений: \(e.coolCount)" }
+        if e.cooling && (e.phase == .recording || e.phase == .paused) { s += " · пауза +\(Int(e.coolExtra)) с от нагрева" }
         if e.hot { s += " · телефон перегрет" }
         return s
     }
@@ -1854,8 +1838,8 @@ struct SettingsPanel: View {
                     .frame(width: 160)
                 }
                 Toggle("Кадры JPEG в Файлы", isOn: $e.saveFrames)
-                Toggle("Пауза при перегреве", isOn: $e.coolBreaks)
-                note("Если телефон сильно нагреется, камера отдохнёт между кадрами (от 1 до 15 минут), потом съёмка продолжится с твоими настройками. В видео будет просто больший промежуток")
+                Toggle("Длиннее пауза при перегреве", isOn: $e.coolBreaks)
+                note("Если телефон сильно нагреется, к паузе между кадрами добавится время, пока не остынет. Потом пауза снова станет твоей. Съёмка не прерывается")
             }
         }
     }
