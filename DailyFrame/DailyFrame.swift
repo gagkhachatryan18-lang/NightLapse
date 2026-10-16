@@ -314,6 +314,8 @@ final class DailyCamera: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
     @Published var available: [ZoomOption] = []
     /// Превью стоит вертикально (телефон держишь вертикально)
     @Published var previewPortrait = true
+    /// Где именно на экране лежит картинка камеры (в координатах окна просмотра)
+    @Published var videoRect: CGRect = .zero
     @Published var infinityFocus = UserDefaults.standard.bool(forKey: "dfInfinity")
     @Published var busy = false
 
@@ -356,6 +358,7 @@ final class DailyCamera: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
             self.applyFocus(inf)
             if !self.session.isRunning { self.session.startRunning() }
             DispatchQueue.main.async { self.rebuildCoordinator() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { self.updateVideoRect() }
         }
     }
 
@@ -398,7 +401,20 @@ final class DailyCamera: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
         guard let c = coordinator, let conn = previewLayer?.connection else { return }
         let a = c.videoRotationAngleForHorizonLevelPreview
         if conn.isVideoRotationAngleSupported(a) { conn.videoRotationAngle = a }
-        let portrait = Int(c.videoRotationAngleForHorizonLevelCapture.rounded()) % 180 != 0
+        updateVideoRect()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { self.updateVideoRect() }
+    }
+
+    /// Точный прямоугольник картинки камеры: по нему кладётся призрак, и по нему видно, вертикально ли держишь телефон
+    func updateVideoRect() {
+        guard let layer = previewLayer, layer.bounds.width > 0 else { return }
+        let r = layer.layerRectConverted(fromMetadataOutputRect: CGRect(x: 0, y: 0, width: 1, height: 1)).standardized
+        guard r.width > 1, r.height > 1, r.width.isFinite, r.height.isFinite else { return }
+        if abs(r.minX - videoRect.minX) > 0.5 || abs(r.minY - videoRect.minY) > 0.5
+            || abs(r.width - videoRect.width) > 0.5 || abs(r.height - videoRect.height) > 0.5 {
+            videoRect = r
+        }
+        let portrait = r.height > r.width
         if portrait != previewPortrait { previewPortrait = portrait }
     }
 
@@ -460,12 +476,19 @@ struct DFPreview: UIViewRepresentable {
     let cam: DailyCamera
 
     final class PView: UIView {
+        weak var cam: DailyCamera?
         override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
         var pl: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
+
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            DispatchQueue.main.async { [weak self] in self?.cam?.updateVideoRect() }
+        }
     }
 
     func makeUIView(context: Context) -> PView {
         let v = PView()
+        v.cam = cam
         v.pl.session = cam.session
         v.pl.videoGravity = .resizeAspect
         v.backgroundColor = .black
@@ -591,23 +614,7 @@ struct CameraView: View {
         ZStack {
             DFPreview(cam: cam)
             // Призрак и сетка ложатся ровно на картинку камеры (кадр 4:3), фото другой формы обрезается по центру
-            Color.clear
-                .aspectRatio(cam.previewPortrait ? 3.0 / 4.0 : 4.0 / 3.0, contentMode: .fit)
-                .overlay {
-                    if mode != .off, let img = overlayImage {
-                        Image(uiImage: img)
-                            .resizable()
-                            .scaledToFill()
-                            .opacity(opacity)
-                    }
-                }
-                .overlay {
-                    if grid {
-                        GridLines().stroke(Color.white.opacity(0.35), lineWidth: 0.5)
-                    }
-                }
-                .clipped()
-                .allowsHitTesting(false)
+            overlayLayer
             if mode != .off, let img = overlayImage,
                (img.size.width > img.size.height) == cam.previewPortrait {
                 VStack {
@@ -642,6 +649,36 @@ struct CameraView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.black)
         .clipShape(RoundedRectangle(cornerRadius: 12))
+    }
+
+    /// Призрак и сетка ровно на месте картинки камеры
+    private var overlayLayer: some View {
+        GeometryReader { geo in
+            let r = cam.videoRect.width > 1 ? cam.videoRect : fallbackRect(geo.size)
+            ZStack {
+                if mode != .off, let img = overlayImage {
+                    Image(uiImage: img)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: r.width, height: r.height)
+                        .opacity(opacity)
+                }
+                if grid {
+                    GridLines().stroke(Color.white.opacity(0.35), lineWidth: 0.5)
+                }
+            }
+            .frame(width: r.width, height: r.height)
+            .clipped()
+            .position(x: r.midX, y: r.midY)
+        }
+        .allowsHitTesting(false)
+    }
+
+    private func fallbackRect(_ size: CGSize) -> CGRect {
+        let a: CGFloat = cam.previewPortrait ? 3.0 / 4.0 : 4.0 / 3.0
+        var w = size.width, h = size.width / a
+        if h > size.height { h = size.height; w = h * a }
+        return CGRect(x: (size.width - w) / 2, y: (size.height - h) / 2, width: w, height: h)
     }
 
     /// Насколько положение телефона отличается от того, при котором снят выбранный кадр
