@@ -186,10 +186,38 @@ final class Store: ObservableObject {
     var ghostURL: URL { dir.appendingPathComponent("ghost.img") }
     var hasGhost: Bool { FileManager.default.fileExists(atPath: ghostURL.path) }
 
+    /// Фото из галереи сохраняется уже повёрнутым правильно (по метке ориентации), до 2400 px
     func setGhost(_ data: Data) -> Bool {
-        do { try data.write(to: ghostURL) } catch { return false }
+        guard let img = UIImage(data: data), let out = Store.upright(img, maxSide: 2400, turns: 0),
+              let jpg = out.jpegData(compressionQuality: 0.9) else { return false }
+        do { try jpg.write(to: ghostURL) } catch { return false }
         ghostVersion += 1
         return true
+    }
+
+    /// Повернуть фото-призрак на 90° по часовой
+    func rotateGhost() {
+        guard let img = UIImage(contentsOfFile: ghostURL.path), let out = Store.upright(img, maxSide: 2400, turns: 1),
+              let jpg = out.jpegData(compressionQuality: 0.9) else { return }
+        try? jpg.write(to: ghostURL)
+        ghostVersion += 1
+    }
+
+    static func upright(_ img: UIImage, maxSide: CGFloat, turns: Int) -> UIImage? {
+        let w = img.size.width, h = img.size.height
+        guard w > 0, h > 0 else { return nil }
+        let k = min(1, maxSide / max(w, h))
+        let sw = (w * k).rounded(), sh = (h * k).rounded()
+        let odd = turns % 2 == 1
+        let size = odd ? CGSize(width: sh, height: sw) : CGSize(width: sw, height: sh)
+        let fmt = UIGraphicsImageRendererFormat.default()
+        fmt.scale = 1
+        return UIGraphicsImageRenderer(size: size, format: fmt).image { ctx in
+            let c = ctx.cgContext
+            c.translateBy(x: size.width / 2, y: size.height / 2)
+            c.rotate(by: CGFloat(turns) * .pi / 2)
+            img.draw(in: CGRect(x: -sw / 2, y: -sh / 2, width: sw, height: sh))
+        }
     }
 
     func removeGhost() {
@@ -277,12 +305,15 @@ final class DailyCamera: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
     private var device: AVCaptureDevice?
     private var coordinator: AVCaptureDevice.RotationCoordinator?
     private var rotObs: NSKeyValueObservation?
+    private var capObs: NSKeyValueObservation?
     private weak var previewLayer: AVCaptureVideoPreviewLayer?
     private var ext = "heic"
 
-    // Объектив и фокус запоминаются между запусками
-    @Published var lens: Lens = Lens(rawValue: UserDefaults.standard.string(forKey: "dfLens") ?? "") ?? .wide
-    @Published var available: [Lens] = [.wide]
+    // Зум и фокус запоминаются между запусками
+    @Published var zoom: Double = (UserDefaults.standard.object(forKey: "dfZoom") as? NSNumber)?.doubleValue ?? 1
+    @Published var available: [ZoomOption] = []
+    /// Превью стоит вертикально (телефон держишь вертикально)
+    @Published var previewPortrait = true
     @Published var infinityFocus = UserDefaults.standard.bool(forKey: "dfInfinity")
     @Published var busy = false
 
@@ -293,21 +324,19 @@ final class DailyCamera: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
     }
 
     func start() {
-        let ds = AVCaptureDevice.DiscoverySession(deviceTypes: Lens.allCases.map { $0.type },
-                                                  mediaType: .video, position: .back)
-        let found = Lens.allCases.filter { l in ds.devices.contains { $0.deviceType == l.type } }
-        available = found.isEmpty ? [.wide] : found
-        if !available.contains(lens) { lens = .wide }
+        available = ZoomOption.available()
+        zoom = ZoomOption.pick(zoom, in: available).value
         AVCaptureDevice.requestAccess(for: .video) { ok in
             guard ok else { return }
-            DispatchQueue.main.async { self.select(self.lens) }
+            DispatchQueue.main.async { self.select(self.zoom) }
         }
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { _ in }
     }
 
-    func select(_ l: Lens) {
-        lens = l
-        UserDefaults.standard.set(l.rawValue, forKey: "dfLens")
+    func select(_ v: Double) {
+        let l = ZoomOption.pick(v, in: available)
+        zoom = l.value
+        UserDefaults.standard.set(l.value, forKey: "dfZoom")
         let inf = infinityFocus
         q.async {
             guard let dev = AVCaptureDevice.default(l.type, for: .video, position: .back)
@@ -323,6 +352,7 @@ final class DailyCamera: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
             self.session.commitConfiguration()
             self.photoOutput.maxPhotoQualityPrioritization = .quality
             self.device = dev
+            applyCrop(l.crop, to: dev)
             self.applyFocus(inf)
             if !self.session.isRunning { self.session.startRunning() }
             DispatchQueue.main.async { self.rebuildCoordinator() }
@@ -359,12 +389,17 @@ final class DailyCamera: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
         rotObs = c.observe(\.videoRotationAngleForHorizonLevelPreview, options: [.new]) { [weak self] _, _ in
             DispatchQueue.main.async { self?.applyPreviewAngle() }
         }
+        capObs = c.observe(\.videoRotationAngleForHorizonLevelCapture, options: [.new]) { [weak self] _, _ in
+            DispatchQueue.main.async { self?.applyPreviewAngle() }
+        }
     }
 
     private func applyPreviewAngle() {
         guard let c = coordinator, let conn = previewLayer?.connection else { return }
         let a = c.videoRotationAngleForHorizonLevelPreview
         if conn.isVideoRotationAngleSupported(a) { conn.videoRotationAngle = a }
+        let portrait = Int(c.videoRotationAngleForHorizonLevelCapture.rounded()) % 180 != 0
+        if portrait != previewPortrait { previewPortrait = portrait }
     }
 
     func capture() {
@@ -555,17 +590,38 @@ struct CameraView: View {
     private var viewfinder: some View {
         ZStack {
             DFPreview(cam: cam)
-            if mode != .off, let img = overlayImage {
-                Image(uiImage: img)
-                    .resizable()
-                    .scaledToFit()
-                    .opacity(opacity)
-                    .allowsHitTesting(false)
-            }
-            if grid {
-                GridLines()
-                    .stroke(Color.white.opacity(0.35), lineWidth: 0.5)
-                    .allowsHitTesting(false)
+            // Призрак и сетка ложатся ровно на картинку камеры (кадр 4:3), фото другой формы обрезается по центру
+            Color.clear
+                .aspectRatio(cam.previewPortrait ? 3.0 / 4.0 : 4.0 / 3.0, contentMode: .fit)
+                .overlay {
+                    if mode != .off, let img = overlayImage {
+                        Image(uiImage: img)
+                            .resizable()
+                            .scaledToFill()
+                            .opacity(opacity)
+                    }
+                }
+                .overlay {
+                    if grid {
+                        GridLines().stroke(Color.white.opacity(0.35), lineWidth: 0.5)
+                    }
+                }
+                .clipped()
+                .allowsHitTesting(false)
+            if mode != .off, let img = overlayImage,
+               (img.size.width > img.size.height) == cam.previewPortrait {
+                VStack {
+                    Spacer()
+                    Text(img.size.width > img.size.height
+                         ? "Прошлый кадр горизонтальный - поверни телефон"
+                         : "Прошлый кадр вертикальный - поверни телефон")
+                        .font(.footnote.weight(.semibold))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(Color.orange.opacity(0.85), in: Capsule())
+                        .padding(.bottom, 44)
+                }
+                .allowsHitTesting(false)
             }
             VStack {
                 hudView
@@ -642,6 +698,10 @@ struct CameraView: View {
                         }
                         .buttonStyle(.bordered)
                         if store.hasGhost {
+                            Button { store.rotateGhost() } label: {
+                                Image(systemName: "rotate.right")
+                            }
+                            .buttonStyle(.bordered)
                             Button(role: .destructive) { store.removeGhost() } label: {
                                 Image(systemName: "trash")
                             }
@@ -653,8 +713,8 @@ struct CameraView: View {
                 }
             }
 
-            Picker("Объектив", selection: lensBinding) {
-                ForEach(cam.available) { Text($0.title).tag($0) }
+            Picker("Зум", selection: zoomBinding) {
+                ForEach(cam.available) { Text($0.title).tag($0.value) }
             }
             .pickerStyle(.segmented)
 
@@ -694,7 +754,7 @@ struct CameraView: View {
 
     private var shutter: some View {
         Button {
-            pending = Shot(q: motion.q, g: motion.g, lens: cam.lens.rawValue)
+            pending = Shot(q: motion.q, g: motion.g, lens: "\(cam.zoom)")
             cam.capture()
         } label: {
             ZStack {
@@ -705,8 +765,8 @@ struct CameraView: View {
         .disabled(cam.busy)
     }
 
-    private var lensBinding: Binding<Lens> {
-        Binding(get: { cam.lens }, set: { cam.select($0) })
+    private var zoomBinding: Binding<Double> {
+        Binding(get: { cam.zoom }, set: { cam.select($0) })
     }
 
     private var infinityBinding: Binding<Bool> {
@@ -748,7 +808,7 @@ struct CameraView: View {
     }
 
     private func handle(_ data: Data, _ ext: String) {
-        let shot = pending ?? Shot(q: motion.q, g: motion.g, lens: cam.lens.rawValue)
+        let shot = pending ?? Shot(q: motion.q, g: motion.g, lens: "\(cam.zoom)")
         pending = nil
         if store.addPhoto(data: data, ext: ext, shot: shot) != nil {
             if copyToPhotos { saveToPhotos(data) }
