@@ -1669,14 +1669,28 @@ struct ContentView: View {
     }
 
     private var planLine: String {
-        let interval = e.exposureSeconds + e.pauseSeconds
-        let perHour = 3600 / max(interval, 0.1) / Double(max(e.fps, 1))
-        var s = "Снимок каждые \(expText(interval)). Час съёмки даст \(Int(perHour.rounded())) с видео"
+        let interval = max(e.exposureSeconds + e.pauseSeconds, 0.01)
+        let fps = Double(max(e.fps, 1))
+        let framesPerHour = 3600 / interval
+        let videoPerHour = framesPerHour / fps
+        // Сколько снимать ради 10 секунд видео
+        let shootFor10 = 10 * fps * interval
+        var s = "Снимок каждые \(expText(interval)), \(Int(framesPerHour.rounded())) кадров в час\n"
+        s += "1 час съёмки = \(String(format: "%.1f", videoPerHour)) с видео\n"
+        s += "10 с видео = \(durText(shootFor10)) съёмки"
         if e.autoStopMin > 0 {
-            let total = perHour * Double(e.autoStopMin) / 60
-            s += ". Всего около \(Int(total.rounded())) с видео"
+            let total = videoPerHour * Double(e.autoStopMin) / 60
+            s += "\nЗа \(durText(Double(e.autoStopMin) * 60)) получится \(String(format: "%.1f", total)) с видео"
         }
         return s
+    }
+
+    /// 45 мин, 3 ч 28 мин
+    private func durText(_ sec: Double) -> String {
+        let m = Int((sec / 60).rounded())
+        if m < 1 { return "\(Int(sec.rounded())) с" }
+        if m < 60 { return "\(m) мин" }
+        return m % 60 == 0 ? "\(m / 60) ч" : "\(m / 60) ч \(m % 60) мин"
     }
 
     private var buttons: some View {
