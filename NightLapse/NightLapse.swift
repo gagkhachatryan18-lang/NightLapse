@@ -60,7 +60,125 @@ enum LensKind: String, CaseIterable, Identifiable {
     }
 }
 
+/// Зум как в Камере iPhone: 0.5x, 1x, 2x, 3x, 4x, 8x. Каждый зум = объектив + цифровое увеличение
+struct ZoomOption: Identifiable, Hashable {
+    let value: Double
+    let type: AVCaptureDevice.DeviceType
+    let crop: CGFloat
+    var id: Double { value }
+    var title: String {
+        if value < 1 { return String(format: "%.1fx", value) }
+        return abs(value - value.rounded()) < 0.01 ? "\(Int(value.rounded()))x" : String(format: "%.1fx", value)
+    }
+
+    static func available() -> [ZoomOption] {
+        let ds = AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.builtInUltraWideCamera, .builtInWideAngleCamera, .builtInTelephotoCamera],
+            mediaType: .video, position: .back)
+        let has = Set(ds.devices.map { $0.deviceType })
+        // Во сколько раз телевик ближе основной камеры (на iPhone 17 Pro Max - 4x)
+        var tele = 3.0
+        if let tri = AVCaptureDevice.default(.builtInTripleCamera, for: .video, position: .back),
+           tri.virtualDeviceSwitchOverVideoZoomFactors.count >= 2 {
+            let f = tri.virtualDeviceSwitchOverVideoZoomFactors.map { $0.doubleValue }
+            tele = f[1] / max(f[0], 0.01)
+        } else if let dual = AVCaptureDevice.default(.builtInDualCamera, for: .video, position: .back),
+                  let f = dual.virtualDeviceSwitchOverVideoZoomFactors.first {
+            tele = f.doubleValue
+        }
+        tele = (tele * 2).rounded() / 2
+        let hasTele = has.contains(.builtInTelephotoCamera)
+        var out: [ZoomOption] = []
+        if has.contains(.builtInUltraWideCamera) {
+            out.append(ZoomOption(value: 0.5, type: .builtInUltraWideCamera, crop: 1))
+        }
+        out.append(ZoomOption(value: 1, type: .builtInWideAngleCamera, crop: 1))
+        for z in [2.0, 3.0] where !hasTele || z < tele - 0.01 {
+            out.append(ZoomOption(value: z, type: .builtInWideAngleCamera, crop: CGFloat(z)))
+        }
+        if hasTele {
+            out.append(ZoomOption(value: tele, type: .builtInTelephotoCamera, crop: 1))
+            out.append(ZoomOption(value: tele * 2, type: .builtInTelephotoCamera, crop: 2))
+        }
+        return out
+    }
+
+    static func pick(_ v: Double, in list: [ZoomOption]) -> ZoomOption {
+        list.first { abs($0.value - v) < 0.01 } ?? list.first { $0.value == 1 } ?? list[0]
+    }
+}
+
+/// Цифровое увеличение (queue): не больше, чем умеет формат
+func applyCrop(_ crop: CGFloat, to dev: AVCaptureDevice) {
+    guard (try? dev.lockForConfiguration()) != nil else { return }
+    dev.videoZoomFactor = min(max(crop, 1), dev.activeFormat.videoMaxZoomFactor)
+    dev.unlockForConfiguration()
+}
+
 enum Phase { case idle, test, waiting, recording, paused, saving }
+
+/// Готовые сценарии: одно нажатие выставляет выдержку, паузу, режим и коррекцию
+enum LapseScene: String, CaseIterable, Identifiable {
+    case stars, trails, city, clouds
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .stars: return "Звёзды"
+        case .trails: return "Треки звёзд"
+        case .city: return "Город"
+        case .clouds: return "Облака"
+        }
+    }
+    var icon: String {
+        switch self {
+        case .stars: return "sparkles"
+        case .trails: return "circle.dashed"
+        case .city: return "building.2"
+        case .clouds: return "cloud.sun"
+        }
+    }
+    var hint: String {
+        switch self {
+        case .stars: return "Ночное небо и Млечный путь, звёзды точками. Фокус на бесконечность"
+        case .trails: return "Звёзды и огни рисуют длинные линии"
+        case .city: return "Шлейфы фар и огни города"
+        case .clouds: return "Закат, облака, день. Выдержка сама укоротится, если светло"
+        }
+    }
+    var exposure: Double {
+        switch self {
+        case .stars: return 20
+        case .trails: return 30
+        case .city: return 4
+        case .clouds: return 2
+        }
+    }
+    var pause: Double {
+        switch self {
+        case .stars: return 1
+        case .trails: return 0
+        case .city: return 1
+        case .clouds: return 3
+        }
+    }
+    var lighten: Bool { self == .trails || self == .city }
+    var ev: Double {
+        switch self {
+        case .stars: return -1.5
+        case .trails: return -1.5
+        case .city: return -1
+        case .clouds: return -0.5
+        }
+    }
+}
+
+/// 1/8 с, 0.5 с, 17 с
+func expText(_ v: Double) -> String {
+    if v >= 1 { return abs(v - v.rounded()) < 0.05 ? "\(Int(v.rounded())) с" : String(format: "%.1f с", v) }
+    let d = (1 / v).rounded()
+    if abs(1 / d - v) < 0.0005 { return "1/\(Int(d)) с" }
+    return String(format: "%.2f с", v)
+}
 
 struct LapseConfig {
     var subNeeded = 30
@@ -133,7 +251,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     @Published var vertical: Bool { didSet { ud.set(vertical, forKey: "vertical") } }
     @Published var saveVideo: Bool { didSet { ud.set(saveVideo, forKey: "saveVideo") } }
     @Published var saveFrames: Bool { didSet { ud.set(saveFrames, forKey: "saveFrames") } }
-    @Published var lens: LensKind { didSet { ud.set(lens.rawValue, forKey: "lens") } }
+    @Published var zoom: Double { didSet { ud.set(zoom, forKey: "zoom") } }
     @Published var uhd: Bool { didSet { ud.set(uhd, forKey: "uhd") } }
     @Published var startDelayMin: Int { didSet { ud.set(startDelayMin, forKey: "delay") } }
     @Published var autoStopMin: Int { didSet { ud.set(autoStopMin, forKey: "autostop") } }
@@ -141,9 +259,12 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     @Published var wbAuto: Bool { didSet { ud.set(wbAuto, forKey: "wbAuto") } }
     @Published var focusAuto: Bool { didSet { ud.set(focusAuto, forKey: "focusAuto") } }
     @Published var evComp: Double { didSet { ud.set(evComp, forKey: "ev") } }
+    @Published var scene: String { didSet { ud.set(scene, forKey: "scene") } }
+    /// Как будет записано видео: горизонтально или вертикально (по тому, как держишь телефон)
+    @Published var captureLandscape = true
 
     // Возможности камеры
-    @Published var availableLenses: [LensKind] = [.wide]
+    @Published var zoomOptions: [ZoomOption] = []
     @Published var minISO: Float = 50
     @Published var maxISO: Float = 3200
     @Published var subExposure: Double = 1   // максимальная выдержка сенсора
@@ -228,7 +349,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         vertical = d.flag("vertical", false)
         saveVideo = d.flag("saveVideo", true)
         saveFrames = d.flag("saveFrames", false)
-        lens = LensKind(rawValue: d.string(forKey: "lens") ?? "") ?? .wide
+        zoom = d.dbl("zoom", 1)
         uhd = d.flag("uhd", true)
         startDelayMin = d.num("delay", 0)
         autoStopMin = d.num("autostop", 0)
@@ -236,13 +357,11 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         wbAuto = d.flag("wbAuto", false)
         focusAuto = d.flag("focusAuto", false)
         evComp = d.dbl("ev", -2)
+        scene = d.string(forKey: "scene") ?? ""
         super.init()
 
-        let ds = AVCaptureDevice.DiscoverySession(
-            deviceTypes: LensKind.allCases.map { $0.deviceType }, mediaType: .video, position: .back)
-        let found = LensKind.allCases.filter { k in ds.devices.contains { $0.deviceType == k.deviceType } }
-        availableLenses = found.isEmpty ? [.wide] : found
-        if !availableLenses.contains(lens) { lens = .wide }
+        zoomOptions = ZoomOption.available()
+        zoom = ZoomOption.pick(zoom, in: zoomOptions).value
 
         UIDevice.current.isBatteryMonitoringEnabled = true
 
@@ -296,8 +415,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
     func changeCamera() {
         guard phase == .idle else { return }
-        let l = lens, u = uhd, s = currentSettings()
-        queue.async { self.reconfigure(lens: l, uhd: u, settings: s) }
+        let z = ZoomOption.pick(zoom, in: zoomOptions), u = uhd, s = currentSettings()
+        queue.async { self.reconfigure(zoom: z, uhd: u, settings: s) }
     }
 
     func applyCamera(forceFocus: Bool = false) {
@@ -307,10 +426,83 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
     /// Переключение авто / ручной фокус: при переходе на ручной берём текущее положение линзы
     func focusModeChanged() {
-        if !focusAuto, let dev = device {
-            focus = min(max(dev.lensPosition, 0), 1)
+        if !focusAuto {
+            if infinityPending {
+                focus = 1
+                infinityPending = false
+            } else if let dev = device {
+                focus = min(max(dev.lensPosition, 0), 1)
+            }
         }
         applyCamera()
+    }
+
+    private var infinityPending = false
+
+    func applyScene(_ sc: LapseScene) {
+        guard phase == .idle else { return }
+        scene = sc.rawValue
+        exposureSeconds = sc.exposure
+        pauseSeconds = sc.pause
+        lighten = sc.lighten
+        evComp = sc.ev
+        isoAuto = true
+        if focusAuto {
+            infinityPending = true
+            focusAuto = false
+        } else {
+            focus = 1
+        }
+        applyCamera(forceFocus: true)
+    }
+
+    // MARK: Поворот (main): превью всегда ровно по горизонту, видео пишется так, как держишь телефон
+
+    private var coordinator: AVCaptureDevice.RotationCoordinator?
+    private var rotObs: [NSKeyValueObservation] = []
+    private weak var previewLayer: AVCaptureVideoPreviewLayer?
+
+    func attachPreview(_ layer: AVCaptureVideoPreviewLayer) {
+        previewLayer = layer
+        rebuildCoordinator()
+    }
+
+    private func rebuildCoordinator() {
+        guard let dev = device, let layer = previewLayer else { return }
+        let c = AVCaptureDevice.RotationCoordinator(device: dev, previewLayer: layer)
+        coordinator = c
+        applyRotation()
+        rotObs = [
+            c.observe(\.videoRotationAngleForHorizonLevelPreview, options: [.new]) { [weak self] _, _ in
+                DispatchQueue.main.async { self?.applyRotation() }
+            },
+            c.observe(\.videoRotationAngleForHorizonLevelCapture, options: [.new]) { [weak self] _, _ in
+                DispatchQueue.main.async { self?.applyRotation() }
+            }
+        ]
+    }
+
+    private func applyRotation() {
+        guard let c = coordinator else { return }
+        if let conn = previewLayer?.connection {
+            let a = c.videoRotationAngleForHorizonLevelPreview
+            if conn.isVideoRotationAngleSupported(a) { conn.videoRotationAngle = a }
+        }
+        if phase == .idle {
+            let land = Int(c.videoRotationAngleForHorizonLevelCapture.rounded()) % 180 == 0
+            if land != captureLandscape { captureLandscape = land }
+        }
+    }
+
+    private func captureAngle() -> CGFloat {
+        coordinator?.videoRotationAngleForHorizonLevelCapture ?? 90
+    }
+
+    /// queue: кадры с сенсора поворачиваются так, как держишь телефон в момент старта
+    private func setOutputAngle(_ a: CGFloat) {
+        if let conn = output.connection(with: .video), conn.isVideoRotationAngleSupported(a) {
+            conn.videoRotationAngle = a
+        }
     }
 
     /// Фокус по касанию картинки (только в автофокусе и до старта)
@@ -340,7 +532,9 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         UIApplication.shared.isIdleTimerDisabled = true
         let s = currentSettings()
         let ff = focusAuto
+        let angle = captureAngle()
         queue.async {
+            self.setOutputAngle(angle)
             self.cfg = c
             self.subCount = 0
             self.inPause = false
@@ -384,7 +578,9 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         UIApplication.shared.isIdleTimerDisabled = true
         let s = currentSettings()
         let ff = focusAuto
+        let angle = captureAngle()
         queue.async {
+            self.setOutputAngle(angle)
             self.cfg = c
             self.subCount = 0
             self.inPause = false
@@ -517,7 +713,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
     private func makeConfig(name: String) -> LapseConfig {
         LapseConfig(subNeeded: subFramesPerFrame, exposure: exposureSeconds, pause: pauseSeconds, lighten: lighten,
-                    gain: isoAuto ? 1 : gain, fps: Int32(fps), vertical: vertical,
+                    gain: isoAuto ? 1 : gain, fps: Int32(fps), vertical: false,
                     saveVideo: saveVideo, saveFrames: saveFrames, name: name,
                     warmup: warmupFrames(), isoAuto: isoAuto, ev: Float(evComp), iso: iso)
     }
@@ -559,8 +755,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
     // MARK: Камера (queue)
 
-    private func reconfigure(lens: LensKind, uhd: Bool, settings: CamSettings) {
-        guard let dev = AVCaptureDevice.default(lens.deviceType, for: .video, position: .back)
+    private func reconfigure(zoom: ZoomOption, uhd: Bool, settings: CamSettings) {
+        guard let dev = AVCaptureDevice.default(zoom.type, for: .video, position: .back)
                 ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
               let input = try? AVCaptureDeviceInput(device: dev) else {
             DispatchQueue.main.async { self.status = "Камера недоступна" }
@@ -598,6 +794,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             dev.unlockForConfiguration()
         }
 
+        applyCrop(zoom.crop, to: dev)
         let fmt = dev.activeFormat
         let sub = CMTimeGetSeconds(fmt.maxExposureDuration)
         let subMin = CMTimeGetSeconds(fmt.minExposureDuration)
@@ -611,6 +808,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             if self.iso < lo || self.iso > hi { self.iso = min(max(self.iso, lo), hi) }
             self.subExposure = sub
             self.minSensorExposure = subMin
+            self.rebuildCoordinator()
         }
     }
 
@@ -833,7 +1031,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         guard let base = CVPixelBufferGetBaseAddress(pb) else { return }
         let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb), rb = CVPixelBufferGetBytesPerRow(pb)
         let n = w * 4
-        if acc.count != n * h {
+        if w != width || h != height || acc.count != n * h {
             width = w
             height = h
             acc = [Float](repeating: 0, count: n * h)
@@ -1005,16 +1203,15 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     }
 }
 
+
 // MARK: - Превью камеры
 
 struct CameraPreview: UIViewRepresentable {
-    let session: AVCaptureSession
-    let vertical: Bool
+    let engine: LapseEngine
     let onTap: (CGPoint) -> Void
 
     final class PView: UIView {
         var onTap: ((CGPoint) -> Void)?
-        var angle: CGFloat = 0
         override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
         var pl: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
 
@@ -1031,111 +1228,198 @@ struct CameraPreview: UIViewRepresentable {
             let p = pl.captureDevicePointConverted(fromLayerPoint: g.location(in: self))
             onTap?(p)
         }
-
-        /// Картинка в превью повёрнута так же, как будет записано видео
-        func fixRotation() {
-            if let c = pl.connection, c.isVideoRotationAngleSupported(angle), c.videoRotationAngle != angle {
-                c.videoRotationAngle = angle
-            }
-        }
-
-        override func layoutSubviews() {
-            super.layoutSubviews()
-            fixRotation()
-        }
     }
 
     func makeUIView(context: Context) -> PView {
         let v = PView()
-        v.pl.session = session
+        v.pl.session = engine.session
         v.pl.videoGravity = .resizeAspect
         v.backgroundColor = .black
-        v.angle = vertical ? 90 : 0
         v.onTap = onTap
+        let e = engine
+        DispatchQueue.main.async { e.attachPreview(v.pl) }
         return v
     }
 
     func updateUIView(_ uiView: PView, context: Context) {
         uiView.onTap = onTap
-        uiView.angle = vertical ? 90 : 0
-        uiView.fixRotation()
     }
 }
 
-// MARK: - Интерфейс
+// MARK: - Главный экран
 
 struct ContentView: View {
     var onSwitch: () -> Void = {}
     @StateObject private var e = LapseEngine()
     @State private var dark = false
     @State private var showTest = false
+    @State private var showSettings = false
 
     private var idle: Bool { e.phase == .idle }
+    private var shooting: Bool {
+        e.phase == .recording || e.phase == .paused || e.phase == .saving || e.phase == .waiting
+    }
 
     var body: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
-            VStack(spacing: 8) {
-                preview
-                statusBar
-                settings
-                buttons
+        GeometryReader { geo in
+            let landscape = geo.size.width > geo.size.height
+            ZStack {
+                Color.black.ignoresSafeArea()
+                if landscape {
+                    HStack(spacing: 12) {
+                        previewBox(height: nil)
+                        VStack(spacing: 10) {
+                            header
+                            ScrollView { controls }
+                            buttons
+                        }
+                        .frame(width: min(400, geo.size.width * 0.45))
+                    }
+                    .padding(8)
+                } else {
+                    VStack(spacing: 10) {
+                        header
+                        previewBox(height: e.captureLandscape ? 230 : 380)
+                        ScrollView { controls }
+                        buttons
+                    }
+                    .padding(.horizontal, 12)
+                }
+                if dark { darkOverlay }
             }
-            if dark { darkOverlay }
         }
         .onAppear { e.configure() }
         .onDisappear { e.shutdown() }
         .onChange(of: e.testCount) { showTest = true }
-        .onChange(of: e.lens) { e.changeCamera() }
+        .onChange(of: e.zoom) { e.changeCamera() }
         .onChange(of: e.uhd) { e.changeCamera() }
         .onChange(of: e.focusAuto) { e.focusModeChanged() }
         .onChange(of: e.wbAuto) { e.applyCamera() }
         .onChange(of: e.evComp) { e.applyCamera() }
         .sheet(isPresented: $showTest) { testSheet }
+        .sheet(isPresented: $showSettings) { SettingsSheet(e: e) }
     }
 
-    private var preview: some View {
-        ZStack(alignment: .bottomTrailing) {
-            CameraPreview(session: e.session, vertical: e.vertical, onTap: { e.focusAt($0) })
-                .frame(maxWidth: .infinity)
-                .frame(height: 220)
-                .background(Color.black)
-                .clipShape(RoundedRectangle(cornerRadius: 12))
-            if let img = e.lastImage {
-                Image(uiImage: img)
-                    .resizable()
-                    .scaledToFit()
-                    .frame(width: 96, height: 96)
-                    .background(Color.black)
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
-                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.white.opacity(0.3)))
-                    .padding(6)
-                    .onTapGesture { showTest = true }
+    // MARK: Верх
+
+    private var header: some View {
+        HStack {
+            Text("Найтлапс").font(.title2.bold())
+            Spacer()
+            Button { onSwitch() } label: {
+                Label("Кадр дня", systemImage: "photo.on.rectangle.angled")
+                    .font(.footnote.weight(.semibold))
+                    .lineLimit(1)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Color.orange.opacity(0.2), in: Capsule())
+                    .foregroundStyle(Color.orange)
+            }
+            .disabled(!idle)
+        }
+        .padding(.top, 4)
+    }
+
+    // MARK: Картинка
+
+    private func previewBox(height: CGFloat?) -> some View {
+        ZStack {
+            CameraPreview(engine: e, onTap: { e.focusAt($0) })
+            VStack {
+                HStack {
+                    infoChip
+                    Spacer()
+                    orientationChip
+                }
+                Spacer()
+                HStack(alignment: .bottom) {
+                    if shooting { recordingInfo }
+                    Spacer()
+                    thumb
+                }
+            }
+            .padding(8)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .frame(height: height)
+        .background(Color.black)
+        .clipShape(RoundedRectangle(cornerRadius: 14))
+    }
+
+    private var infoChip: some View {
+        HStack(spacing: 8) {
+            Label(e.battery >= 0 ? "\(e.battery)%" : "-", systemImage: "battery.100")
+            Label(String(format: "%.0f ГБ", e.freeGB), systemImage: "internaldrive")
+            if e.hot {
+                Image(systemName: "thermometer.high").foregroundStyle(Color.orange)
             }
         }
-        .padding(.horizontal)
+        .font(.caption2.monospacedDigit())
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(Color.black.opacity(0.55), in: Capsule())
     }
 
-    private var statusBar: some View {
-        VStack(spacing: 4) {
-            HStack(spacing: 12) {
-                Label(hms(e.elapsed), systemImage: "timer")
-                Label("\(e.framesDone)", systemImage: "photo.stack")
-                Label(String(format: "%.1f с", Double(e.framesDone) / Double(max(e.fps, 1))), systemImage: "film")
-                Label(e.battery >= 0 ? "\(e.battery)%" : "-", systemImage: "battery.100")
-                Label(String(format: "%.0f ГБ", e.freeGB), systemImage: "internaldrive")
+    private var orientationChip: some View {
+        Label(e.captureLandscape ? "Горизонтально" : "Вертикально",
+              systemImage: e.captureLandscape ? "rectangle" : "rectangle.portrait")
+            .font(.caption2)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(Color.black.opacity(0.55), in: Capsule())
+    }
+
+    private var recordingInfo: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text("\(e.framesDone) кадров").font(.headline.monospacedDigit())
+            Text("\(hms(e.elapsed)) · видео \(String(format: "%.1f", Double(e.framesDone) / Double(max(e.fps, 1)))) с")
+                .font(.caption.monospacedDigit())
+        }
+        .padding(8)
+        .background(Color.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    @ViewBuilder private var thumb: some View {
+        if let img = e.lastImage {
+            Image(uiImage: img)
+                .resizable()
+                .scaledToFit()
+                .frame(maxWidth: 90, maxHeight: 90)
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.white.opacity(0.4)))
+                .onTapGesture { showTest = true }
+        }
+    }
+
+    // MARK: Управление
+
+    private var controls: some View {
+        VStack(spacing: 12) {
+            statusView
+            if shooting {
+                card("Идёт съёмка") {
+                    Text("Не двигай телефон. Чтобы экран не светил, нажми луну внизу. Остановить можно кнопкой «Стоп»")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                sceneCard
+                mainCard
             }
-            .font(.caption.monospacedDigit())
-            .lineLimit(1)
-            .minimumScaleFactor(0.7)
+        }
+        .padding(.bottom, 8)
+    }
+
+    private var statusView: some View {
+        VStack(spacing: 6) {
             if e.phase == .recording || e.phase == .test {
                 ProgressView(value: Double(min(e.subDone, e.subTotal)), total: Double(max(e.subTotal, 1)))
             }
             Text(statusLine)
                 .font(.footnote)
                 .foregroundStyle(e.hot ? Color.orange : Color.secondary)
+                .multilineTextAlignment(.center)
         }
-        .padding(.horizontal)
     }
 
     private var statusLine: String {
@@ -1145,149 +1429,106 @@ struct ContentView: View {
         return s
     }
 
-    private var planLine: String {
-        let interval = e.exposureSeconds + e.pauseSeconds
-        let minutes = Double(e.fps * 10) * interval / 60
-        let every = interval < 10 ? String(format: "%.1f с", interval) : "\(Int(interval)) с"
-        return "Кадр каждые \(every) · 10 с видео ≈ \(String(format: minutes < 10 ? "%.1f" : "%.0f", minutes)) мин съёмки"
+    private func card<C: View>(_ title: String, @ViewBuilder _ content: () -> C) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(title).font(.headline)
+            content()
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(white: 0.11), in: RoundedRectangle(cornerRadius: 14))
     }
 
-    /// 1/8 с, 0.5 с, 17 с
-    private func expText(_ v: Double) -> String {
-        if v >= 1 { return v == v.rounded() ? "\(Int(v)) с" : String(format: "%.1f с", v) }
-        let d = (1 / v).rounded()
-        if abs(1 / d - v) < 0.0005 { return "1/\(Int(d)) с" }
-        return String(format: "%.3f с", v)
+    private var sceneCard: some View {
+        card("Что снимаем") {
+            LazyVGrid(columns: [GridItem(.flexible(), spacing: 8), GridItem(.flexible(), spacing: 8)], spacing: 8) {
+                ForEach(LapseScene.allCases) { sc in
+                    Button { e.applyScene(sc) } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: sc.icon).frame(width: 22)
+                            Text(sc.title).lineLimit(1).minimumScaleFactor(0.8)
+                            Spacer(minLength: 0)
+                        }
+                        .padding(.vertical, 12)
+                        .padding(.horizontal, 10)
+                        .frame(maxWidth: .infinity)
+                        .background(e.scene == sc.rawValue ? Color.red.opacity(0.4) : Color.white.opacity(0.08),
+                                    in: RoundedRectangle(cornerRadius: 10))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            Text(LapseScene(rawValue: e.scene)?.hint ?? "Выбери, что снимаешь, и настройки выставятся сами. Потом их можно подправить ниже")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
     }
 
-    private var settings: some View {
-        Form {
-            Section("Камера") {
-                Picker("Объектив", selection: $e.lens) {
-                    ForEach(e.availableLenses) { Text($0.title).tag($0) }
-                }
-                .pickerStyle(.segmented)
-                Toggle("4K (выкл. = 1080p)", isOn: $e.uhd)
-                Toggle("Автофокус", isOn: $e.focusAuto)
-                if e.focusAuto {
-                    Text("Коснись картинки, чтобы навести фокус. Дальше он фиксируется. В темноте автофокус часто промахивается")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                } else {
-                    VStack(alignment: .leading) {
-                        Text(e.focus >= 0.99 ? "Фокус: бесконечность" : String(format: "Фокус: %.0f%%", e.focus * 100))
-                        Slider(value: $e.focus, in: 0...1, onEditingChanged: { editing in if !editing { e.applyCamera() } })
-                    }
-                }
-            }
+    private func row(_ title: String, _ value: String) -> some View {
+        HStack {
+            Text(title)
+            Spacer()
+            Text(value).foregroundStyle(.secondary).monospacedDigit()
+        }
+    }
 
-            Section("Экспозиция") {
-                Stepper("Выдержка кадра: \(expText(e.exposureSeconds))",
-                        onIncrement: { e.exposureUp() }, onDecrement: { e.exposureDown() })
-                Text("Сенсор \(expText(e.sensorExposure)) × \(e.subFramesPerFrame) подкадров")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Toggle("Авто ISO", isOn: $e.isoAuto)
-                if e.isoAuto {
-                    VStack(alignment: .leading) {
-                        Text("Коррекция: \(String(format: "%+.1f", e.evComp)) EV")
-                        Slider(value: $e.evComp, in: -4...1, step: 0.5)
-                    }
-                    Text("ISO сейчас: \(Int(e.iso)). Подбирается сам и меняется плавно")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                } else {
-                    VStack(alignment: .leading) {
-                        Text("ISO: \(Int(e.iso))")
-                        Slider(value: $e.iso, in: e.minISO...max(e.maxISO, e.minISO + 1),
-                               onEditingChanged: { editing in if !editing { e.applyCamera() } })
-                    }
-                    VStack(alignment: .leading) {
-                        Text("Яркость: x\(String(format: "%.2g", e.gain))")
-                        Slider(value: $e.gain, in: 0.25...8, step: 0.25)
-                    }
-                }
-                Toggle("Авто баланс белого", isOn: $e.wbAuto)
-                if e.wbAuto {
-                    Text("В авто цвет может слегка мерцать между кадрами")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                } else {
-                    VStack(alignment: .leading) {
-                        Text("Баланс белого: \(Int(e.wbTemp)) K")
-                        Slider(value: $e.wbTemp, in: 2500...7500, step: 100,
-                               onEditingChanged: { editing in if !editing { e.applyCamera() } })
-                    }
-                }
-                Picker("Режим", selection: $e.lighten) {
-                    Text("Среднее").tag(false)
-                    Text("Треки").tag(true)
-                }
-                .pickerStyle(.segmented)
-                Text(e.lighten ? "Шлейфы огней и звёзд" : "Меньше шума, мягкие облака и вода")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+    private var mainCard: some View {
+        card("Основное") {
+            Picker("Зум", selection: $e.zoom) {
+                ForEach(e.zoomOptions) { Text($0.title).tag($0.value) }
             }
-
-            Section("Интервал") {
-                Stepper("Пауза: \(Int(e.pauseSeconds)) с", value: $e.pauseSeconds, in: 0...60, step: 1)
-                Picker("Задержка старта", selection: $e.startDelayMin) {
-                    Text("Нет").tag(0)
-                    Text("1 мин").tag(1)
-                    Text("5 мин").tag(5)
-                    Text("15 мин").tag(15)
-                    Text("30 мин").tag(30)
-                    Text("1 ч").tag(60)
-                }
-                Picker("Автостоп", selection: $e.autoStopMin) {
-                    Text("Нет").tag(0)
+            .pickerStyle(.segmented)
+            Stepper(onIncrement: { e.exposureUp() }, onDecrement: { e.exposureDown() }) {
+                row("Выдержка кадра", expText(e.exposureSeconds))
+            }
+            Stepper(value: $e.pauseSeconds, in: 0...60, step: 1) {
+                row("Пауза", "\(Int(e.pauseSeconds)) с")
+            }
+            HStack {
+                Text("Длительность")
+                Spacer()
+                Picker("Длительность", selection: $e.autoStopMin) {
+                    Text("Пока не остановлю").tag(0)
                     Text("30 мин").tag(30)
                     Text("1 ч").tag(60)
                     Text("2 ч").tag(120)
                     Text("4 ч").tag(240)
                     Text("8 ч").tag(480)
                 }
-                Text(planLine)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                .pickerStyle(.menu)
             }
-
-            Section("Сохранение") {
-                Toggle("Видео в Фото", isOn: $e.saveVideo)
-                Picker("Кадров в секунду", selection: $e.fps) {
-                    Text("24").tag(24)
-                    Text("25").tag(25)
-                    Text("30").tag(30)
-                }
-                .pickerStyle(.segmented)
-                Toggle("Вертикальное видео", isOn: $e.vertical)
-                Toggle("Кадры JPEG в Файлы", isOn: $e.saveFrames)
+            Text(planLine)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            Button { showSettings = true } label: {
+                Label("Все настройки", systemImage: "slider.horizontal.3")
+                    .frame(maxWidth: .infinity)
             }
+            .buttonStyle(.bordered)
         }
-        .scrollContentBackground(.hidden)
-        .disabled(!idle)
+    }
+
+    private var planLine: String {
+        let interval = e.exposureSeconds + e.pauseSeconds
+        let perHour = 3600 / max(interval, 0.1) / Double(max(e.fps, 1))
+        var s = "Снимок каждые \(expText(interval)). Час съёмки даст \(Int(perHour.rounded())) с видео"
+        if e.autoStopMin > 0 {
+            let total = perHour * Double(e.autoStopMin) / 60
+            s += ". Всего около \(Int(total.rounded())) с видео"
+        }
+        return s
     }
 
     private var buttons: some View {
         HStack(spacing: 10) {
             switch e.phase {
             case .idle:
-                Button { onSwitch() } label: {
-                    Image(systemName: "photo.on.rectangle.angled")
-                        .accessibilityLabel("Кадр дня")
-                }
-                .buttonStyle(.bordered)
-                .tint(.orange)
                 Button { e.testFrame() } label: {
-                    Label("Тест", systemImage: "camera.aperture")
-                        .lineLimit(1)
-                        .fixedSize()
+                    Label("Тест", systemImage: "camera.aperture").lineLimit(1).fixedSize()
                 }
                 .buttonStyle(.bordered)
                 Button { e.start() } label: {
-                    Label("Старт", systemImage: "record.circle")
-                        .lineLimit(1)
-                        .frame(maxWidth: .infinity)
+                    Label("Старт", systemImage: "record.circle").lineLimit(1).frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
             case .test, .waiting:
@@ -1309,9 +1550,10 @@ struct ContentView: View {
             .buttonStyle(.bordered)
         }
         .controlSize(.large)
-        .padding(.horizontal)
         .padding(.bottom, 8)
     }
+
+    // MARK: Затемнение и тест
 
     private var darkOverlay: some View {
         Color.black
@@ -1338,5 +1580,109 @@ struct ContentView: View {
             }
         }
         .presentationDragIndicator(.visible)
+    }
+}
+
+// MARK: - Все настройки
+
+struct SettingsSheet: View {
+    @ObservedObject var e: LapseEngine
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    Picker("Зум", selection: $e.zoom) {
+                        ForEach(e.zoomOptions) { Text($0.title).tag($0.value) }
+                    }
+                    .pickerStyle(.segmented)
+                    Toggle("4K (выкл. = 1080p)", isOn: $e.uhd)
+                    Toggle("Автофокус", isOn: $e.focusAuto)
+                    if e.focusAuto {
+                        Text("Коснись картинки, чтобы навести фокус. В темноте автофокус часто промахивается")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        VStack(alignment: .leading) {
+                            Text(e.focus >= 0.99 ? "Фокус: бесконечность" : String(format: "Фокус: %.0f%%", e.focus * 100))
+                            Slider(value: $e.focus, in: 0...1, onEditingChanged: { editing in if !editing { e.applyCamera() } })
+                        }
+                    }
+                } header: {
+                    Text("Камера")
+                } footer: {
+                    Text("Видео будет горизонтальным или вертикальным - так, как держишь телефон в момент старта")
+                }
+
+                Section("Яркость и цвет") {
+                    Toggle("Авто ISO", isOn: $e.isoAuto)
+                    if e.isoAuto {
+                        VStack(alignment: .leading) {
+                            Text("Коррекция: \(String(format: "%+.1f", e.evComp)) EV")
+                            Slider(value: $e.evComp, in: -4...1, step: 0.5)
+                        }
+                        Text("Минус - темнее и меньше шума. ISO сейчас: \(Int(e.iso))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        VStack(alignment: .leading) {
+                            Text("ISO: \(Int(e.iso))")
+                            Slider(value: $e.iso, in: e.minISO...max(e.maxISO, e.minISO + 1),
+                                   onEditingChanged: { editing in if !editing { e.applyCamera() } })
+                        }
+                        VStack(alignment: .leading) {
+                            Text("Яркость: x\(String(format: "%.2g", e.gain))")
+                            Slider(value: $e.gain, in: 0.25...8, step: 0.25)
+                        }
+                    }
+                    Toggle("Авто баланс белого", isOn: $e.wbAuto)
+                    if !e.wbAuto {
+                        VStack(alignment: .leading) {
+                            Text("Баланс белого: \(Int(e.wbTemp)) K")
+                            Slider(value: $e.wbTemp, in: 2500...7500, step: 100,
+                                   onEditingChanged: { editing in if !editing { e.applyCamera() } })
+                        }
+                    }
+                    Picker("Склейка", selection: $e.lighten) {
+                        Text("Среднее").tag(false)
+                        Text("Треки").tag(true)
+                    }
+                    .pickerStyle(.segmented)
+                    Text(e.lighten ? "Шлейфы огней и звёзд" : "Меньше шума, мягкие облака и вода")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Section("Старт") {
+                    Picker("Задержка старта", selection: $e.startDelayMin) {
+                        Text("Нет").tag(0)
+                        Text("1 мин").tag(1)
+                        Text("5 мин").tag(5)
+                        Text("15 мин").tag(15)
+                        Text("30 мин").tag(30)
+                        Text("1 ч").tag(60)
+                    }
+                }
+
+                Section("Сохранение") {
+                    Toggle("Видео в Фото", isOn: $e.saveVideo)
+                    Picker("Кадров в секунду", selection: $e.fps) {
+                        Text("24").tag(24)
+                        Text("25").tag(25)
+                        Text("30").tag(30)
+                    }
+                    .pickerStyle(.segmented)
+                    Toggle("Кадры JPEG в Файлы", isOn: $e.saveFrames)
+                }
+            }
+            .navigationTitle("Настройки")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Готово") { dismiss() }
+                }
+            }
+        }
     }
 }
