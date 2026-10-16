@@ -234,7 +234,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     static let defaultExposure: Double = 1
     /// Шаги выдержки: доли секунды, потом целые секунды
     static let exposureSteps: [Double] = {
-        let fractions: [Double] = [0.0333333, 0.0666667, 0.125, 0.25, 0.5]
+        let fractions: [Double] = [1.0 / 8000, 1.0 / 4000, 1.0 / 2000, 1.0 / 1000, 1.0 / 500, 1.0 / 250,
+                                   1.0 / 125, 1.0 / 60, 0.0333333, 0.0666667, 0.125, 0.25, 0.5]
         let whole: [Double] = (1...120).map { (i: Int) -> Double in Double(i) }
         return fractions + whole
     }()
@@ -255,6 +256,10 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     @Published var uhd: Bool { didSet { ud.set(uhd, forKey: "uhd") } }
     @Published var startDelayMin: Int { didSet { ud.set(startDelayMin, forKey: "delay") } }
     @Published var autoStopMin: Int { didSet { ud.set(autoStopMin, forKey: "autostop") } }
+    /// Пауза для охлаждения, если телефон сильно нагрелся
+    @Published var coolBreaks: Bool { didSet { ud.set(coolBreaks, forKey: "coolBreaks") } }
+    @Published var cooling = false
+    @Published var coolCount = 0
     @Published var isoAuto: Bool { didSet { ud.set(isoAuto, forKey: "isoAuto") } }
     @Published var wbAuto: Bool { didSet { ud.set(wbAuto, forKey: "wbAuto") } }
     @Published var focusAuto: Bool { didSet { ud.set(focusAuto, forKey: "focusAuto") } }
@@ -353,6 +358,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         uhd = d.flag("uhd", true)
         startDelayMin = d.num("delay", 0)
         autoStopMin = d.num("autostop", 0)
+        coolBreaks = d.flag("coolBreaks", true)
         isoAuto = d.flag("isoAuto", true)
         wbAuto = d.flag("wbAuto", false)
         focusAuto = d.flag("focusAuto", false)
@@ -506,15 +512,34 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     }
 
     /// Фокус по касанию картинки (только в автофокусе и до старта)
+    /// Касание кадра, как в Камере iPhone: фокус и замер яркости в этой точке.
+    /// Если автофокус выключен, после наводки фокус фиксируется на найденном расстоянии
     func focusAt(_ p: CGPoint) {
-        guard focusAuto, phase == .idle else { return }
+        guard phase == .idle else { return }
+        let fa = focusAuto
         queue.async {
             guard let dev = self.device, (try? dev.lockForConfiguration()) != nil else { return }
             defer { dev.unlockForConfiguration() }
             if dev.isFocusPointOfInterestSupported { dev.focusPointOfInterest = p }
             if dev.isFocusModeSupported(.autoFocus) { dev.focusMode = .autoFocus }
-            self.appliedFocusAuto = true
+            if dev.isExposurePointOfInterestSupported { dev.exposurePointOfInterest = p }
+            if dev.isExposureModeSupported(.continuousAutoExposure) { dev.exposureMode = .continuousAutoExposure }
+            // Чтобы смена яркости сразу после касания не сбила наводку
+            self.appliedFocusAuto = fa
         }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+            guard self.phase == .idle, !self.focusAuto, let dev = self.device else { return }
+            self.focus = min(max(dev.lensPosition, 0), 1)
+            self.scene = ""
+            self.applyCamera(forceFocus: true)
+        }
+    }
+
+    /// Яркость, как ползунок-солнце в Камере: сдвиг в EV
+    func nudgeBrightness(_ delta: Double) {
+        guard phase == .idle else { return }
+        let v = min(max(evComp + delta, -4), 2)
+        evComp = (v * 10).rounded() / 10
     }
 
     private func warmupFrames() -> Int {
@@ -570,6 +595,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         subTotal = c.subNeeded
         elapsed = 0
         pauses = 0
+        coolCount = 0
         let now = Date()
         recStart = now
         autoStopAt = autoStopMin > 0 ? now.addingTimeInterval(Double(autoStopMin) * 60) : nil
@@ -599,6 +625,11 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
     func stop() {
         guard phase == .recording || phase == .paused else { return }
+        if cooling {
+            cooling = false
+            coolStart = nil
+            queue.async { if !self.session.isRunning { self.session.startRunning() } }
+        }
         phase = .saving
         status = "Сохраняю..."
         UIApplication.shared.isIdleTimerDisabled = false
@@ -676,7 +707,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
     /// Съёмка продолжается сама, когда приложение снова на экране и камера свободна
     private func tryResume() {
-        guard phase == .paused, !inBackground, !session.isInterrupted else { return }
+        guard phase == .paused, !inBackground, !cooling, !session.isInterrupted else { return }
         phase = .recording
         status = isoAuto ? "Продолжаю: подбор ISO..." : "Съёмка продолжена"
         subDone = 0
@@ -737,8 +768,66 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         let state = ProcessInfo.processInfo.thermalState
         let isHot = state == .serious || state == .critical
         if isHot != hot { hot = isHot }
+        checkCooling(state, now)
         if tickCount % 10 == 0 { updateFree() }
         tickCount += 1
+    }
+
+    // MARK: Охлаждение (main)
+
+    private var coolStart: Date?
+
+    /// Сильный нагрев: камера выключается между кадрами, пока телефон не остынет.
+    /// Потом съёмка продолжается с той же паузой и настройками, что выставлены
+    private func checkCooling(_ state: ProcessInfo.ThermalState, _ now: Date) {
+        if !cooling {
+            guard coolBreaks, phase == .recording, state == .serious || state == .critical else { return }
+            cooling = true
+            coolCount += 1
+            coolStart = now
+            status = "Телефон нагрелся: пауза, пока остынет"
+            queue.async {
+                self.suspended = true
+                self.subCount = 0
+                self.inPause = false
+                if self.session.isRunning { self.session.stopRunning() }
+            }
+            return
+        }
+        let waited = now.timeIntervalSince(coolStart ?? now)
+        let cool = state == .nominal || state == .fair
+        // Минимум 1 минута отдыха, максимум 15 минут
+        guard (cool && waited >= 60) || waited >= 900 else {
+            if phase == .recording {
+                status = "Охлаждение: \(hms(waited)). Съёмка продолжится сама"
+            }
+            return
+        }
+        endCooling()
+    }
+
+    private func endCooling() {
+        guard cooling else { return }
+        cooling = false
+        coolStart = nil
+        guard phase == .recording else {
+            // Съёмка на паузе по другой причине: камера включится при её продолжении
+            queue.async { if !self.session.isRunning && !self.closed { self.session.startRunning() } }
+            return
+        }
+        status = "Остыл, продолжаю съёмку"
+        let s = currentSettings()
+        let warm = warmupFrames()
+        queue.async {
+            if !self.session.isRunning { self.session.startRunning() }
+            self.applyOnQueue(s, forceFocus: s.focusAuto)
+            self.subCount = 0
+            self.inPause = false
+            self.warmupLeft = warm
+            self.calibLeft = 0
+            self.calibSkip = 0
+            self.suspended = false
+        }
     }
 
     private func updateFree() {
@@ -1208,16 +1297,35 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
 struct CameraPreview: UIViewRepresentable {
     let engine: LapseEngine
-    let onTap: (CGPoint) -> Void
+    /// Точка для камеры и точка на экране
+    let onTap: (CGPoint, CGPoint) -> Void
+    /// Вертикальный сдвиг пальца (в точках) с прошлого вызова
+    let onPan: (CGFloat) -> Void
 
     final class PView: UIView {
-        var onTap: ((CGPoint) -> Void)?
+        var onTap: ((CGPoint, CGPoint) -> Void)?
+        var onPan: ((CGFloat) -> Void)?
+        private var lastY: CGFloat = 0
         override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
         var pl: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
 
         override init(frame: CGRect) {
             super.init(frame: frame)
             addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(tapped(_:))))
+            let pan = UIPanGestureRecognizer(target: self, action: #selector(panned(_:)))
+            pan.maximumNumberOfTouches = 1
+            addGestureRecognizer(pan)
+        }
+
+        @objc func panned(_ g: UIPanGestureRecognizer) {
+            let y = g.translation(in: self).y
+            switch g.state {
+            case .began: lastY = y
+            case .changed:
+                onPan?(y - lastY)
+                lastY = y
+            default: break
+            }
         }
 
         required init?(coder: NSCoder) {
@@ -1225,8 +1333,8 @@ struct CameraPreview: UIViewRepresentable {
         }
 
         @objc func tapped(_ g: UITapGestureRecognizer) {
-            let p = pl.captureDevicePointConverted(fromLayerPoint: g.location(in: self))
-            onTap?(p)
+            let v = g.location(in: self)
+            onTap?(pl.captureDevicePointConverted(fromLayerPoint: v), v)
         }
     }
 
@@ -1236,6 +1344,7 @@ struct CameraPreview: UIViewRepresentable {
         v.pl.videoGravity = .resizeAspect
         v.backgroundColor = .black
         v.onTap = onTap
+        v.onPan = onPan
         let e = engine
         DispatchQueue.main.async { e.attachPreview(v.pl) }
         return v
@@ -1243,6 +1352,7 @@ struct CameraPreview: UIViewRepresentable {
 
     func updateUIView(_ uiView: PView, context: Context) {
         uiView.onTap = onTap
+        uiView.onPan = onPan
     }
 }
 
@@ -1254,6 +1364,8 @@ struct ContentView: View {
     @State private var dark = false
     @State private var showTest = false
     @State private var showSettings = false
+    @State private var focusMark: CGPoint?
+    @State private var markTick = 0
 
     private var idle: Bool { e.phase == .idle }
     private var shooting: Bool {
@@ -1297,7 +1409,6 @@ struct ContentView: View {
         .onChange(of: e.wbAuto) { e.applyCamera() }
         .onChange(of: e.evComp) { e.applyCamera() }
         .sheet(isPresented: $showTest) { testSheet }
-        .sheet(isPresented: $showSettings) { SettingsSheet(e: e) }
     }
 
     // MARK: Верх
@@ -1324,7 +1435,19 @@ struct ContentView: View {
 
     private func previewBox(height: CGFloat?) -> some View {
         ZStack {
-            CameraPreview(engine: e, onTap: { e.focusAt($0) })
+            CameraPreview(engine: e,
+                          onTap: { dp, vp in
+                              guard idle else { return }
+                              e.focusAt(dp)
+                              focusMark = vp
+                              keepMark()
+                          },
+                          onPan: { dy in
+                              guard idle else { return }
+                              e.nudgeBrightness(Double(-dy) / 120)
+                              keepMark()
+                          })
+            if let m = focusMark { focusIndicator(at: m) }
             VStack {
                 HStack {
                     infoChip
@@ -1344,6 +1467,34 @@ struct ContentView: View {
         .frame(height: height)
         .background(Color.black)
         .clipShape(RoundedRectangle(cornerRadius: 14))
+    }
+
+    /// Жёлтая рамка фокуса и солнце яркости, как в Камере iPhone
+    private func focusIndicator(at m: CGPoint) -> some View {
+        GeometryReader { _ in
+            ZStack {
+                RoundedRectangle(cornerRadius: 3)
+                    .stroke(Color.yellow, lineWidth: 1.5)
+                    .frame(width: 72, height: 72)
+                    .position(m)
+                VStack(spacing: 2) {
+                    Image(systemName: "sun.max.fill")
+                    Text(String(format: "%+.1f", e.evComp)).font(.caption2.monospacedDigit())
+                }
+                .foregroundStyle(Color.yellow)
+                .position(x: m.x + 58, y: m.y)
+            }
+        }
+        .allowsHitTesting(false)
+    }
+
+    /// Рамка видна 3 с после последнего касания или движения пальцем
+    private func keepMark() {
+        markTick += 1
+        let t = markTick
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+            if markTick == t { focusMark = nil }
+        }
     }
 
     private var infoChip: some View {
@@ -1405,6 +1556,7 @@ struct ContentView: View {
             } else {
                 sceneCard
                 mainCard
+                if showSettings { SettingsPanel(e: e) }
             }
         }
         .padding(.bottom, 8)
@@ -1425,6 +1577,7 @@ struct ContentView: View {
     private var statusLine: String {
         var s = e.phase == .waiting ? "Старт через \(hms(e.countdown))" : e.status
         if e.pauses > 0 && (e.phase == .recording || e.phase == .paused) { s += " · пауз: \(e.pauses)" }
+        if e.coolCount > 0 && (e.phase == .recording || e.phase == .paused) { s += " · охлаждений: \(e.coolCount)" }
         if e.hot { s += " · телефон перегрет" }
         return s
     }
@@ -1500,9 +1653,16 @@ struct ContentView: View {
             Text(planLine)
                 .font(.footnote)
                 .foregroundStyle(.secondary)
-            Button { showSettings = true } label: {
-                Label("Все настройки", systemImage: "slider.horizontal.3")
-                    .frame(maxWidth: .infinity)
+            Text("Коснись кадра, чтобы навести фокус и яркость. Веди пальцем вверх или вниз - ярче или темнее")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Button { withAnimation { showSettings.toggle() } } label: {
+                HStack {
+                    Label("Все настройки", systemImage: "slider.horizontal.3")
+                    Spacer()
+                    Image(systemName: showSettings ? "chevron.up" : "chevron.down")
+                }
+                .frame(maxWidth: .infinity)
             }
             .buttonStyle(.bordered)
         }
@@ -1583,78 +1743,80 @@ struct ContentView: View {
     }
 }
 
-// MARK: - Все настройки
+// MARK: - Все настройки (раскрываются под основными, кадр остаётся на экране)
 
-struct SettingsSheet: View {
+struct SettingsPanel: View {
     @ObservedObject var e: LapseEngine
-    @Environment(\.dismiss) private var dismiss
+
+    private func card<C: View>(_ title: String, @ViewBuilder _ content: () -> C) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(title).font(.headline)
+            content()
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(white: 0.11), in: RoundedRectangle(cornerRadius: 14))
+    }
+
+    private func note(_ t: String) -> some View {
+        Text(t).font(.caption).foregroundStyle(.secondary)
+    }
 
     var body: some View {
-        NavigationStack {
-            Form {
-                Section {
-                    Picker("Зум", selection: $e.zoom) {
-                        ForEach(e.zoomOptions) { Text($0.title).tag($0.value) }
+        VStack(spacing: 12) {
+            card("Камера") {
+                Toggle("4K (выкл. = 1080p)", isOn: $e.uhd)
+                Toggle("Автофокус", isOn: $e.focusAuto)
+                if e.focusAuto {
+                    note("Камера сама держит фокус. В темноте автофокус часто промахивается")
+                } else {
+                    VStack(alignment: .leading) {
+                        Text(e.focus >= 0.99 ? "Фокус: бесконечность" : String(format: "Фокус: %.0f%%", e.focus * 100))
+                        Slider(value: $e.focus, in: 0...1, onEditingChanged: { editing in if !editing { e.applyCamera() } })
                     }
-                    .pickerStyle(.segmented)
-                    Toggle("4K (выкл. = 1080p)", isOn: $e.uhd)
-                    Toggle("Автофокус", isOn: $e.focusAuto)
-                    if e.focusAuto {
-                        Text("Коснись картинки, чтобы навести фокус. В темноте автофокус часто промахивается")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    } else {
-                        VStack(alignment: .leading) {
-                            Text(e.focus >= 0.99 ? "Фокус: бесконечность" : String(format: "Фокус: %.0f%%", e.focus * 100))
-                            Slider(value: $e.focus, in: 0...1, onEditingChanged: { editing in if !editing { e.applyCamera() } })
-                        }
-                    }
-                } header: {
-                    Text("Камера")
-                } footer: {
-                    Text("Видео будет горизонтальным или вертикальным - так, как держишь телефон в момент старта")
                 }
+                note("Видео будет горизонтальным или вертикальным - так, как держишь телефон в момент старта")
+            }
 
-                Section("Яркость и цвет") {
-                    Toggle("Авто ISO", isOn: $e.isoAuto)
-                    if e.isoAuto {
-                        VStack(alignment: .leading) {
-                            Text("Коррекция: \(String(format: "%+.1f", e.evComp)) EV")
-                            Slider(value: $e.evComp, in: -4...1, step: 0.5)
-                        }
-                        Text("Минус - темнее и меньше шума. ISO сейчас: \(Int(e.iso))")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    } else {
-                        VStack(alignment: .leading) {
-                            Text("ISO: \(Int(e.iso))")
-                            Slider(value: $e.iso, in: e.minISO...max(e.maxISO, e.minISO + 1),
-                                   onEditingChanged: { editing in if !editing { e.applyCamera() } })
-                        }
-                        VStack(alignment: .leading) {
-                            Text("Яркость: x\(String(format: "%.2g", e.gain))")
-                            Slider(value: $e.gain, in: 0.25...8, step: 0.25)
-                        }
+            card("Яркость и цвет") {
+                Toggle("Авто ISO", isOn: $e.isoAuto)
+                if e.isoAuto {
+                    VStack(alignment: .leading) {
+                        Text("Яркость: \(String(format: "%+.1f", e.evComp)) EV")
+                        Slider(value: $e.evComp, in: -4...2, step: 0.1)
                     }
-                    Toggle("Авто баланс белого", isOn: $e.wbAuto)
-                    if !e.wbAuto {
-                        VStack(alignment: .leading) {
-                            Text("Баланс белого: \(Int(e.wbTemp)) K")
-                            Slider(value: $e.wbTemp, in: 2500...7500, step: 100,
-                                   onEditingChanged: { editing in if !editing { e.applyCamera() } })
-                        }
+                    note("Минус - темнее и меньше шума. ISO сейчас: \(Int(e.iso))")
+                } else {
+                    VStack(alignment: .leading) {
+                        Text("ISO: \(Int(e.iso))")
+                        Slider(value: $e.iso, in: e.minISO...max(e.maxISO, e.minISO + 1),
+                               onEditingChanged: { editing in if !editing { e.applyCamera() } })
                     }
-                    Picker("Склейка", selection: $e.lighten) {
-                        Text("Среднее").tag(false)
-                        Text("Треки").tag(true)
+                    VStack(alignment: .leading) {
+                        Text("Усиление: x\(String(format: "%.2g", e.gain))")
+                        Slider(value: $e.gain, in: 0.25...8, step: 0.25)
                     }
-                    .pickerStyle(.segmented)
-                    Text(e.lighten ? "Шлейфы огней и звёзд" : "Меньше шума, мягкие облака и вода")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
                 }
+                Toggle("Авто баланс белого", isOn: $e.wbAuto)
+                if !e.wbAuto {
+                    VStack(alignment: .leading) {
+                        Text("Баланс белого: \(Int(e.wbTemp)) K")
+                        Slider(value: $e.wbTemp, in: 2500...7500, step: 100,
+                               onEditingChanged: { editing in if !editing { e.applyCamera() } })
+                    }
+                }
+                Picker("Склейка", selection: $e.lighten) {
+                    Text("Среднее").tag(false)
+                    Text("Треки").tag(true)
+                }
+                .pickerStyle(.segmented)
+                note(e.lighten ? "Шлейфы огней и звёзд" : "Меньше шума, мягкие облака и вода")
+            }
 
-                Section("Старт") {
+            card("Старт и сохранение") {
+                HStack {
+                    Text("Задержка старта")
+                    Spacer()
                     Picker("Задержка старта", selection: $e.startDelayMin) {
                         Text("Нет").tag(0)
                         Text("1 мин").tag(1)
@@ -1663,25 +1825,23 @@ struct SettingsSheet: View {
                         Text("30 мин").tag(30)
                         Text("1 ч").tag(60)
                     }
+                    .pickerStyle(.menu)
                 }
-
-                Section("Сохранение") {
-                    Toggle("Видео в Фото", isOn: $e.saveVideo)
+                Toggle("Видео в Фото", isOn: $e.saveVideo)
+                HStack {
+                    Text("Кадров в секунду")
+                    Spacer()
                     Picker("Кадров в секунду", selection: $e.fps) {
                         Text("24").tag(24)
                         Text("25").tag(25)
                         Text("30").tag(30)
                     }
                     .pickerStyle(.segmented)
-                    Toggle("Кадры JPEG в Файлы", isOn: $e.saveFrames)
+                    .frame(width: 160)
                 }
-            }
-            .navigationTitle("Настройки")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Готово") { dismiss() }
-                }
+                Toggle("Кадры JPEG в Файлы", isOn: $e.saveFrames)
+                Toggle("Пауза при перегреве", isOn: $e.coolBreaks)
+                note("Если телефон сильно нагреется, камера отдохнёт между кадрами (от 1 до 15 минут), потом съёмка продолжится с твоими настройками. В видео будет просто больший промежуток")
             }
         }
     }
