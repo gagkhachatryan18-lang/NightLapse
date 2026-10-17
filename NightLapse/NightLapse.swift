@@ -193,6 +193,7 @@ struct LapseConfig {
     var name = "NightLapse"
     var warmup = 2
     var isoAuto = false
+    var autoShutter = true
     var ev: Float = -2
     var iso: Float = 800
 }
@@ -265,6 +266,10 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     /// Сколько секунд сейчас добавлено к паузе из-за нагрева
     @Published var coolExtra: Double = 0
     @Published var isoAuto: Bool { didSet { ud.set(isoAuto, forKey: "isoAuto") } }
+    /// Умная выдержка: светлеет - выдержка кадра сама укорачивается, интервал между снимками тот же
+    @Published var autoShutter: Bool { didSet { ud.set(autoShutter, forKey: "autoShutter") } }
+    /// Выдержка кадра, которая реально используется сейчас
+    @Published var effExposure: Double = 0
     @Published var wbAuto: Bool { didSet { ud.set(wbAuto, forKey: "wbAuto") } }
     @Published var focusAuto: Bool { didSet { ud.set(focusAuto, forKey: "focusAuto") } }
     @Published var evComp: Double { didSet { ud.set(evComp, forKey: "ev") } }
@@ -340,6 +345,10 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     /// Авто ISO: если даже максимального ISO мало, кадр (уже очищенный от шума сложением) осветляется цифрово
     private var autoGain: Float = 1
     private let maxAutoGain: Float = 16
+    /// Сколько секунд копить кадр сейчас (при умной выдержке может быть меньше выставленной)
+    private var frameTarget: Double = 1
+    /// Пауза после текущего кадра: твоя пауза + время, на которое кадр вышел короче
+    private var pauseNow: Double = 0
     private var phaseStart: CMTime = .invalid
     private var writer: AVAssetWriter?
     private var writerInput: AVAssetWriterInput?
@@ -368,6 +377,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         autoStopMin = d.num("autostop", 0)
         coolBreaks = d.flag("coolBreaks", true)
         isoAuto = d.flag("isoAuto", true)
+        autoShutter = d.flag("autoShutter", true)
         wbAuto = d.flag("wbAuto", false)
         focusAuto = d.flag("focusAuto", false)
         evComp = d.dbl("ev", -2)
@@ -576,6 +586,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             self.calibLeft = c.isoAuto ? 4 : 0
             self.calibSkip = 0
             self.setAutoGain(1)
+            self.setFrameTarget(c.exposure)
             self.mode = .test
             self.beginCaptureExposure(s, forceFocus: ff)
         }
@@ -626,6 +637,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             self.calibLeft = c.isoAuto ? 4 : 0
             self.calibSkip = 0
             self.setAutoGain(1)
+            self.setFrameTarget(c.exposure)
             self.writer = nil
             self.framesDir = nil
             self.videoIndex = 0
@@ -757,7 +769,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         LapseConfig(subNeeded: subFramesPerFrame, exposure: exposureSeconds, pause: pauseSeconds, lighten: lighten,
                     gain: isoAuto ? 1 : gain, fps: Int32(fps), vertical: false,
                     saveVideo: saveVideo, saveFrames: saveFrames, name: name,
-                    warmup: warmupFrames(), isoAuto: isoAuto, ev: Float(evComp), iso: iso)
+                    warmup: warmupFrames(), isoAuto: isoAuto, autoShutter: autoShutter, ev: Float(evComp), iso: iso)
     }
 
     private func tick() {
@@ -1041,6 +1053,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             }
         }
         if calibLeft == 0 {
+            updateFrameTarget()
             let isTest = mode == .test
             DispatchQueue.main.async {
                 if self.phase == .recording { self.status = "Съёмка" }
@@ -1051,6 +1064,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
     /// После каждого кадра: плавная подстройка, не больше 1/3 EV за кадр, чтобы не было скачков яркости
     private func autoISOStep(mean: Float) {
+        defer { updateFrameTarget() }
         let f = lightFactor(mean: mean, limit: 1.26)
         guard abs(f - 1) > 0.02 else { return }
         if f < 1 && autoGain > 1 {
@@ -1062,6 +1076,25 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         if abs(r - 1) > 0.005 { warmupLeft = max(warmupLeft, 1) }
         let rest = f / max(r, 0.0001)
         if rest > 1.02 { setAutoGain(autoGain * Float(pow(rest, 1 / 2.2))) }
+    }
+
+    /// Умная выдержка, как приоритет диафрагмы на камере: выдержка кадра такая, чтобы шум был
+    /// не больше, чем у одного снимка на низком ISO. Ночью - вся выставленная выдержка,
+    /// на рассвете короче, днём - один короткий снимок
+    private func updateFrameTarget() {
+        guard cfg.isoAuto, cfg.autoShutter, let dev = device else {
+            setFrameTarget(cfg.exposure)
+            return
+        }
+        let isoRef = Double(max(dev.activeFormat.minISO * 2, 100))
+        let dur = CMTimeGetSeconds(curDur)
+        let need = autoGain > 1.01 ? cfg.exposure : dur * Double(curISO) / isoRef
+        setFrameTarget(min(cfg.exposure, max(dur, need)))
+    }
+
+    private func setFrameTarget(_ t: Double) {
+        frameTarget = t
+        DispatchQueue.main.async { self.effExposure = t }
     }
 
     private func setAutoGain(_ g: Float) {
@@ -1080,7 +1113,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         }
         let t = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         if inPause {
-            if CMTimeGetSeconds(t - phaseStart) < cfg.pause + extraPause { return }
+            if CMTimeGetSeconds(t - phaseStart) < pauseNow + extraPause { return }
             inPause = false
         }
         if cfg.isoAuto && calibLeft > 0 {
@@ -1094,9 +1127,9 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         let sub = CMTimeGetSeconds(curDur)
         let got = CMTimeGetSeconds(t - accStart) + sub
         let total = cfg.subNeeded
-        let done = min(total, Int((got / max(cfg.exposure, 0.001) * Double(total)).rounded(.down)))
+        let done = min(total, Int((got / max(frameTarget, 0.001) * Double(total)).rounded(.down)))
         DispatchQueue.main.async { self.subDone = done }
-        guard got >= cfg.exposure - sub * 0.5 else { return }
+        guard got >= frameTarget - sub * 0.5 else { return }
 
         let n = subCount
         subCount = 0
@@ -1119,7 +1152,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             return
         }
 
-        inPause = cfg.pause + extraPause > 0
+        pauseNow = cfg.pause + max(0, cfg.exposure - frameTarget)
+        inPause = pauseNow + extraPause > 0
         if let f = frame {
             writeFrame(f)
             if cfg.isoAuto { autoISOStep(mean: mean) }
@@ -1591,6 +1625,9 @@ struct ContentView: View {
         var s = e.phase == .waiting ? "Старт через \(hms(e.countdown))" : e.status
         if e.pauses > 0 && (e.phase == .recording || e.phase == .paused) { s += " · пауз: \(e.pauses)" }
         if e.cooling && (e.phase == .recording || e.phase == .paused) { s += " · пауза +\(Int(e.coolExtra)) с от нагрева" }
+        if e.phase == .recording && e.isoAuto && e.autoShutter && e.effExposure > 0 && e.effExposure < e.exposureSeconds - 0.01 {
+            s += " · выдержка \(expText(e.effExposure))"
+        }
         if e.hot { s += " · телефон перегрет" }
         return s
     }
@@ -1813,6 +1850,10 @@ struct SettingsPanel: View {
                         Slider(value: $e.evComp, in: -4...2, step: 0.1)
                     }
                     note("Минус - темнее и меньше шума. ISO сейчас: \(Int(e.iso))" + (e.autoGainShown > 1.05 ? String(format: ", + усиление x%.1f", e.autoGainShown) : ""))
+                    Toggle("Умная выдержка", isOn: $e.autoShutter)
+                    note(e.autoShutter
+                         ? "Как приоритет диафрагмы на камере: светает - выдержка сама укорачивается, темнеет - растёт до выставленной. Снимки идут с тем же интервалом" + (e.phase == .recording && e.effExposure > 0 ? ". Сейчас: \(expText(e.effExposure))" : "")
+                         : "Выдержка всегда такая, как выставлена")
                 } else {
                     VStack(alignment: .leading) {
                         Text("ISO: \(Int(e.iso))")
