@@ -164,8 +164,8 @@ enum LapseScene: String, CaseIterable, Identifiable {
     var lighten: Bool { self == .trails || self == .city }
     var ev: Double {
         switch self {
-        case .stars: return -1.5
-        case .trails: return -1.5
+        case .stars: return -1
+        case .trails: return -1
         case .city: return -1
         case .clouds: return -0.5
         }
@@ -244,6 +244,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     // Остальные настройки запоминаются между запусками
     @Published var pauseSeconds: Double { didSet { ud.set(pauseSeconds, forKey: "pause") } }
     @Published var iso: Float { didSet { ud.set(iso, forKey: "iso") } }
+    /// Цифровое усиление в авто ISO, когда сенсор уже на максимуме
+    @Published var autoGainShown: Float = 1
     @Published var wbTemp: Float { didSet { ud.set(wbTemp, forKey: "wb") } }
     @Published var focus: Float { didSet { ud.set(focus, forKey: "focus") } }
     @Published var gain: Float { didSet { ud.set(gain, forKey: "gain") } }
@@ -335,6 +337,9 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     private var accStart: CMTime = .invalid
     private var inPause = false
     private var extraPause: Double = 0
+    /// Авто ISO: если даже максимального ISO мало, кадр (уже очищенный от шума сложением) осветляется цифрово
+    private var autoGain: Float = 1
+    private let maxAutoGain: Float = 16
     private var phaseStart: CMTime = .invalid
     private var writer: AVAssetWriter?
     private var writerInput: AVAssetWriterInput?
@@ -570,6 +575,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             self.warmupLeft = c.warmup
             self.calibLeft = c.isoAuto ? 4 : 0
             self.calibSkip = 0
+            self.setAutoGain(1)
             self.mode = .test
             self.beginCaptureExposure(s, forceFocus: ff)
         }
@@ -619,6 +625,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             self.warmupLeft = c.warmup
             self.calibLeft = c.isoAuto ? 4 : 0
             self.calibSkip = 0
+            self.setAutoGain(1)
             self.writer = nil
             self.framesDir = nil
             self.videoIndex = 0
@@ -1018,12 +1025,20 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             calibSkip -= 1
             return
         }
-        let f = lightFactor(mean: meanLuma(pb), limit: 16)
+        let f = lightFactor(mean: meanLuma(pb), limit: 64)
         calibLeft -= 1
-        if abs(f - 1) < 0.08 || abs(setExposure(light: currentLight() * f) - 1) < 0.02 {
+        if abs(f - 1) < 0.08 {
             calibLeft = 0
         } else {
-            calibSkip = 2
+            let r = setExposure(light: currentLight() * min(f, 16))
+            if abs(r - 1) < 0.02 || calibLeft == 0 {
+                calibLeft = 0
+                // Сенсор на пределе: недостающий свет добавит цифровое усиление
+                let rest = f / max(r, 0.0001)
+                setAutoGain(rest > 1.08 ? Float(pow(rest, 1 / 2.2)) : 1)
+            } else {
+                calibSkip = 2
+            }
         }
         if calibLeft == 0 {
             let isTest = mode == .test
@@ -1037,9 +1052,22 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     /// После каждого кадра: плавная подстройка, не больше 1/3 EV за кадр, чтобы не было скачков яркости
     private func autoISOStep(mean: Float) {
         let f = lightFactor(mean: mean, limit: 1.26)
-        if abs(f - 1) > 0.02, abs(setExposure(light: currentLight() * f) - 1) > 0.005 {
-            warmupLeft = max(warmupLeft, 1)
+        guard abs(f - 1) > 0.02 else { return }
+        if f < 1 && autoGain > 1 {
+            // Слишком светло: сначала убираем цифровое усиление
+            setAutoGain(autoGain * Float(pow(f, 1 / 2.2)))
+            return
         }
+        let r = setExposure(light: currentLight() * f)
+        if abs(r - 1) > 0.005 { warmupLeft = max(warmupLeft, 1) }
+        let rest = f / max(r, 0.0001)
+        if rest > 1.02 { setAutoGain(autoGain * Float(pow(rest, 1 / 2.2))) }
+    }
+
+    private func setAutoGain(_ g: Float) {
+        autoGain = min(max(g, 1), maxAutoGain)
+        let v = autoGain
+        DispatchQueue.main.async { self.autoGainShown = v }
     }
 
     // MARK: Обработка кадров (queue)
@@ -1148,7 +1176,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         let dst = base.assumingMemoryBound(to: UInt8.self)
         let rowN = width * 4
         let h = height
-        var s: Float = cfg.lighten ? cfg.gain : cfg.gain / Float(max(n, 1))
+        let g = cfg.isoAuto ? autoGain : cfg.gain
+        var s: Float = cfg.lighten ? g : g / Float(max(n, 1))
         var lo: Float = 0
         var hi: Float = 255
         acc.withUnsafeMutableBufferPointer { a in
@@ -1783,7 +1812,7 @@ struct SettingsPanel: View {
                         Text("Яркость: \(String(format: "%+.1f", e.evComp)) EV")
                         Slider(value: $e.evComp, in: -4...2, step: 0.1)
                     }
-                    note("Минус - темнее и меньше шума. ISO сейчас: \(Int(e.iso))")
+                    note("Минус - темнее и меньше шума. ISO сейчас: \(Int(e.iso))" + (e.autoGainShown > 1.05 ? String(format: ", + усиление x%.1f", e.autoGainShown) : ""))
                 } else {
                     VStack(alignment: .leading) {
                         Text("ISO: \(Int(e.iso))")
