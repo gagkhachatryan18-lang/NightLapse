@@ -352,6 +352,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
     // queue: поиск резкости по звёздам
     private var focusPlan: [Float] = []
+    /// queue: до этого времени кадры не берутся (защита от дрожания после нажатия)
+    private var holdUntil: CFTimeInterval = 0
     private var focusIdx = 0
     private var focusSkip = 0
     private var focusAcc = 0.0
@@ -362,7 +364,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     func starFocus() {
         guard phase == .idle else { return }
         phase = .test
-        status = "Фокус по звёздам..."
+        status = "Не трогай телефон, ищу резкость по звёздам..."
         subTotal = 23
         subDone = 0
         UIApplication.shared.isIdleTimerDisabled = true
@@ -382,6 +384,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
                 dev.unlockForConfiguration()
             }
             self.setLens(self.focusPlan[0])
+            self.holdUntil = CACurrentMediaTime() + 3
             self.mode = .focus
         }
     }
@@ -767,7 +770,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         phase = .test
         subTotal = c.subNeeded
         subDone = 0
-        status = c.isoAuto ? "Подбор ISO..." : "Тестовый кадр..."
+        status = "Не трогай телефон 3 с..."
         UIApplication.shared.isIdleTimerDisabled = true
         let s = currentSettings()
         let ff = focusAuto
@@ -783,6 +786,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             self.calibSkip = 0
             self.setAutoGain(1)
             self.setFrameTarget(c.exposure)
+            self.holdUntil = CACurrentMediaTime() + 3
             self.mode = .test
             self.beginCaptureExposure(s, forceFocus: ff)
         }
@@ -818,7 +822,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         recStart = now
         autoStopAt = autoStopMin > 0 ? now.addingTimeInterval(Double(autoStopMin) * 60) : nil
         phase = .recording
-        status = c.isoAuto ? "Подбор ISO..." : "Съёмка"
+        status = "Не трогай телефон 3 с..."
         UIApplication.shared.isIdleTimerDisabled = true
         let s = currentSettings()
         let ff = focusAuto
@@ -844,6 +848,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             self.liveCur = nil
             self.liveIndex = 0
             self.recStartQ = Date()
+            self.holdUntil = CACurrentMediaTime() + 3
             self.mode = .record
             self.beginCaptureExposure(s, forceFocus: ff)
         }
@@ -1372,6 +1377,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard mode != .off, !suspended, let pb = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        // Первые 3 секунды после нажатия телефон ещё дрожит от касания - эти кадры пропускаем
+        if CACurrentMediaTime() < holdUntil { return }
         if mode == .focus {
             focusStep(pb)
             return
