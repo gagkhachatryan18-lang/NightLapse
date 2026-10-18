@@ -403,6 +403,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     }
     private var live: [LiveOut] = []
     private var trailMax: Frame?
+    /// Сколько ночных кадров попало в фото со следами
+    private var nightFrames = 0
     private var liveCur: Frame?
     private var liveIndex: Int64 = 0
     /// Время старта съёмки для журнала (queue)
@@ -696,6 +698,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             self.outIndex = 0
             self.live = []
             self.trailMax = nil
+            self.nightFrames = 0
             self.liveCur = nil
             self.liveIndex = 0
             self.recStartQ = Date()
@@ -1389,9 +1392,19 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         guard var cur = liveCur else { return }
         liveCur = nil
         cur.load(from: pb)
-        trailMax?.trail(with: cur, lut: maxLUT)
+        // Следы копятся только в темноте: днём «самое яркое» из всех кадров - это белое небо,
+        // а листья на ветру заменяются небом. Светлый кадр идёт в Starlapse как есть, без следа
+        let night = isNightLight(Double(curISO) * CMTimeGetSeconds(curDur))
+        if night {
+            trailMax?.trail(with: cur, lut: maxLUT)
+            nightFrames += 1
+        }
         for i in live.indices {
-            live[i].acc.trail(with: cur, lut: live[i].lut)
+            if night {
+                live[i].acc.trail(with: cur, lut: live[i].lut)
+            } else {
+                live[i].acc = cur
+            }
             var pbo: CVPixelBuffer?
             if let pool = live[i].adaptor.pixelBufferPool {
                 CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pbo)
@@ -1423,7 +1436,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             o.writer.finishWriting { sem.signal() }
             sem.wait()
         }
-        if let d = dir, let tm = trailMax, let img = tm.cgImage(), let jpg = ShootStore.jpeg(img) {
+        if nightFrames > 0, let d = dir, let tm = trailMax, let img = tm.cgImage(), let jpg = ShootStore.jpeg(img) {
             try? jpg.write(to: d.appendingPathComponent("startrail.jpg"))
         }
         trailMax = nil
