@@ -25,7 +25,10 @@ struct NightLapseApp: App {
                     ContentView(onSwitch: { switchTo(.daily) })
                         .tint(.red)
                 } else {
-                    RootView(onSwitch: { switchTo(.night) })
+                    RootView(onSwitch: { switchTo(.night) }, onScene: { sc in
+                        UserDefaults.standard.set(sc.rawValue, forKey: "pendingScene")
+                        switchTo(.night)
+                    })
                         .tint(.orange)
                 }
             }
@@ -181,6 +184,8 @@ struct LapseConfig {
     var autoShutter = true
     var ev: Float = -2
     var iso: Float = 800
+    var scene = ""
+    var interval = 0.0
 }
 
 struct CamSettings {
@@ -289,6 +294,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     @Published var lastImage: UIImage?
     @Published var testCount = 0
     @Published var pauses = 0
+    /// Папка с кадрами последней законченной съёмки: после «Стоп» открывается редактор
+    @Published var lastShoot: URL?
 
     var subFramesPerFrame: Int { max(1, Int((exposureSeconds / max(sensorExposure, 0.0001)).rounded())) }
 
@@ -386,6 +393,21 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     private var framesDir: URL?
     private var videoIndex: Int64 = 0
     private var outIndex = 0
+    /// Starlapse трёх длин и фото со следами собираются прямо во время съёмки
+    private struct LiveOut {
+        let writer: AVAssetWriter
+        let input: AVAssetWriterInput
+        let adaptor: AVAssetWriterInputPixelBufferAdaptor
+        var acc: Frame
+        let lut: [UInt8]
+    }
+    private var live: [LiveOut] = []
+    private var trailMax: Frame?
+    private var liveCur: Frame?
+    private var liveIndex: Int64 = 0
+    /// Время старта съёмки для журнала (queue)
+    private var recStartQ: Date?
+    private let maxLUT = decayLUT(1)
 
     override init() {
         let d = UserDefaults.standard
@@ -437,6 +459,10 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         nc.addObserver(forName: AVCaptureSession.runtimeErrorNotification, object: session, queue: .main) { [weak self] _ in
             self?.camRuntimeError()
         }
+        nc.addObserver(forName: UIApplication.didReceiveMemoryWarningNotification, object: nil, queue: .main) { _ in
+            Diag.event("Мало памяти")
+        }
+        Diag.event("Запуск приложения, \(Diag.model())")
 
         ticker = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.tick() }
         tick()
@@ -668,6 +694,11 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             self.framesDir = nil
             self.videoIndex = 0
             self.outIndex = 0
+            self.live = []
+            self.trailMax = nil
+            self.liveCur = nil
+            self.liveIndex = 0
+            self.recStartQ = Date()
             self.mode = .record
             self.beginCaptureExposure(s, forceFocus: ff)
         }
@@ -734,6 +765,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
     private func camRuntimeError() {
         guard !closed else { return }
+        Diag.event("Ошибка камеры, перезапуск")
         queue.async {
             if !self.session.isRunning { self.session.startRunning() }
         }
@@ -743,6 +775,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
     private func pauseRecording(_ why: String) {
         guard phase == .recording else { return }
+        Diag.event(why)
         phase = .paused
         status = why
         pauses += 1
@@ -757,6 +790,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     /// Съёмка продолжается сама, когда приложение снова на экране и камера свободна
     private func tryResume() {
         guard phase == .paused, !inBackground, !session.isInterrupted else { return }
+        Diag.event("Съёмка продолжена")
         phase = .recording
         status = isoAuto ? "Продолжаю: подбор ISO..." : "Съёмка продолжена"
         subDone = 0
@@ -794,8 +828,9 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     private func makeConfig(name: String) -> LapseConfig {
         LapseConfig(subNeeded: subFramesPerFrame, exposure: exposureSeconds, pause: pauseSeconds, lighten: lighten,
                     gain: isoAuto ? 1 : gain, fps: Int32(fps), vertical: false,
-                    saveVideo: saveVideo, saveFrames: saveFrames, name: name,
-                    warmup: warmupFrames(), isoAuto: isoAuto, autoShutter: autoShutter, ev: Float(evComp), iso: iso)
+                    saveVideo: saveVideo, saveFrames: true, name: name,
+                    warmup: warmupFrames(), isoAuto: isoAuto, autoShutter: autoShutter, ev: Float(evComp), iso: iso,
+                    scene: scene, interval: intervalSeconds)
     }
 
     private func tick() {
@@ -842,6 +877,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             if !cooling {
                 cooling = true
                 coolCount += 1
+                Diag.event("Нагрев \(Diag.thermal()): пауза +\(Int(x)) с")
             }
             if x != coolExtra {
                 setExtra(x)
@@ -850,6 +886,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         } else if cooling {
             cooling = false
             setExtra(0)
+            Diag.event("Остыл")
             if phase == .recording { status = "Остыл, пауза снова \(Int(pauseSeconds)) с" }
         }
     }
@@ -918,6 +955,10 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         let subMin = CMTimeGetSeconds(fmt.minExposureDuration)
         let lo = fmt.minISO, hi = fmt.maxISO
         appliedFocusAuto = nil
+        let dims = CMVideoFormatDescriptionGetDimensions(fmt.formatDescription)
+        Diag.device = "Камера: \(dev.localizedName), зум \(zoom.title), формат \(dims.width)x\(dims.height), "
+            + "выдержка сенсора \(String(format: "%.4f", subMin))-\(String(format: "%.3f", sub)) с, ISO \(Int(lo))-\(Int(hi))"
+        Diag.event("Камера: " + Diag.device)
         applyOnQueue(settings, forceFocus: true)
         if !session.isRunning { session.startRunning() }
         DispatchQueue.main.async {
@@ -1160,6 +1201,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         let n = subCount
         subCount = 0
         phaseStart = t
+        let t0 = CACurrentMediaTime()
         let frame = renderFrame(count: n)
         var mean: Float = 0
         if cfg.isoAuto, let f = frame { mean = meanLuma(f) }
@@ -1169,6 +1211,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             DispatchQueue.main.async { self.applyCamera() }
             let img = frame.flatMap { makeThumb($0, maxSide: 2000) }
             let note = cfg.isoAuto ? "Тест готов. ISO подобран: \(Int(curISO))" : "Тест готов: проверь яркость и резкость"
+            Diag.event("Тест: подкадров \(n), сенсор \(String(format: "%.4f", CMTimeGetSeconds(curDur))) с, ISO \(Int(curISO)), "
+                + "усиление \(String(format: "%.2f", autoGain)), яркость \(String(format: "%.0f", mean)), выдержка \(cfg.exposure) с")
             DispatchQueue.main.async {
                 self.lastImage = img
                 self.subDone = 0
@@ -1183,7 +1227,15 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         if let f = frame {
             writeFrame(f)
             if cfg.isoAuto { autoISOStep(mean: mean) }
+        } else {
+            Diag.event("Кадр \(outIndex + 1) не собрался")
         }
+        let ms = (CACurrentMediaTime() - t0) * 1000
+        let since = recStartQ.map { Date().timeIntervalSince($0) } ?? 0
+        Diag.frame([String(format: "%.1f", since), "\(outIndex)", "\(n)", String(format: "%.5f", CMTimeGetSeconds(curDur)),
+                    "\(Int(curISO))", String(format: "%.2f", autoGain), String(format: "%.3f", frameTarget),
+                    String(format: "%.1f", mean), String(format: "%.1f", pauseNow), String(format: "%.0f", extraPause),
+                    String(format: "%.0f", ms), Diag.thermal(), "\(battery)", String(format: "%.1f", freeGB)])
     }
 
     private func accumulate(_ pb: CVPixelBuffer) {
@@ -1272,6 +1324,12 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
                 let dir = Self.docs().appendingPathComponent(cfg.name + "_frames", isDirectory: true)
                 try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
                 framesDir = dir
+                ShootStore.writeInfo(dir, ["fps": Int(cfg.fps), "scene": cfg.scene, "interval": cfg.interval,
+                                           "created": Date().timeIntervalSince1970, "done": false,
+                                           "exposure": cfg.exposure, "pause": cfg.pause, "ev": Double(cfg.ev),
+                                           "device": Diag.model(), "camera": Diag.device])
+                Diag.beginShoot(dir, "режим \(cfg.scene), интервал \(cfg.interval) с, выдержка \(cfg.exposure) с, "
+                    + "пауза \(cfg.pause) с, яркость \(cfg.ev) EV, \(cfg.fps) к/с, подкадров \(cfg.subNeeded)")
             }
             if let dir = framesDir, let cs = CGColorSpace(name: CGColorSpace.sRGB) {
                 var img = CIImage(cvPixelBuffer: out)
@@ -1280,6 +1338,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
                 let q = CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String)
                 try? ci.writeJPEGRepresentation(of: img, to: url, colorSpace: cs, options: [q: 0.95])
             }
+            updateLive(out)
         }
 
         outIndex += 1
@@ -1289,6 +1348,86 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             self.framesDone = c
             if let t = thumb { self.lastImage = t }
         }
+    }
+
+    private func makeLiveWriter(_ url: URL, _ w: Int, _ h: Int) -> (AVAssetWriter, AVAssetWriterInput, AVAssetWriterInputPixelBufferAdaptor)? {
+        try? FileManager.default.removeItem(at: url)
+        guard let wr = try? AVAssetWriter(outputURL: url, fileType: .mov) else { return nil }
+        wr.movieFragmentInterval = CMTime(seconds: 10, preferredTimescale: 600)
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
+            AVVideoCodecKey: AVVideoCodecType.hevc,
+            AVVideoWidthKey: w,
+            AVVideoHeightKey: h,
+            AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: w * h * 18]
+        ])
+        input.expectsMediaDataInRealTime = false
+        let ad = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey as String: w,
+            kCVPixelBufferHeightKey as String: h
+        ])
+        guard wr.canAdd(input) else { return nil }
+        wr.add(input)
+        guard wr.startWriting() else { return nil }
+        wr.startSession(atSourceTime: .zero)
+        return (wr, input, ad)
+    }
+
+    /// queue: каждый новый кадр сразу добавляется в Starlapse и в фото со следами - после «Стоп» всё готово
+    private func updateLive(_ pb: CVPixelBuffer) {
+        guard let dir = framesDir else { return }
+        let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb)
+        if trailMax == nil || trailMax?.w != w || trailMax?.h != h {
+            trailMax = Frame(w: w, h: h)
+            liveCur = Frame(w: w, h: h)
+            liveIndex = 0
+            live = Trail.allCases.compactMap { t in
+                guard let u = ShootStore.liveURL(dir, .starlapse, t), let m = makeLiveWriter(u, w, h) else { return nil }
+                return LiveOut(writer: m.0, input: m.1, adaptor: m.2, acc: Frame(w: w, h: h), lut: decayLUT(t.decay))
+            }
+        }
+        guard var cur = liveCur else { return }
+        liveCur = nil
+        cur.load(from: pb)
+        trailMax?.trail(with: cur, lut: maxLUT)
+        for i in live.indices {
+            live[i].acc.trail(with: cur, lut: live[i].lut)
+            var pbo: CVPixelBuffer?
+            if let pool = live[i].adaptor.pixelBufferPool {
+                CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pbo)
+            } else {
+                CVPixelBufferCreate(nil, w, h, kCVPixelFormatType_32BGRA, nil, &pbo)
+            }
+            guard let o = pbo else { continue }
+            live[i].acc.copy(to: o)
+            var tries = 0
+            while !live[i].input.isReadyForMoreMediaData && tries < 300 {
+                usleep(10_000)
+                tries += 1
+            }
+            if live[i].input.isReadyForMoreMediaData {
+                live[i].adaptor.append(o, withPresentationTime: CMTime(value: liveIndex, timescale: cfg.fps))
+            }
+        }
+        liveCur = cur
+        liveIndex += 1
+    }
+
+    /// queue: дописать Starlapse и сохранить фото со следами в папку съёмки
+    private func finishLive(_ dir: URL?) {
+        let outs = live
+        live = []
+        for o in outs {
+            o.input.markAsFinished()
+            let sem = DispatchSemaphore(value: 0)
+            o.writer.finishWriting { sem.signal() }
+            sem.wait()
+        }
+        if let d = dir, let tm = trailMax, let img = tm.cgImage(), let jpg = ShootStore.jpeg(img) {
+            try? jpg.write(to: d.appendingPathComponent("startrail.jpg"))
+        }
+        trailMax = nil
+        liveCur = nil
     }
 
     private func makeThumb(_ pb: CVPixelBuffer, maxSide: CGFloat) -> UIImage? {
@@ -1335,12 +1474,24 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         DispatchQueue.main.async { self.applyCamera() }
         suspended = false
         let frames = outIndex
-        let framesSaved = framesDir != nil
+        let dir = framesDir
+        framesDir = nil
+        finishLive(dir)
+        if let d = dir { ShootStore.markDone(d) }
+        Diag.event("Стоп: \(frames) кадров")
+        Diag.endShoot()
+        func end(_ m: String) {
+            DispatchQueue.main.async {
+                self.finished(m)
+                if let d = dir { self.lastShoot = d }
+            }
+        }
         guard let w = writer, let url = videoURL, videoIndex > 0 else {
             writer = nil
-            DispatchQueue.main.async {
-                if frames == 0 { self.finished("Ни одного кадра не снято") }
-                else { self.finished(framesSaved ? "Кадры сохранены: Файлы → На iPhone → NightLapse" : "Готово") }
+            if frames == 0 {
+                DispatchQueue.main.async { self.finished("Ни одного кадра не снято") }
+            } else {
+                end("Кадры сохранены: Файлы → На iPhone → NightLapse")
             }
             return
         }
@@ -1350,16 +1501,15 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         adaptor = nil
         w.finishWriting {
             guard w.status == .completed else {
-                DispatchQueue.main.async { self.finished("Ошибка записи видео. Проверь Файлы → NightLapse") }
+                Diag.event("Ошибка записи видео: \(w.error?.localizedDescription ?? "-")")
+                end("Ошибка записи видео, но все кадры целы: Файлы → NightLapse")
                 return
             }
             PHPhotoLibrary.shared().performChanges({
                 PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
             }) { ok, _ in
                 if ok { try? FileManager.default.removeItem(at: url) }
-                DispatchQueue.main.async {
-                    self.finished(ok ? "Видео сохранено в Фото" : "Нет доступа к Фото. Видео лежит в Файлы → NightLapse")
-                }
+                end(ok ? "Видео сохранено в Фото" : "Нет доступа к Фото. Видео лежит в Файлы → NightLapse")
             }
         }
     }
@@ -1440,14 +1590,10 @@ struct ContentView: View {
     @State private var focusMark: CGPoint?
     @State private var markTick = 0
     @State private var openParam: Param?
+    @State private var showShoots = false
+    @State private var shootToOpen: URL?
 
     enum Param { case brightness, interval, duration }
-
-    struct ModeItem: Identifiable {
-        let title: String
-        let index: Int
-        var id: Int { index }
-    }
 
     private var idle: Bool { e.phase == .idle }
     private var shooting: Bool {
@@ -1483,7 +1629,13 @@ struct ContentView: View {
                 if dark { darkOverlay }
             }
         }
-        .onAppear { e.configure() }
+        .onAppear {
+            e.configure()
+            if let p = UserDefaults.standard.string(forKey: "pendingScene"), let sc = LapseScene(rawValue: p) {
+                UserDefaults.standard.removeObject(forKey: "pendingScene")
+                e.applyScene(sc)
+            }
+        }
         .onDisappear { e.shutdown() }
         .onChange(of: e.testCount) { showTest = true }
         .onChange(of: e.zoom) {
@@ -1497,6 +1649,15 @@ struct ContentView: View {
         .onChange(of: e.wbAuto) { e.applyCamera() }
         .onChange(of: e.evComp) { e.applyCamera() }
         .onChange(of: e.phase) { if e.phase != .idle { openParam = nil } }
+        .onChange(of: e.lastShoot) {
+            if let d = e.lastShoot {
+                shootToOpen = d
+                showShoots = true
+            }
+        }
+        .sheet(isPresented: $showShoots, onDismiss: { shootToOpen = nil }) {
+            ShootsView(open: shootToOpen)
+        }
         .sheet(isPresented: $showTest) { testSheet }
         .sheet(isPresented: $showSettings) {
             SettingsSheet(e: e)
@@ -1801,32 +1962,7 @@ struct ContentView: View {
 
     /// Режимы листаются пальцем или касанием, как в Камере
     private var modeCarousel: some View {
-        let items: [ModeItem] = [ModeItem(title: "Кадр дня", index: 0)]
-            + LapseScene.allCases.enumerated().map { ModeItem(title: $0.element.title, index: $0.offset + 1) }
-        let sel = (LapseScene.allCases.firstIndex(of: e.sceneKind) ?? 0) + 1
-        let w: CGFloat = 86
-        return HStack(spacing: 0) {
-            ForEach(items) { item in
-                let i = item.index
-                Button { select(i) } label: {
-                    Text(item.title.uppercased())
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(i == sel ? Color.yellow : (i == 0 ? Color.orange.opacity(0.8) : Color.white))
-                        .lineLimit(1)
-                        .frame(width: w, height: 28)
-                }
-            }
-        }
-        .fixedSize()
-        .offset(x: (CGFloat(items.count - 1) / 2 - CGFloat(sel)) * w)
-        .frame(maxWidth: .infinity)
-        .clipped()
-        .contentShape(Rectangle())
-        .gesture(DragGesture(minimumDistance: 15).onEnded { v in
-            if v.translation.width < -30 { select(sel + 1) }
-            if v.translation.width > 30 { select(sel - 1) }
-        })
-        .animation(.easeOut(duration: 0.2), value: sel)
+        ModeCarousel(selected: (LapseScene.allCases.firstIndex(of: e.sceneKind) ?? 0) + 1) { select($0) }
     }
 
     private func select(_ i: Int) {
@@ -1853,13 +1989,18 @@ struct ContentView: View {
     }
 
     @ViewBuilder private var thumbButton: some View {
-        Button { if e.lastImage != nil { showTest = true } } label: {
+        Button {
+            shootToOpen = nil
+            showShoots = true
+        } label: {
             ZStack {
                 RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.1))
                 if let img = e.lastImage {
                     Image(uiImage: img)
                         .resizable()
                         .scaledToFill()
+                } else {
+                    Image(systemName: "film.stack").foregroundStyle(Color.white)
                 }
             }
             .frame(width: 52, height: 52)
@@ -1963,6 +2104,49 @@ struct ContentView: View {
     }
 }
 
+// MARK: - Лента режимов, общая для найтлапса и кадра дня
+
+/// 0 - Кадр дня, дальше режимы найтлапса по порядку
+struct ModeCarousel: View {
+    let selected: Int
+    let onSelect: (Int) -> Void
+
+    struct Item: Identifiable {
+        let title: String
+        let index: Int
+        var id: Int { index }
+    }
+
+    var body: some View {
+        let items: [Item] = [Item(title: "Кадр дня", index: 0)]
+            + LapseScene.allCases.enumerated().map { Item(title: $0.element.title, index: $0.offset + 1) }
+        let w: CGFloat = 86
+        let sel = selected
+        HStack(spacing: 0) {
+            ForEach(items) { item in
+                let i = item.index
+                Button { if i != sel { onSelect(i) } } label: {
+                    Text(item.title.uppercased())
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(i == sel ? Color.yellow : Color.white)
+                        .lineLimit(1)
+                        .frame(width: w, height: 28)
+                }
+            }
+        }
+        .fixedSize()
+        .offset(x: (CGFloat(items.count - 1) / 2 - CGFloat(sel)) * w)
+        .frame(maxWidth: .infinity)
+        .clipped()
+        .contentShape(Rectangle())
+        .gesture(DragGesture(minimumDistance: 15).onEnded { v in
+            if v.translation.width < -30 && sel + 1 < items.count { onSelect(sel + 1) }
+            if v.translation.width > 30 && sel > 0 { onSelect(sel - 1) }
+        })
+        .animation(.easeOut(duration: 0.2), value: sel)
+    }
+}
+
 // MARK: - Настройки (шторка по шестерёнке)
 
 struct SettingsSheet: View {
@@ -2004,7 +2188,9 @@ struct SettingsSheet: View {
                         Text("25").tag(25)
                         Text("30").tag(30)
                     }
-                    Toggle("Кадры JPEG в Файлы", isOn: $e.saveFrames)
+                    Text("Исходные кадры всегда сохраняются в Файлы → На iPhone → NightLapse. Удалить их можно только вручную")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                 }
 
                 Section {
@@ -2021,6 +2207,14 @@ struct SettingsSheet: View {
                     Text("Съёмка")
                 } footer: {
                     Text("Если телефон сильно нагреется, к паузе между кадрами добавится время, пока не остынет. Съёмка не прерывается")
+                }
+
+                Section {
+                    ReportRow()
+                } header: {
+                    Text("Отчёт для улучшения")
+                } footer: {
+                    Text("Приложение ведёт журнал: настройки, яркость, ISO, нагрев, ошибки по каждому кадру. Само ничего не отправляет. Собери отчёт и пришли файл в чат с Claude")
                 }
 
                 Section("Подсказки") {
