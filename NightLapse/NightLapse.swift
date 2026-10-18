@@ -380,6 +380,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     private var extraPause: Double = 0
     /// Авто ISO: если даже максимального ISO мало, кадр (уже очищенный от шума сложением) осветляется цифрово
     private var autoGain: Float = 1
+    /// Последние настройки для ночного превью (только queue)
+    private var currentSettingsQueue = CamSettings(dur: 1, ev: 0, iso: 100, temp: 4500, focus: 1, wbAuto: true, focusAuto: false)
     private let maxAutoGain: Float = 16
     /// Сколько секунд копить кадр сейчас (при умной выдержке может быть меньше выставленной)
     private var frameTarget: Double = 1
@@ -857,6 +859,13 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         if isHot != hot { hot = isHot }
         checkCooling(state, now)
         if tickCount % 10 == 0 { updateFree() }
+        if phase == .idle && tickCount % 2 == 0 {
+            let cs = currentSettings()
+            queue.async {
+                self.currentSettingsQueue = cs
+                self.checkNightPreview()
+            }
+        }
         tickCount += 1
     }
 
@@ -981,12 +990,20 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         let fmt = dev.activeFormat
 
         if mode == .off {
-            // До старта превью с автоэкспозицией, чтобы было видно, что в кадре. Коррекция EV видна сразу
-            if dev.isExposureModeSupported(.continuousAutoExposure) {
-                dev.exposureMode = .continuousAutoExposure
+            if nightPreview && dev.isExposureModeSupported(.custom) {
+                // Ночью автоэкспозиция превью упирается в 1/30 с и кадр чёрный. Тогда превью - 1/3 с на максимальном ISO:
+                // звёзды и горизонт видно, можно выстроить кадр. Яркость результата задаёт ☀︎ и проверяет «Тест»
+                let d = min(1.0 / 3.0, CMTimeGetSeconds(fmt.maxExposureDuration))
+                dev.setExposureModeCustom(duration: CMTime(seconds: d, preferredTimescale: 1_000_000),
+                                          iso: fmt.maxISO, completionHandler: nil)
+            } else {
+                // До старта превью с автоэкспозицией, чтобы было видно, что в кадре. Коррекция EV видна сразу
+                if dev.isExposureModeSupported(.continuousAutoExposure) {
+                    dev.exposureMode = .continuousAutoExposure
+                }
+                dev.setExposureTargetBias(min(max(s.ev, dev.minExposureTargetBias), dev.maxExposureTargetBias),
+                                          completionHandler: nil)
             }
-            dev.setExposureTargetBias(min(max(s.ev, dev.minExposureTargetBias), dev.maxExposureTargetBias),
-                                      completionHandler: nil)
         } else if dev.isExposureModeSupported(.custom) {
             // Во время съёмки: ручная выдержка сенсора. В авто ISO выдержку и ISO ведёт подстройка
             if !cfg.isoAuto {
@@ -1027,6 +1044,29 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             g.greenGain = min(max(g.greenGain, 1), m)
             g.blueGain = min(max(g.blueGain, 1), m)
             dev.setWhiteBalanceModeLocked(with: g, completionHandler: nil)
+        }
+    }
+
+    /// queue: ночное превью включается, когда автоэкспозиция упёрлась в максимум ISO,
+    /// и выключается, когда стало заметно светлее
+    private var nightPreview = false
+
+    func checkNightPreview() {
+        guard mode == .off, let dev = device else { return }
+        let fmt = dev.activeFormat
+        if nightPreview {
+            if dev.exposureMode != .custom {
+                // Касание кадра включило автоэкспозицию - через пару секунд возвращаем ночное превью
+                applyOnQueue(currentSettingsQueue)
+            } else if dev.exposureTargetOffset > 5 {
+                nightPreview = false
+                applyOnQueue(currentSettingsQueue)
+            }
+        } else if dev.exposureMode == .continuousAutoExposure,
+                  dev.iso >= fmt.maxISO * 0.9,
+                  CMTimeGetSeconds(dev.exposureDuration) >= 1.0 / 40 {
+            nightPreview = true
+            applyOnQueue(currentSettingsQueue)
         }
     }
 
@@ -1107,7 +1147,11 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             calibSkip -= 1
             return
         }
-        let f = lightFactor(mean: meanLuma(pb), limit: 64)
+        let m = meanLuma(pb)
+        let f = lightFactor(mean: m, limit: 64)
+        // Без ограничения: сколько света не хватает на самом деле. Нужно, чтобы ☀︎ влияла на усиление,
+        // даже когда сенсор уже на максимуме (иначе усиление всегда упиралось в один и тот же предел)
+        let fAll = lightFactor(mean: m, limit: 100_000)
         calibLeft -= 1
         if abs(f - 1) < 0.08 {
             calibLeft = 0
@@ -1116,7 +1160,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             if abs(r - 1) < 0.02 || calibLeft == 0 {
                 calibLeft = 0
                 // Сенсор на пределе: недостающий свет добавит цифровое усиление
-                let rest = f / max(r, 0.0001)
+                let rest = fAll / max(r, 0.0001)
                 setAutoGain(rest > 1.08 ? Float(pow(rest, 1 / 2.2)) : 1)
             } else {
                 calibSkip = 2
@@ -1292,7 +1336,11 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         let rowN = width * 4
         let h = height
         let g = cfg.isoAuto ? autoGain : cfg.gain
-        var s: Float = cfg.lighten ? g : g / Float(max(n, 1))
+        let div: Float = cfg.lighten ? 1 : Float(max(n, 1))
+        var s: Float = g / div
+        // С цифровым усилением сначала убираем «пол» шума по каждому цвету: иначе усиление
+        // поднимает его вместе с картинкой и ночное небо выходит серо-фиолетовым
+        if g > 1.01 { subtractBlack(div: div) }
         var lo: Float = 0
         var hi: Float = 255
         acc.withUnsafeMutableBufferPointer { a in
@@ -1304,6 +1352,39 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             }
         }
         return out
+    }
+
+    /// Чёрная точка по каждому каналу: 1% самых тёмных точек кадра становится чёрным
+    private func subtractBlack(div: Float) {
+        let px = acc.count / 4
+        guard px > 1000 else { return }
+        var hist = [Int](repeating: 0, count: 3 * 256)
+        var total = 0
+        acc.withUnsafeBufferPointer { a in
+            var i = 0
+            while i < px {
+                for c in 0..<3 {
+                    let v = Int(min(255, max(0, a[i * 4 + c] / div)))
+                    hist[c * 256 + v] += 1
+                }
+                total += 1
+                i += 37
+            }
+        }
+        let need = max(1, total / 100)
+        acc.withUnsafeMutableBufferPointer { a in
+            guard let p = a.baseAddress else { return }
+            for c in 0..<3 {
+                var sum = 0, bl = 0
+                while bl < 255 {
+                    sum += hist[c * 256 + bl]
+                    if sum >= need { break }
+                    bl += 1
+                }
+                var neg = -Float(min(bl, 60)) * div
+                if neg < 0 { vDSP_vsadd(p + c, 4, &neg, p + c, 4, vDSP_Length(px)) }
+            }
+        }
     }
 
     private func writeFrame(_ out: CVPixelBuffer) {
