@@ -244,6 +244,21 @@ struct Frame {
     }
 }
 
+/// Свет на сенсоре = ISO × выдержка подкадра. Меньше 20 - сумерки или день: следов звёзд там нет
+func isNightLight(_ light: Double) -> Bool { light >= 20 }
+
+/// Из журнала съёмки: какие кадры сняты в темноте (номер кадра → да/нет). Пусто, если журнала нет
+func nightMap(_ dir: URL) -> [Int: Bool] {
+    guard let text = try? String(contentsOf: dir.appendingPathComponent("log.csv"), encoding: .utf8) else { return [:] }
+    var m: [Int: Bool] = [:]
+    for line in text.split(separator: "\n").dropFirst() {
+        let c = line.split(separator: ",")
+        guard c.count > 4, let f = Int(c[1]), let s = Double(c[3]), let iso = Double(c[4]) else { continue }
+        m[f] = isNightLight(iso * s)
+    }
+    return m
+}
+
 func decayLUT(_ d: Float) -> [UInt8] {
     (0..<256).map { UInt8(min(255, max(0, (Float($0) * d).rounded(.down)))) }
 }
@@ -353,7 +368,7 @@ final class Renderer: ObservableObject {
     }
 
     /// Читает кадры по 4 сразу на разных ядрах, потом склеивает по порядку
-    private func eachFrame(_ urls: [URL], _ w: Int, _ h: Int, _ body: (Frame) -> Void) -> Bool {
+    private func eachFrame(_ urls: [URL], _ w: Int, _ h: Int, _ body: (Frame, Int) -> Void) -> Bool {
         let batch = 4
         var curs = (0..<batch).map { _ in Frame(w: w, h: h) }
         var i = 0
@@ -369,7 +384,7 @@ final class Renderer: ObservableObject {
                     }
                 }
             }
-            for k in 0..<n where curs[k].ok { body(curs[k]) }
+            for k in 0..<n where curs[k].ok { body(curs[k], base + k) }
             i += n
             report(i, urls.count)
         }
@@ -386,8 +401,16 @@ final class Renderer: ObservableObject {
         guard let first = urls.first.flatMap({ ShootStore.full($0) }) else { return "Нет кадров" }
         var acc = Frame(w: first.width, h: first.height)
         let lut = decayLUT(1)
-        let done = eachFrame(urls, first.width, first.height) { cur in acc.trail(with: cur, lut: lut) }
+        let nm = nightMap(shoot.dir)
+        var used = 0
+        let done = eachFrame(urls, first.width, first.height) { cur, i in
+            // Номер кадра в журнале = номер файла frame_00001 → 1
+            guard nm.isEmpty || (nm[i + 1] ?? true) else { return }
+            acc.trail(with: cur, lut: lut)
+            used += 1
+        }
         if !done { return "Остановлено" }
+        if used == 0 { return "Все кадры сняты днём или в сумерках. Фото со следами получается только в темноте" }
         guard let img = acc.cgImage(), let jpg = ShootStore.jpeg(img) else { return "Не удалось собрать фото" }
         // Копия рядом с исходниками, на случай если в Фото нет доступа
         try? jpg.write(to: shoot.dir.appendingPathComponent("startrail.jpg"))
@@ -433,8 +456,15 @@ final class Renderer: ObservableObject {
         var acc = Frame(w: w, h: h)
         let lut = decayLUT(decay ?? 1)
         var idx: Int64 = 0
-        let done = eachFrame(urls, w, h) { cur in
-            if decay != nil { acc.trail(with: cur, lut: lut) }
+        let nm = nightMap(shoot.dir)
+        let done = eachFrame(urls, w, h) { cur, i in
+            if decay != nil {
+                if nm.isEmpty || (nm[i + 1] ?? true) {
+                    acc.trail(with: cur, lut: lut)
+                } else {
+                    acc = cur
+                }
+            }
             let src = decay == nil ? cur : acc
             var pbo: CVPixelBuffer?
             if let pool = ad.pixelBufferPool {
