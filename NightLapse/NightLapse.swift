@@ -117,48 +117,33 @@ func applyCrop(_ crop: CGFloat, to dev: AVCaptureDevice) {
 
 enum Phase { case idle, test, waiting, recording, paused, saving }
 
-/// Готовые сценарии: одно нажатие выставляет выдержку, паузу, режим и коррекцию
+/// Режимы съёмки, как режимы в Камере iPhone: всё остальное выставляется само
 enum LapseScene: String, CaseIterable, Identifiable {
     case stars, trails, city, clouds
     var id: String { rawValue }
     var title: String {
         switch self {
         case .stars: return "Звёзды"
-        case .trails: return "Треки звёзд"
+        case .trails: return "Треки"
         case .city: return "Город"
         case .clouds: return "Облака"
         }
     }
-    var icon: String {
-        switch self {
-        case .stars: return "sparkles"
-        case .trails: return "circle.dashed"
-        case .city: return "building.2"
-        case .clouds: return "cloud.sun"
-        }
-    }
     var hint: String {
         switch self {
-        case .stars: return "Ночное небо и Млечный путь, звёзды точками. Фокус на бесконечность"
+        case .stars: return "Звёзды точками: выдержка сама подбирается под объектив"
         case .trails: return "Звёзды и огни рисуют длинные линии"
         case .city: return "Шлейфы фар и огни города"
         case .clouds: return "Закат, облака, день. Выдержка сама укоротится, если светло"
         }
     }
-    var exposure: Double {
+    /// Снимок каждые N секунд по умолчанию
+    var interval: Double {
         switch self {
-        case .stars: return 20
+        case .stars: return 10
         case .trails: return 30
-        case .city: return 4
-        case .clouds: return 2
-        }
-    }
-    var pause: Double {
-        switch self {
-        case .stars: return 1
-        case .trails: return 0
-        case .city: return 1
-        case .clouds: return 3
+        case .city: return 5
+        case .clouds: return 5
         }
     }
     var lighten: Bool { self == .trails || self == .city }
@@ -241,6 +226,9 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         return fractions + whole
     }()
     @Published var exposureSeconds: Double
+    /// Снимок каждые N секунд. Выдержка и пауза считаются из него сами
+    @Published var intervalSeconds: Double { didSet { ud.set(intervalSeconds, forKey: "interval") } }
+    static let intervalSteps: [Double] = [1, 2, 3, 4, 5, 6, 8, 10, 12, 15, 20, 25, 30, 40, 50, 60, 90, 120]
 
     // Остальные настройки запоминаются между запусками
     @Published var pauseSeconds: Double { didSet { ud.set(pauseSeconds, forKey: "pause") } }
@@ -304,6 +292,47 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
     var subFramesPerFrame: Int { max(1, Int((exposureSeconds / max(sensorExposure, 0.0001)).rounded())) }
 
+    var sceneKind: LapseScene { LapseScene(rawValue: scene) ?? .stars }
+
+    /// Самая длинная выдержка, при которой звёзды ещё точки (небо вращается, на 1x в 4K примерно 7 с)
+    var starLimit: Double {
+        let t = 7.0 / max(zoom, 0.5) * (uhd ? 1 : 2)
+        return max(1, t.rounded())
+    }
+
+    /// Выдержка и пауза из интервала и режима
+    func syncExposure() {
+        let sc = sceneKind
+        let cap: Double
+        switch sc {
+        case .stars: cap = starLimit
+        case .clouds: cap = 2
+        case .trails, .city: cap = intervalSeconds
+        }
+        let ex = min(intervalSeconds, cap)
+        exposureSeconds = ex
+        pauseSeconds = max(0, intervalSeconds - ex)
+        lighten = sc.lighten
+    }
+
+    func intervalUp() {
+        if let n = Self.intervalSteps.first(where: { $0 > intervalSeconds + 0.001 }) { intervalSeconds = n }
+        syncExposure()
+    }
+
+    func intervalDown() {
+        if let n = Self.intervalSteps.last(where: { $0 < intervalSeconds - 0.001 }) { intervalSeconds = n }
+        syncExposure()
+    }
+
+    /// Фокус обратно на бесконечность
+    func focusInfinity() {
+        guard phase == .idle else { return }
+        focusAuto = false
+        focus = 1
+        applyCamera(forceFocus: true)
+    }
+
     func exposureUp() {
         if let n = Self.exposureSteps.first(where: { $0 > exposureSeconds + 0.0001 }) { exposureSeconds = n }
         applyCamera()
@@ -361,6 +390,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     override init() {
         let d = UserDefaults.standard
         exposureSeconds = LapseEngine.defaultExposure
+        intervalSeconds = d.dbl("interval", 10)
         pauseSeconds = d.dbl("pause", 2)
         iso = Float(d.dbl("iso", 800))
         wbTemp = Float(d.dbl("wb", 4500))
@@ -376,16 +406,18 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         startDelayMin = d.num("delay", 0)
         autoStopMin = d.num("autostop", 0)
         coolBreaks = d.flag("coolBreaks", true)
-        isoAuto = d.flag("isoAuto", true)
-        autoShutter = d.flag("autoShutter", true)
+        // Яркость всегда авто (один ползунок), умная выдержка всегда включена, фокус - бесконечность или по касанию
+        isoAuto = true
+        autoShutter = true
         wbAuto = d.flag("wbAuto", false)
-        focusAuto = d.flag("focusAuto", false)
-        evComp = d.dbl("ev", -2)
-        scene = d.string(forKey: "scene") ?? ""
+        focusAuto = false
+        evComp = d.dbl("ev", -1)
+        scene = LapseScene(rawValue: d.string(forKey: "scene") ?? "")?.rawValue ?? LapseScene.stars.rawValue
         super.init()
 
         zoomOptions = ZoomOption.available()
         zoom = ZoomOption.pick(zoom, in: zoomOptions).value
+        syncExposure()
 
         UIDevice.current.isBatteryMonitoringEnabled = true
 
@@ -466,17 +498,12 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     func applyScene(_ sc: LapseScene) {
         guard phase == .idle else { return }
         scene = sc.rawValue
-        exposureSeconds = sc.exposure
-        pauseSeconds = sc.pause
-        lighten = sc.lighten
+        intervalSeconds = sc.interval
         evComp = sc.ev
         isoAuto = true
-        if focusAuto {
-            infinityPending = true
-            focusAuto = false
-        } else {
-            focus = 1
-        }
+        focusAuto = false
+        focus = 1
+        syncExposure()
         applyCamera(forceFocus: true)
     }
 
@@ -548,7 +575,6 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
             guard self.phase == .idle, !self.focusAuto, let dev = self.device else { return }
             self.focus = min(max(dev.lensPosition, 0), 1)
-            self.scene = ""
             self.applyCamera(forceFocus: true)
         }
     }
@@ -1284,7 +1310,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             AVVideoCodecKey: AVVideoCodecType.hevc,
             AVVideoWidthKey: width,
             AVVideoHeightKey: height,
-            AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: width * height * 6]
+            AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: width * height * 18]
         ]
         let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
         input.expectsMediaDataInRealTime = false
@@ -1403,7 +1429,7 @@ struct CameraPreview: UIViewRepresentable {
     }
 }
 
-// MARK: - Главный экран
+// MARK: - Главный экран, как Камера iPhone
 
 struct ContentView: View {
     var onSwitch: () -> Void = {}
@@ -1413,6 +1439,15 @@ struct ContentView: View {
     @State private var showSettings = false
     @State private var focusMark: CGPoint?
     @State private var markTick = 0
+    @State private var openParam: Param?
+
+    enum Param { case brightness, interval, duration }
+
+    struct ModeItem: Identifiable {
+        let title: String
+        let index: Int
+        var id: Int { index }
+    }
 
     private var idle: Bool { e.phase == .idle }
     private var shooting: Bool {
@@ -1425,24 +1460,25 @@ struct ContentView: View {
             ZStack {
                 Color.black.ignoresSafeArea()
                 if landscape {
-                    HStack(spacing: 12) {
-                        previewBox(height: nil)
+                    HStack(spacing: 0) {
+                        preview
                         VStack(spacing: 10) {
-                            header
-                            ScrollView { controls }
-                            buttons
+                            topBar
+                            Spacer(minLength: 0)
+                            bottomControls
                         }
-                        .frame(width: min(400, geo.size.width * 0.45))
+                        .frame(width: min(360, geo.size.width * 0.42))
+                        .padding(.horizontal, 8)
                     }
-                    .padding(8)
                 } else {
-                    VStack(spacing: 10) {
-                        header
-                        previewBox(height: e.captureLandscape ? 230 : 380)
-                        ScrollView { controls }
-                        buttons
+                    VStack(spacing: 0) {
+                        topBar
+                            .padding(.horizontal, 16)
+                            .padding(.bottom, 6)
+                        preview
+                        bottomControls
+                            .padding(.top, 8)
                     }
-                    .padding(.horizontal, 12)
                 }
                 if dark { darkOverlay }
             }
@@ -1450,37 +1486,83 @@ struct ContentView: View {
         .onAppear { e.configure() }
         .onDisappear { e.shutdown() }
         .onChange(of: e.testCount) { showTest = true }
-        .onChange(of: e.zoom) { e.changeCamera() }
-        .onChange(of: e.uhd) { e.changeCamera() }
-        .onChange(of: e.focusAuto) { e.focusModeChanged() }
+        .onChange(of: e.zoom) {
+            e.changeCamera()
+            e.syncExposure()
+        }
+        .onChange(of: e.uhd) {
+            e.changeCamera()
+            e.syncExposure()
+        }
         .onChange(of: e.wbAuto) { e.applyCamera() }
         .onChange(of: e.evComp) { e.applyCamera() }
+        .onChange(of: e.phase) { if e.phase != .idle { openParam = nil } }
         .sheet(isPresented: $showTest) { testSheet }
+        .sheet(isPresented: $showSettings) {
+            SettingsSheet(e: e)
+                .presentationDetents([.medium, .large])
+        }
     }
 
-    // MARK: Верх
+    // MARK: Верхняя полоса
 
-    private var header: some View {
-        HStack {
-            Text("Найтлапс").font(.title2.bold())
-            Spacer()
-            Button { onSwitch() } label: {
-                Label("Кадр дня", systemImage: "photo.on.rectangle.angled")
-                    .font(.footnote.weight(.semibold))
-                    .lineLimit(1)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                    .background(Color.orange.opacity(0.2), in: Capsule())
-                    .foregroundStyle(Color.orange)
+    private var topBar: some View {
+        HStack(spacing: 10) {
+            infoChip
+            Spacer(minLength: 0)
+            if shooting { recTimer }
+            Spacer(minLength: 0)
+            Button { e.focusInfinity() } label: {
+                Text("∞")
+                    .font(.system(size: 20, weight: .semibold))
+                    .frame(width: 36, height: 36)
+                    .foregroundStyle(e.focus >= 0.99 ? Color.yellow : Color.white)
+                    .background(Color.white.opacity(0.12), in: Circle())
             }
             .disabled(!idle)
+            .accessibilityLabel("Фокус на бесконечность")
+            roundIcon("moon.fill") { dark = true }
+            roundIcon("gearshape.fill") { showSettings = true }
+                .disabled(!idle)
         }
         .padding(.top, 4)
     }
 
-    // MARK: Картинка
+    private func roundIcon(_ name: String, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: name)
+                .font(.system(size: 16, weight: .semibold))
+                .frame(width: 36, height: 36)
+                .foregroundStyle(Color.white)
+                .background(Color.white.opacity(0.12), in: Circle())
+        }
+    }
 
-    private func previewBox(height: CGFloat?) -> some View {
+    private var infoChip: some View {
+        HStack(spacing: 8) {
+            Label(e.battery >= 0 ? "\(e.battery)%" : "-", systemImage: "battery.100")
+            Label(String(format: "%.0f ГБ", e.freeGB), systemImage: "internaldrive")
+            if e.hot {
+                Image(systemName: "thermometer.high").foregroundStyle(Color.orange)
+            }
+        }
+        .font(.caption2.monospacedDigit())
+        .labelStyle(.titleAndIcon)
+        .foregroundStyle(Color.white.opacity(0.8))
+    }
+
+    /// Красный таймер, как при записи видео в Камере
+    private var recTimer: some View {
+        Text(e.phase == .waiting ? "Старт через \(hms(e.countdown))" : hms(e.elapsed))
+            .font(.subheadline.monospacedDigit().weight(.semibold))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
+            .background(e.phase == .recording ? Color.red : Color.gray.opacity(0.5), in: RoundedRectangle(cornerRadius: 6))
+    }
+
+    // MARK: Кадр
+
+    private var preview: some View {
         ZStack {
             CameraPreview(engine: e,
                           onTap: { dp, vp in
@@ -1495,25 +1577,57 @@ struct ContentView: View {
                               keepMark()
                           })
             if let m = focusMark { focusIndicator(at: m) }
-            VStack {
-                HStack {
-                    infoChip
-                    Spacer()
-                    orientationChip
+            VStack(spacing: 6) {
+                if e.phase == .recording || e.phase == .test {
+                    ProgressView(value: Double(min(e.subDone, e.subTotal)), total: Double(max(e.subTotal, 1)))
+                        .tint(.red)
+                }
+                if showStatus {
+                    Text(statusLine)
+                        .font(.caption)
+                        .multilineTextAlignment(.center)
+                        .foregroundStyle(e.hot ? Color.orange : Color.white)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 4)
+                        .background(Color.black.opacity(0.55), in: Capsule())
                 }
                 Spacer()
-                HStack(alignment: .bottom) {
-                    if shooting { recordingInfo }
-                    Spacer()
-                    thumb
+                if shooting {
+                    HStack {
+                        recordingInfo
+                        Spacer()
+                    }
+                } else if idle {
+                    zoomRow
                 }
             }
-            .padding(8)
+            .padding(10)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .frame(height: height)
         .background(Color.black)
-        .clipShape(RoundedRectangle(cornerRadius: 14))
+    }
+
+    private var showStatus: Bool {
+        !idle || (e.status != "Готово" && !e.status.isEmpty)
+    }
+
+    /// Кнопки зума, как в Камере: круглые, выбранная жёлтая
+    private var zoomRow: some View {
+        HStack(spacing: 6) {
+            ForEach(e.zoomOptions) { z in
+                let sel = abs(z.value - e.zoom) < 0.01
+                Button { e.zoom = z.value } label: {
+                    Text(sel ? z.title : z.title.replacingOccurrences(of: "x", with: ""))
+                        .font(.system(size: sel ? 13 : 12, weight: .bold))
+                        .foregroundStyle(sel ? Color.yellow : Color.white)
+                        .frame(width: sel ? 40 : 32, height: sel ? 40 : 32)
+                        .background(Color.black.opacity(0.55), in: Circle())
+                }
+            }
+        }
+        .padding(4)
+        .background(Color.white.opacity(0.08), in: Capsule())
+        .animation(.easeOut(duration: 0.15), value: e.zoom)
     }
 
     /// Жёлтая рамка фокуса и солнце яркости, как в Камере iPhone
@@ -1544,193 +1658,269 @@ struct ContentView: View {
         }
     }
 
-    private var infoChip: some View {
-        HStack(spacing: 8) {
-            Label(e.battery >= 0 ? "\(e.battery)%" : "-", systemImage: "battery.100")
-            Label(String(format: "%.0f ГБ", e.freeGB), systemImage: "internaldrive")
-            if e.hot {
-                Image(systemName: "thermometer.high").foregroundStyle(Color.orange)
-            }
-        }
-        .font(.caption2.monospacedDigit())
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
-        .background(Color.black.opacity(0.55), in: Capsule())
-    }
-
-    private var orientationChip: some View {
-        Label(e.captureLandscape ? "Горизонтально" : "Вертикально",
-              systemImage: e.captureLandscape ? "rectangle" : "rectangle.portrait")
-            .font(.caption2)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(Color.black.opacity(0.55), in: Capsule())
-    }
-
     private var recordingInfo: some View {
         VStack(alignment: .leading, spacing: 2) {
             Text("\(e.framesDone) кадров").font(.headline.monospacedDigit())
-            Text("\(hms(e.elapsed)) · видео \(String(format: "%.1f", Double(e.framesDone) / Double(max(e.fps, 1)))) с")
+            Text("видео \(String(format: "%.1f", Double(e.framesDone) / Double(max(e.fps, 1)))) с")
                 .font(.caption.monospacedDigit())
         }
         .padding(8)
         .background(Color.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 8))
     }
 
-    @ViewBuilder private var thumb: some View {
-        if let img = e.lastImage {
-            Image(uiImage: img)
-                .resizable()
-                .scaledToFit()
-                .frame(maxWidth: 90, maxHeight: 90)
-                .clipShape(RoundedRectangle(cornerRadius: 6))
-                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.white.opacity(0.4)))
-                .onTapGesture { showTest = true }
-        }
-    }
-
-    // MARK: Управление
-
-    private var controls: some View {
-        VStack(spacing: 12) {
-            statusView
-            if shooting {
-                card("Идёт съёмка") {
-                    Text("Не двигай телефон. Чтобы экран не светил, нажми луну внизу. Остановить можно кнопкой «Стоп»")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                }
-            } else {
-                sceneCard
-                mainCard
-                if showSettings { SettingsPanel(e: e) }
-            }
-        }
-        .padding(.bottom, 8)
-    }
-
-    private var statusView: some View {
-        VStack(spacing: 6) {
-            if e.phase == .recording || e.phase == .test {
-                ProgressView(value: Double(min(e.subDone, e.subTotal)), total: Double(max(e.subTotal, 1)))
-            }
-            Text(statusLine)
-                .font(.footnote)
-                .foregroundStyle(e.hot ? Color.orange : Color.secondary)
-                .multilineTextAlignment(.center)
-        }
-    }
-
     private var statusLine: String {
-        var s = e.phase == .waiting ? "Старт через \(hms(e.countdown))" : e.status
+        var s = e.phase == .waiting ? "Ожидание старта" : e.status
         if e.pauses > 0 && (e.phase == .recording || e.phase == .paused) { s += " · пауз: \(e.pauses)" }
         if e.cooling && (e.phase == .recording || e.phase == .paused) { s += " · пауза +\(Int(e.coolExtra)) с от нагрева" }
-        if e.phase == .recording && e.isoAuto && e.autoShutter && e.effExposure > 0 && e.effExposure < e.exposureSeconds - 0.01 {
+        if e.phase == .recording && e.effExposure > 0 && e.effExposure < e.exposureSeconds - 0.01 {
             s += " · выдержка \(expText(e.effExposure))"
         }
         if e.hot { s += " · телефон перегрет" }
         return s
     }
 
-    private func card<C: View>(_ title: String, @ViewBuilder _ content: () -> C) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text(title).font(.headline)
-            content()
+    // MARK: Низ: параметры, режимы, кнопка спуска
+
+    private var bottomControls: some View {
+        VStack(spacing: 10) {
+            if idle {
+                if let p = openParam { paramEditor(p) }
+                paramRow
+                Text(planLine)
+                    .font(.caption2)
+                    .foregroundStyle(Color.white.opacity(0.6))
+                    .multilineTextAlignment(.center)
+                modeCarousel
+            } else if e.phase == .recording || e.phase == .paused {
+                Text("Не двигай телефон. Луна сверху гасит экран")
+                    .font(.caption)
+                    .foregroundStyle(Color.white.opacity(0.6))
+            }
+            shutterRow
         }
-        .padding(14)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(white: 0.11), in: RoundedRectangle(cornerRadius: 14))
+        .padding(.bottom, 8)
     }
 
-    private var sceneCard: some View {
-        card("Что снимаем") {
-            LazyVGrid(columns: [GridItem(.flexible(), spacing: 8), GridItem(.flexible(), spacing: 8)], spacing: 8) {
-                ForEach(LapseScene.allCases) { sc in
-                    Button { e.applyScene(sc) } label: {
-                        HStack(spacing: 8) {
-                            Image(systemName: sc.icon).frame(width: 22)
-                            Text(sc.title).lineLimit(1).minimumScaleFactor(0.8)
-                            Spacer(minLength: 0)
-                        }
-                        .padding(.vertical, 12)
-                        .padding(.horizontal, 10)
-                        .frame(maxWidth: .infinity)
-                        .background(e.scene == sc.rawValue ? Color.red.opacity(0.4) : Color.white.opacity(0.08),
-                                    in: RoundedRectangle(cornerRadius: 10))
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-            Text(LapseScene(rawValue: e.scene)?.hint ?? "Выбери, что снимаешь, и настройки выставятся сами. Потом их можно подправить ниже")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+    private var paramRow: some View {
+        HStack(spacing: 8) {
+            paramChip(.brightness, "sun.max.fill", String(format: "%+.1f", e.evComp))
+            paramChip(.interval, "timer", expText(e.intervalSeconds))
+            paramChip(.duration, "hourglass", e.autoStopMin == 0 ? "∞" : durText(Double(e.autoStopMin) * 60))
         }
     }
 
-    private func row(_ title: String, _ value: String) -> some View {
-        HStack {
-            Text(title)
-            Spacer()
-            Text(value).foregroundStyle(.secondary).monospacedDigit()
+    private func paramChip(_ p: Param, _ icon: String, _ value: String) -> some View {
+        let on = openParam == p
+        return Button {
+            withAnimation(.easeOut(duration: 0.15)) { openParam = on ? nil : p }
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: icon)
+                Text(value).monospacedDigit()
+            }
+            .font(.footnote.weight(.semibold))
+            .foregroundStyle(on ? Color.black : Color.white)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .background(on ? Color.yellow : Color.white.opacity(0.14), in: Capsule())
         }
     }
 
-    private var mainCard: some View {
-        card("Основное") {
-            Picker("Зум", selection: $e.zoom) {
-                ForEach(e.zoomOptions) { Text($0.title).tag($0.value) }
-            }
-            .pickerStyle(.segmented)
-            Stepper(onIncrement: { e.exposureUp() }, onDecrement: { e.exposureDown() }) {
-                row("Выдержка кадра", expText(e.exposureSeconds))
-            }
-            Stepper(value: $e.pauseSeconds, in: 0...60, step: 1) {
-                row("Пауза", "\(Int(e.pauseSeconds)) с")
-            }
-            HStack {
-                Text("Длительность")
-                Spacer()
-                Picker("Длительность", selection: $e.autoStopMin) {
-                    Text("Пока не остановлю").tag(0)
-                    Text("30 мин").tag(30)
-                    Text("1 ч").tag(60)
-                    Text("2 ч").tag(120)
-                    Text("4 ч").tag(240)
-                    Text("8 ч").tag(480)
-                }
-                .pickerStyle(.menu)
-            }
-            Text(planLine)
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-            Text("Коснись кадра, чтобы навести фокус и яркость. Веди пальцем вверх или вниз - ярче или темнее")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Button { withAnimation { showSettings.toggle() } } label: {
+    @ViewBuilder private func paramEditor(_ p: Param) -> some View {
+        VStack(spacing: 6) {
+            switch p {
+            case .brightness:
                 HStack {
-                    Label("Все настройки", systemImage: "slider.horizontal.3")
-                    Spacer()
-                    Image(systemName: showSettings ? "chevron.up" : "chevron.down")
+                    Image(systemName: "sun.min")
+                    Slider(value: $e.evComp, in: -4...2, step: 0.1)
+                        .tint(.yellow)
+                    Image(systemName: "sun.max.fill")
                 }
-                .frame(maxWidth: .infinity)
+                Text("Яркость \(String(format: "%+.1f", e.evComp)). Можно и пальцем по кадру вверх-вниз")
+                    .font(.caption2)
+                    .foregroundStyle(Color.white.opacity(0.6))
+            case .interval:
+                HStack(spacing: 16) {
+                    stepButton("minus") { e.intervalDown() }
+                    Text("Снимок каждые \(expText(e.intervalSeconds))")
+                        .font(.subheadline.weight(.semibold))
+                        .monospacedDigit()
+                        .frame(minWidth: 170)
+                    stepButton("plus") { e.intervalUp() }
+                }
+                Text(intervalNote)
+                    .font(.caption2)
+                    .foregroundStyle(Color.white.opacity(0.6))
+                    .multilineTextAlignment(.center)
+            case .duration:
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach([0, 30, 60, 120, 240, 480], id: \.self) { m in
+                            let sel = e.autoStopMin == m
+                            Button { e.autoStopMin = m } label: {
+                                Text(m == 0 ? "Пока не остановлю" : durText(Double(m) * 60))
+                                    .font(.footnote.weight(.semibold))
+                                    .foregroundStyle(sel ? Color.black : Color.white)
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(sel ? Color.yellow : Color.white.opacity(0.14), in: Capsule())
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 16)
+                }
             }
-            .buttonStyle(.bordered)
         }
+        .padding(.horizontal, 16)
+        .transition(.opacity)
+    }
+
+    private func stepButton(_ icon: String, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 15, weight: .bold))
+                .frame(width: 38, height: 38)
+                .foregroundStyle(Color.white)
+                .background(Color.white.opacity(0.14), in: Circle())
+        }
+    }
+
+    private var intervalNote: String {
+        let ex = expText(e.exposureSeconds)
+        switch e.sceneKind {
+        case .stars:
+            return e.pauseSeconds > 0
+                ? "Выдержка \(ex) - дольше звёзды размажутся. Остальное время - пауза"
+                : "Выдержка \(ex)"
+        case .clouds:
+            return "Выдержка до \(ex), днём сама короче"
+        case .trails, .city:
+            return "Выдержка на весь интервал, линии без разрывов"
+        }
+    }
+
+    /// Режимы листаются пальцем или касанием, как в Камере
+    private var modeCarousel: some View {
+        let items: [ModeItem] = [ModeItem(title: "Кадр дня", index: 0)]
+            + LapseScene.allCases.enumerated().map { ModeItem(title: $0.element.title, index: $0.offset + 1) }
+        let sel = (LapseScene.allCases.firstIndex(of: e.sceneKind) ?? 0) + 1
+        let w: CGFloat = 86
+        return HStack(spacing: 0) {
+            ForEach(items) { item in
+                let i = item.index
+                Button { select(i) } label: {
+                    Text(item.title.uppercased())
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(i == sel ? Color.yellow : (i == 0 ? Color.orange.opacity(0.8) : Color.white))
+                        .lineLimit(1)
+                        .frame(width: w, height: 28)
+                }
+            }
+        }
+        .fixedSize()
+        .offset(x: (CGFloat(items.count - 1) / 2 - CGFloat(sel)) * w)
+        .frame(maxWidth: .infinity)
+        .clipped()
+        .contentShape(Rectangle())
+        .gesture(DragGesture(minimumDistance: 15).onEnded { v in
+            if v.translation.width < -30 { select(sel + 1) }
+            if v.translation.width > 30 { select(sel - 1) }
+        })
+        .animation(.easeOut(duration: 0.2), value: sel)
+    }
+
+    private func select(_ i: Int) {
+        guard idle else { return }
+        if i <= 0 {
+            onSwitch()
+            return
+        }
+        let all = LapseScene.allCases
+        guard i - 1 < all.count else { return }
+        openParam = nil
+        e.applyScene(all[i - 1])
+    }
+
+    private var shutterRow: some View {
+        HStack {
+            thumbButton
+            Spacer()
+            shutterButton
+            Spacer()
+            testButton
+        }
+        .padding(.horizontal, 28)
+    }
+
+    @ViewBuilder private var thumbButton: some View {
+        Button { if e.lastImage != nil { showTest = true } } label: {
+            ZStack {
+                RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.1))
+                if let img = e.lastImage {
+                    Image(uiImage: img)
+                        .resizable()
+                        .scaledToFill()
+                }
+            }
+            .frame(width: 52, height: 52)
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.white.opacity(0.4)))
+        }
+    }
+
+    /// Большая кнопка: круг - старт, квадрат - стоп
+    private var shutterButton: some View {
+        Button {
+            switch e.phase {
+            case .idle: e.start()
+            case .recording, .paused: e.stop()
+            case .test, .waiting: e.cancel()
+            case .saving: break
+            }
+        } label: {
+            ZStack {
+                Circle().stroke(Color.white, lineWidth: 4).frame(width: 78, height: 78)
+                switch e.phase {
+                case .idle:
+                    Circle().fill(Color.red).frame(width: 64, height: 64)
+                case .recording, .paused:
+                    RoundedRectangle(cornerRadius: 7).fill(Color.red).frame(width: 30, height: 30)
+                case .test, .waiting:
+                    Image(systemName: "xmark").font(.system(size: 26, weight: .bold)).foregroundStyle(Color.white)
+                case .saving:
+                    ProgressView()
+                }
+            }
+        }
+        .disabled(e.phase == .saving)
+        .accessibilityLabel(idle ? "Старт" : "Стоп")
+    }
+
+    private var testButton: some View {
+        Button { e.testFrame() } label: {
+            VStack(spacing: 1) {
+                if e.phase == .test {
+                    ProgressView()
+                } else {
+                    Image(systemName: "camera.aperture").font(.system(size: 18, weight: .semibold))
+                }
+                Text("Тест").font(.system(size: 9, weight: .semibold))
+            }
+            .foregroundStyle(Color.white)
+            .frame(width: 52, height: 52)
+            .background(Color.white.opacity(0.14), in: Circle())
+        }
+        .disabled(!idle)
+        .opacity(idle || e.phase == .test ? 1 : 0.3)
     }
 
     private var planLine: String {
-        let interval = max(e.exposureSeconds + e.pauseSeconds, 0.01)
+        let interval = max(e.intervalSeconds, 0.01)
         let fps = Double(max(e.fps, 1))
-        let framesPerHour = 3600 / interval
-        let videoPerHour = framesPerHour / fps
-        // Сколько снимать ради 10 секунд видео
-        let shootFor10 = 10 * fps * interval
-        var s = "Снимок каждые \(expText(interval)), \(Int(framesPerHour.rounded())) кадров в час\n"
-        s += "1 час съёмки = \(String(format: "%.1f", videoPerHour)) с видео\n"
-        s += "10 с видео = \(durText(shootFor10)) съёмки"
+        let videoPerHour = 3600 / interval / fps
+        var s = "\(e.sceneKind.hint)\n1 час съёмки = \(String(format: "%.1f", videoPerHour)) с видео"
         if e.autoStopMin > 0 {
-            let total = videoPerHour * Double(e.autoStopMin) / 60
-            s += "\nЗа \(durText(Double(e.autoStopMin) * 60)) получится \(String(format: "%.1f", total)) с видео"
+            s += ", за \(durText(Double(e.autoStopMin) * 60)) - \(String(format: "%.1f", videoPerHour * Double(e.autoStopMin) / 60)) с"
         }
         return s
     }
@@ -1741,40 +1931,6 @@ struct ContentView: View {
         if m < 1 { return "\(Int(sec.rounded())) с" }
         if m < 60 { return "\(m) мин" }
         return m % 60 == 0 ? "\(m / 60) ч" : "\(m / 60) ч \(m % 60) мин"
-    }
-
-    private var buttons: some View {
-        HStack(spacing: 10) {
-            switch e.phase {
-            case .idle:
-                Button { e.testFrame() } label: {
-                    Label("Тест", systemImage: "camera.aperture").lineLimit(1).fixedSize()
-                }
-                .buttonStyle(.bordered)
-                Button { e.start() } label: {
-                    Label("Старт", systemImage: "record.circle").lineLimit(1).frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
-            case .test, .waiting:
-                Button { e.cancel() } label: {
-                    Text("Отмена").frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-            case .recording, .paused:
-                Button { e.stop() } label: {
-                    Label("Стоп", systemImage: "stop.circle").frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
-            case .saving:
-                ProgressView().frame(maxWidth: .infinity)
-            }
-            Button { dark = true } label: {
-                Image(systemName: "moon.fill")
-            }
-            .buttonStyle(.bordered)
-        }
-        .controlSize(.large)
-        .padding(.bottom, 8)
     }
 
     // MARK: Затемнение и тест
@@ -1807,84 +1963,51 @@ struct ContentView: View {
     }
 }
 
-// MARK: - Все настройки (раскрываются под основными, кадр остаётся на экране)
+// MARK: - Настройки (шторка по шестерёнке)
 
-struct SettingsPanel: View {
+struct SettingsSheet: View {
     @ObservedObject var e: LapseEngine
-
-    private func card<C: View>(_ title: String, @ViewBuilder _ content: () -> C) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text(title).font(.headline)
-            content()
-        }
-        .padding(14)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(white: 0.11), in: RoundedRectangle(cornerRadius: 14))
-    }
-
-    private func note(_ t: String) -> some View {
-        Text(t).font(.caption).foregroundStyle(.secondary)
-    }
+    @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        VStack(spacing: 12) {
-            card("Камера") {
-                Toggle("4K (выкл. = 1080p)", isOn: $e.uhd)
-                Toggle("Автофокус", isOn: $e.focusAuto)
-                if e.focusAuto {
-                    note("Камера сама держит фокус. В темноте автофокус часто промахивается")
-                } else {
-                    VStack(alignment: .leading) {
-                        Text(e.focus >= 0.99 ? "Фокус: бесконечность" : String(format: "Фокус: %.0f%%", e.focus * 100))
-                        Slider(value: $e.focus, in: 0...1, onEditingChanged: { editing in if !editing { e.applyCamera() } })
+        NavigationStack {
+            Form {
+                Section {
+                    Toggle("4K (выкл. = 1080p)", isOn: $e.uhd)
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("Баланс белого")
+                            Spacer()
+                            Text(e.wbAuto ? "Авто" : "\(Int(e.wbTemp)) K").foregroundStyle(.secondary).monospacedDigit()
+                        }
+                        HStack(spacing: 10) {
+                            Button("Авто") { e.wbAuto = true }
+                                .buttonStyle(.bordered)
+                                .tint(e.wbAuto ? .yellow : .gray)
+                            Slider(value: Binding(get: { e.wbTemp }, set: { v in
+                                e.wbTemp = v
+                                if e.wbAuto { e.wbAuto = false }
+                            }), in: 2500...7500, step: 100, onEditingChanged: { editing in if !editing { e.applyCamera() } })
+                            .opacity(e.wbAuto ? 0.4 : 1)
+                        }
                     }
+                } header: {
+                    Text("Камера")
+                } footer: {
+                    Text("Видео будет горизонтальным или вертикальным - как держишь телефон в момент старта")
                 }
-                note("Видео будет горизонтальным или вертикальным - так, как держишь телефон в момент старта")
-            }
 
-            card("Яркость и цвет") {
-                Toggle("Авто ISO", isOn: $e.isoAuto)
-                if e.isoAuto {
-                    VStack(alignment: .leading) {
-                        Text("Яркость: \(String(format: "%+.1f", e.evComp)) EV")
-                        Slider(value: $e.evComp, in: -4...2, step: 0.1)
+                Section("Сохранение") {
+                    Toggle("Видео в Фото", isOn: $e.saveVideo)
+                    Picker("Кадров в секунду", selection: $e.fps) {
+                        Text("24").tag(24)
+                        Text("25").tag(25)
+                        Text("30").tag(30)
                     }
-                    note("Минус - темнее и меньше шума. ISO сейчас: \(Int(e.iso))" + (e.autoGainShown > 1.05 ? String(format: ", + усиление x%.1f", e.autoGainShown) : ""))
-                    Toggle("Умная выдержка", isOn: $e.autoShutter)
-                    note(e.autoShutter
-                         ? "Как приоритет диафрагмы на камере: светает - выдержка сама укорачивается, темнеет - растёт до выставленной. Снимки идут с тем же интервалом" + (e.phase == .recording && e.effExposure > 0 ? ". Сейчас: \(expText(e.effExposure))" : "")
-                         : "Выдержка всегда такая, как выставлена")
-                } else {
-                    VStack(alignment: .leading) {
-                        Text("ISO: \(Int(e.iso))")
-                        Slider(value: $e.iso, in: e.minISO...max(e.maxISO, e.minISO + 1),
-                               onEditingChanged: { editing in if !editing { e.applyCamera() } })
-                    }
-                    VStack(alignment: .leading) {
-                        Text("Усиление: x\(String(format: "%.2g", e.gain))")
-                        Slider(value: $e.gain, in: 0.25...8, step: 0.25)
-                    }
+                    Toggle("Кадры JPEG в Файлы", isOn: $e.saveFrames)
                 }
-                Toggle("Авто баланс белого", isOn: $e.wbAuto)
-                if !e.wbAuto {
-                    VStack(alignment: .leading) {
-                        Text("Баланс белого: \(Int(e.wbTemp)) K")
-                        Slider(value: $e.wbTemp, in: 2500...7500, step: 100,
-                               onEditingChanged: { editing in if !editing { e.applyCamera() } })
-                    }
-                }
-                Picker("Склейка", selection: $e.lighten) {
-                    Text("Среднее").tag(false)
-                    Text("Треки").tag(true)
-                }
-                .pickerStyle(.segmented)
-                note(e.lighten ? "Шлейфы огней и звёзд" : "Меньше шума, мягкие облака и вода")
-            }
 
-            card("Старт и сохранение") {
-                HStack {
-                    Text("Задержка старта")
-                    Spacer()
+                Section {
                     Picker("Задержка старта", selection: $e.startDelayMin) {
                         Text("Нет").tag(0)
                         Text("1 мин").tag(1)
@@ -1893,23 +2016,27 @@ struct SettingsPanel: View {
                         Text("30 мин").tag(30)
                         Text("1 ч").tag(60)
                     }
-                    .pickerStyle(.menu)
+                    Toggle("Длиннее пауза при перегреве", isOn: $e.coolBreaks)
+                } header: {
+                    Text("Съёмка")
+                } footer: {
+                    Text("Если телефон сильно нагреется, к паузе между кадрами добавится время, пока не остынет. Съёмка не прерывается")
                 }
-                Toggle("Видео в Фото", isOn: $e.saveVideo)
-                HStack {
-                    Text("Кадров в секунду")
-                    Spacer()
-                    Picker("Кадров в секунду", selection: $e.fps) {
-                        Text("24").tag(24)
-                        Text("25").tag(25)
-                        Text("30").tag(30)
-                    }
-                    .pickerStyle(.segmented)
-                    .frame(width: 160)
+
+                Section("Подсказки") {
+                    Text("Коснись кадра - фокус и замер яркости в этой точке. Веди пальцем вверх-вниз - ярче или темнее")
+                    Text("∞ сверху - фокус обратно на бесконечность, для звёзд")
+                    Text("Режимы внизу листаются пальцем, как в Камере")
                 }
-                Toggle("Кадры JPEG в Файлы", isOn: $e.saveFrames)
-                Toggle("Длиннее пауза при перегреве", isOn: $e.coolBreaks)
-                note("Если телефон сильно нагреется, к паузе между кадрами добавится время, пока не остынет. Потом пауза снова станет твоей. Съёмка не прерывается")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            }
+            .navigationTitle("Настройки")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Готово") { dismiss() }
+                }
             }
         }
     }
