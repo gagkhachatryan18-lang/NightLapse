@@ -586,44 +586,33 @@ struct GridLines: Shape {
 
 struct RootView: View {
     var onSwitch: () -> Void = {}
+    /// Переход в найтлапс сразу на нужный режим
+    var onScene: (LapseScene) -> Void = { _ in }
     @StateObject private var store = Store()
     @StateObject private var cam = DailyCamera()
     @StateObject private var motion = Motion()
 
     var body: some View {
-        TabView {
-            CameraView(cam: cam, motion: motion)
-                .tabItem { Label("Съёмка", systemImage: "camera") }
-            ArchiveView()
-                .tabItem { Label("Архив", systemImage: "square.grid.3x3") }
-        }
-        .environmentObject(store)
-        .onAppear {
-            cam.start()
-            motion.start()
-        }
-        .onDisappear {
-            cam.shutdown()
-            motion.stop()
-        }
-        .overlay(alignment: .topTrailing) {
-            Button { onSwitch() } label: {
-                Label("Найтлапс", systemImage: "moon.stars")
-                    .font(.footnote.weight(.semibold))
-                    .padding(.horizontal, 10).padding(.vertical, 6)
-                    .background(.ultraThinMaterial, in: Capsule())
+        CameraView(cam: cam, motion: motion, onScene: onScene)
+            .environmentObject(store)
+            .onAppear {
+                cam.start()
+                motion.start()
             }
-            .padding(.top, 4).padding(.trailing, 10)
-        }
+            .onDisappear {
+                cam.shutdown()
+                motion.stop()
+            }
     }
 }
 
-// MARK: - Съёмка
+// MARK: - Съёмка (тот же вид, что у найтлапса)
 
 struct CameraView: View {
     @EnvironmentObject var store: Store
     @ObservedObject var cam: DailyCamera
     @ObservedObject var motion: Motion
+    var onScene: (LapseScene) -> Void = { _ in }
 
     @AppStorage("ovMode") private var mode: OverlayMode = .ghost
     @AppStorage("ovTarget") private var target: TargetMode = .previous
@@ -638,6 +627,9 @@ struct CameraView: View {
     @State private var pickedItem: PhotosPickerItem?
     @State private var focusMark: CGPoint?
     @State private var markTick = 0
+    @State private var ghostOpen = false
+    @State private var showArchive = false
+    @State private var lastThumb: UIImage?
 
     private var overlayKey: String {
         "\(store.current)|\(mode.rawValue)|\(target.rawValue)|\(store.photos.count)|\(store.meta.ref ?? "")|\(store.ghostVersion)"
@@ -646,26 +638,41 @@ struct CameraView: View {
     var body: some View {
         GeometryReader { geo in
             let landscape = geo.size.width > geo.size.height
-            Group {
+            ZStack {
+                Color.black.ignoresSafeArea()
                 if landscape {
-                    HStack(spacing: 12) {
+                    HStack(spacing: 0) {
                         viewfinder
-                        controls.frame(width: 320)
+                        VStack(spacing: 10) {
+                            topBar
+                            Spacer(minLength: 0)
+                            bottomControls
+                        }
+                        .frame(width: min(360, geo.size.width * 0.42))
+                        .padding(.horizontal, 8)
                     }
                 } else {
-                    VStack(spacing: 10) {
+                    VStack(spacing: 0) {
+                        topBar
+                            .padding(.horizontal, 16)
+                            .padding(.bottom, 6)
                         viewfinder
-                        controls
+                        bottomControls
+                            .padding(.top, 8)
                     }
                 }
             }
-            .padding(8)
+            .frame(width: geo.size.width, height: geo.size.height)
         }
         .onAppear {
             cam.onPhoto = { data, ext in handle(data, ext) }
         }
         .task(id: overlayKey) { await refreshOverlay() }
+        .task(id: "\(store.current)|\(store.photos.count)") { await loadLastThumb() }
         .onChange(of: pickedItem) { loadPicked() }
+        .sheet(isPresented: $showArchive) {
+            ArchiveView().environmentObject(store)
+        }
         .alert("Новый проект", isPresented: $newProject) {
             TextField("Название", text: $newName)
             Button("Создать") {
@@ -675,6 +682,48 @@ struct CameraView: View {
             Button("Отмена", role: .cancel) { newName = "" }
         } message: {
             Text("Например: Вид из окна")
+        }
+    }
+
+    // MARK: Верхняя полоса
+
+    private var topBar: some View {
+        HStack(spacing: 10) {
+            Menu {
+                ForEach(store.projects, id: \.self) { p in
+                    Button(p) { store.current = p }
+                }
+                Divider()
+                Button("Новый проект...") { newProject = true }
+            } label: {
+                Label(store.current, systemImage: "folder")
+                    .font(.footnote.weight(.semibold))
+                    .lineLimit(1)
+                    .foregroundStyle(Color.white)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 7)
+                    .background(Color.white.opacity(0.12), in: Capsule())
+            }
+            Spacer(minLength: 0)
+            roundToggle("grid", on: grid) { grid.toggle() }
+            Button { cam.setInfinity(!cam.infinityFocus) } label: {
+                Text("∞")
+                    .font(.system(size: 20, weight: .semibold))
+                    .frame(width: 36, height: 36)
+                    .foregroundStyle(cam.infinityFocus ? Color.yellow : Color.white)
+                    .background(Color.white.opacity(0.12), in: Circle())
+            }
+        }
+        .padding(.top, 4)
+    }
+
+    private func roundToggle(_ icon: String, on: Bool, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 16, weight: .semibold))
+                .frame(width: 36, height: 36)
+                .foregroundStyle(on ? Color.yellow : Color.white)
+                .background(Color.white.opacity(0.12), in: Circle())
         }
     }
 
@@ -695,40 +744,54 @@ struct CameraView: View {
             // Призрак и сетка ложатся ровно на картинку камеры (кадр 4:3), фото другой формы обрезается по центру
             overlayLayer
             focusLayer
-            if mode != .off, let img = overlayImage,
-               (img.size.width > img.size.height) == cam.previewPortrait {
-                VStack {
-                    Spacer()
+            VStack(spacing: 6) {
+                hudView
+                if mode != .off, let img = overlayImage,
+                   (img.size.width > img.size.height) == cam.previewPortrait {
                     Text(img.size.width > img.size.height
                          ? "Прошлый кадр горизонтальный - поверни телефон"
                          : "Прошлый кадр вертикальный - поверни телефон")
                         .font(.footnote.weight(.semibold))
+                        .multilineTextAlignment(.center)
+                        .lineLimit(2)
                         .padding(.horizontal, 12)
                         .padding(.vertical, 6)
                         .background(Color.orange.opacity(0.85), in: Capsule())
-                        .padding(.bottom, 44)
                 }
-                .allowsHitTesting(false)
-            }
-            VStack {
-                hudView
-                Spacer()
-            }
-            if let t = toast {
-                VStack {
-                    Spacer()
+                if let t = toast {
                     Text(t)
                         .font(.footnote.weight(.semibold))
+                        .lineLimit(2)
                         .padding(.horizontal, 12)
                         .padding(.vertical, 6)
                         .background(Color.black.opacity(0.7), in: Capsule())
-                        .padding(.bottom, 10)
                 }
+                Spacer()
+                zoomRow
             }
+            .padding(10)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.black)
-        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .clipped()
+    }
+
+    /// Кнопки зума, как в Камере
+    private var zoomRow: some View {
+        HStack(spacing: 6) {
+            ForEach(cam.available) { z in
+                let sel = abs(z.value - cam.zoom) < 0.01
+                Button { cam.select(z.value) } label: {
+                    Text(sel ? z.title : z.title.replacingOccurrences(of: "x", with: ""))
+                        .font(.system(size: sel ? 13 : 12, weight: .bold))
+                        .foregroundStyle(sel ? Color.yellow : Color.white)
+                        .frame(width: sel ? 40 : 32, height: sel ? 40 : 32)
+                        .background(Color.black.opacity(0.55), in: Circle())
+                }
+            }
+        }
+        .padding(4)
+        .background(Color.white.opacity(0.08), in: Capsule())
     }
 
     /// Жёлтая рамка фокуса и солнце яркости
@@ -807,10 +870,10 @@ struct CameraView: View {
                     .foregroundStyle(hudColor(h.head, 1.5, 5))
             }
             .font(.footnote.monospacedDigit().weight(.semibold))
+            .lineLimit(1)
             .padding(.horizontal, 10)
             .padding(.vertical, 5)
             .background(Color.black.opacity(0.55), in: Capsule())
-            .padding(8)
         }
     }
 
@@ -818,19 +881,97 @@ struct CameraView: View {
         v < good ? .green : (v < warn ? .yellow : .red)
     }
 
-    // MARK: Управление
+    // MARK: Низ: призрак, режимы, кнопка спуска
 
-    private var controls: some View {
+    private var bottomControls: some View {
         VStack(spacing: 10) {
+            if ghostOpen { ghostEditor }
+            HStack(spacing: 8) {
+                chip(icon: "square.on.square.dashed", text: ghostTitle, on: ghostOpen) {
+                    withAnimation(.easeOut(duration: 0.15)) { ghostOpen.toggle() }
+                }
+                Text("Кадров: \(store.photos.count)")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(Color.white.opacity(0.7))
+            }
+            if store.photos.isEmpty {
+                Text("Первый кадр станет эталоном. Потом на экране будет виден прошлый кадр - подгоняй телефон под него")
+                    .font(.caption2)
+                    .foregroundStyle(Color.white.opacity(0.6))
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 16)
+            }
+            ModeCarousel(selected: 0) { i in
+                let all = LapseScene.allCases
+                if i >= 1 && i - 1 < all.count { onScene(all[i - 1]) }
+            }
+            HStack {
+                Button { showArchive = true } label: {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.1))
+                        if let img = lastThumb {
+                            Image(uiImage: img).resizable().scaledToFill()
+                        } else {
+                            Image(systemName: "square.grid.3x3").foregroundStyle(Color.white)
+                        }
+                    }
+                    .frame(width: 52, height: 52)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.white.opacity(0.4)))
+                }
+                Spacer()
+                shutter
+                Spacer()
+                Button {
+                    mode = mode == .off ? .ghost : .off
+                } label: {
+                    VStack(spacing: 1) {
+                        Image(systemName: mode == .off ? "eye.slash" : "eye")
+                            .font(.system(size: 18, weight: .semibold))
+                        Text("Призрак").font(.system(size: 9, weight: .semibold))
+                    }
+                    .foregroundStyle(mode == .off ? Color.white : Color.yellow)
+                    .frame(width: 52, height: 52)
+                    .background(Color.white.opacity(0.14), in: Circle())
+                }
+            }
+            .padding(.horizontal, 28)
+        }
+        .padding(.bottom, 8)
+    }
+
+    private var ghostTitle: String {
+        switch mode {
+        case .off: return "Призрак выкл."
+        case .edges: return "Контур \(Int(opacity * 100))%"
+        default: return "Призрак \(Int(opacity * 100))%"
+        }
+    }
+
+    private func chip(icon: String, text: String, on: Bool, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 5) {
+                Image(systemName: icon)
+                Text(text).monospacedDigit().lineLimit(1)
+            }
+            .font(.footnote.weight(.semibold))
+            .foregroundStyle(on ? Color.black : Color.white)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .background(on ? Color.yellow : Color.white.opacity(0.14), in: Capsule())
+        }
+    }
+
+    private var ghostEditor: some View {
+        VStack(spacing: 8) {
             Picker("Накладка", selection: $mode) {
                 ForEach(OverlayMode.allCases) { Text($0.title).tag($0) }
             }
             .pickerStyle(.segmented)
-
             if mode != .off {
                 HStack {
-                    Text("Прозрачность").font(.footnote)
-                    Slider(value: $opacity, in: 0.1...0.9)
+                    Image(systemName: "circle.lefthalf.filled")
+                    Slider(value: $opacity, in: 0.1...0.9).tint(.yellow)
                 }
                 Picker("Откуда", selection: $target) {
                     ForEach(TargetMode.allCases) { Text($0.title).tag($0) }
@@ -858,68 +999,33 @@ struct CameraView: View {
                     .id(store.ghostVersion)
                 }
             }
-
-            Picker("Зум", selection: zoomBinding) {
-                ForEach(cam.available) { Text($0.title).tag($0.value) }
-            }
-            .pickerStyle(.segmented)
-
-            HStack {
-                Toggle("Сетка", isOn: $grid)
-                Toggle("Фокус ∞", isOn: infinityBinding)
-            }
-            .font(.footnote)
-
-            if store.photos.isEmpty {
-                Text("Первый кадр станет эталоном. Дальше на экране будет виден прошлый кадр, подгоняй телефон под него")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-            }
-
-            HStack {
-                Menu {
-                    ForEach(store.projects, id: \.self) { p in
-                        Button(p) { store.current = p }
-                    }
-                    Divider()
-                    Button("Новый проект...") { newProject = true }
-                } label: {
-                    Label(store.current, systemImage: "folder")
-                        .lineLimit(1)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                shutter
-                Text("Кадров: \(store.photos.count)")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .trailing)
-            }
         }
+        .padding(.horizontal, 16)
     }
 
+    /// Белая кнопка, как фото в Камере
     private var shutter: some View {
         Button {
             pending = Shot(q: motion.q, g: motion.g, lens: "\(cam.zoom)")
             cam.capture()
         } label: {
             ZStack {
-                Circle().stroke(Color.white, lineWidth: 3).frame(width: 72, height: 72)
-                Circle().fill(Color.white.opacity(cam.busy ? 0.4 : 1)).frame(width: 58, height: 58)
+                Circle().stroke(Color.white, lineWidth: 4).frame(width: 78, height: 78)
+                Circle().fill(Color.white.opacity(cam.busy ? 0.4 : 1)).frame(width: 64, height: 64)
             }
         }
         .disabled(cam.busy)
     }
 
-    private var zoomBinding: Binding<Double> {
-        Binding(get: { cam.zoom }, set: { cam.select($0) })
-    }
-
-    private var infinityBinding: Binding<Bool> {
-        Binding(get: { cam.infinityFocus }, set: { cam.setInfinity($0) })
-    }
-
     // MARK: Логика
+
+    @MainActor private func loadLastThumb() async {
+        guard let u = store.photos.last?.url else {
+            lastThumb = nil
+            return
+        }
+        lastThumb = await Task.detached { Thumb.make(u, maxPixel: 200) }.value
+    }
 
     @MainActor private func refreshOverlay() async {
         let source: URL?
@@ -1248,6 +1354,7 @@ struct PhotoViewer: View {
 
 struct ArchiveView: View {
     @EnvironmentObject var store: Store
+    @Environment(\.dismiss) private var dismiss
     @StateObject private var exporter = Exporter()
     @AppStorage("fps") private var fps = 8
     @AppStorage("align") private var align = true
@@ -1291,6 +1398,11 @@ struct ArchiveView: View {
             }
             .navigationTitle("Архив: \(store.current)")
             .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Готово") { dismiss() }
+                }
+            }
         }
         .fullScreenCover(item: $viewing) { p in PhotoViewer(photo: p) }
         .confirmationDialog("Удалить кадр?", isPresented: Binding(
@@ -1356,7 +1468,7 @@ struct ArchiveView: View {
         card {
             Text("Кадры: \(store.photos.count)").font(.headline)
             if store.photos.isEmpty {
-                Text("Пока пусто. Сними первый кадр на вкладке «Съёмка»")
+                Text("Пока пусто. Сними первый кадр белой кнопкой")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             } else {
