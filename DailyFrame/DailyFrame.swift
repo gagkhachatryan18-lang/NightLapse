@@ -653,26 +653,16 @@ struct CameraView: View {
             let landscape = geo.size.width > geo.size.height
             ZStack {
                 Color.black.ignoresSafeArea()
-                if landscape {
-                    HStack(spacing: 0) {
-                        viewfinder
-                        VStack(spacing: 10) {
-                            topBar
-                            Spacer(minLength: 0)
-                            bottomControls
-                        }
-                        .frame(width: min(360, geo.size.width * 0.42))
-                        .padding(.horizontal, 8)
-                    }
-                } else {
-                    VStack(spacing: 0) {
-                        topBar
-                            .padding(.horizontal, 16)
-                            .padding(.bottom, 6)
-                        viewfinder
-                        bottomControls
-                            .padding(.top, 8)
-                    }
+                // Видоискатель не пересоздаётся при повороте (см. CameraLayout)
+                CameraLayout(landscape: landscape) {
+                    topBar
+                        .padding(.horizontal, landscape ? 8 : 16)
+                        .padding(.bottom, landscape ? 0 : 6)
+                    viewfinder
+                    bottomControls
+                        .padding(.top, landscape ? 0 : 8)
+                        .padding(.horizontal, landscape ? 8 : 0)
+                        .clipped()
                 }
             }
             .frame(width: geo.size.width, height: geo.size.height)
