@@ -198,7 +198,7 @@ struct CamSettings {
     var focusAuto: Bool
 }
 
-private enum Mode { case off, test, record }
+private enum Mode { case off, test, record, focus }
 
 private extension UserDefaults {
     func dbl(_ k: String, _ d: Double) -> Double { (object(forKey: k) as? NSNumber)?.doubleValue ?? d }
@@ -333,11 +333,143 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     }
 
     /// Фокус обратно на бесконечность
+    /// ∞: днём - линза на бесконечность. Ночью положение 1.0 у iPhone даёт размытые звёзды-кружки,
+    /// поэтому ночью ∞ сам ищет резкость по звёздам (около 20 секунд)
     func focusInfinity() {
         guard phase == .idle else { return }
         focusAuto = false
+        if isDark {
+            starFocus()
+            return
+        }
         focus = 1
+        starFocused = false
         applyCamera(forceFocus: true)
+    }
+
+    @Published var starFocused = false
+    @Published var isDark = false
+
+    // queue: поиск резкости по звёздам
+    private var focusPlan: [Float] = []
+    private var focusIdx = 0
+    private var focusSkip = 0
+    private var focusAcc = 0.0
+    private var focusN = 0
+    private var focusFine = false
+    private var focusResults: [(Float, Double)] = []
+
+    func starFocus() {
+        guard phase == .idle else { return }
+        phase = .test
+        status = "Фокус по звёздам..."
+        subTotal = 18
+        subDone = 0
+        UIApplication.shared.isIdleTimerDisabled = true
+        queue.async {
+            guard let dev = self.device else { return }
+            self.focusPlan = stride(from: 0.70, through: 1.0001, by: 0.03).map { Float(min($0, 1)) }
+            self.focusFine = false
+            self.focusResults = []
+            self.focusIdx = 0
+            self.appliedFocusAuto = nil
+            if (try? dev.lockForConfiguration()) != nil {
+                if dev.isExposureModeSupported(.custom) {
+                    let d = min(0.25, CMTimeGetSeconds(dev.activeFormat.maxExposureDuration))
+                    dev.setExposureModeCustom(duration: CMTime(seconds: d, preferredTimescale: 1_000_000),
+                                              iso: dev.activeFormat.maxISO, completionHandler: nil)
+                }
+                dev.unlockForConfiguration()
+            }
+            self.setLens(self.focusPlan[0])
+            self.mode = .focus
+        }
+    }
+
+    private func setLens(_ p: Float) {
+        guard let dev = device, (try? dev.lockForConfiguration()) != nil else { return }
+        if dev.isLockingFocusWithCustomLensPositionSupported {
+            dev.setFocusModeLocked(lensPosition: min(max(p, 0), 1), completionHandler: nil)
+        }
+        dev.unlockForConfiguration()
+        focusSkip = 2
+        focusAcc = 0
+        focusN = 0
+    }
+
+    private func focusStep(_ pb: CVPixelBuffer) {
+        if focusSkip > 0 {
+            focusSkip -= 1
+            return
+        }
+        focusAcc += starMetric(pb)
+        focusN += 1
+        guard focusN >= 3 else { return }
+        focusResults.append((focusPlan[focusIdx], focusAcc / Double(focusN)))
+        let done = focusResults.count
+        DispatchQueue.main.async { self.subDone = done }
+        focusIdx += 1
+        if focusIdx < focusPlan.count {
+            setLens(focusPlan[focusIdx])
+            return
+        }
+        let best = focusResults.max(by: { $0.1 < $1.1 })?.0 ?? 1
+        if !focusFine {
+            // Второй проход: точнее вокруг лучшего места
+            focusFine = true
+            focusPlan = stride(from: Double(best) - 0.03, through: Double(best) + 0.0301, by: 0.01).map { Float(min(max($0, 0), 1)) }
+            focusIdx = 0
+            setLens(focusPlan[0])
+            return
+        }
+        mode = .off
+        Diag.event("Фокус по звёздам: \(String(format: "%.2f", best)); "
+            + focusResults.map { String(format: "%.2f=%.0f", $0.0, $0.1) }.joined(separator: " "))
+        DispatchQueue.main.async {
+            self.focusAuto = false
+            self.focus = best
+            self.starFocused = true
+            self.subDone = 0
+            self.applyCamera(forceFocus: true)
+            self.finished("Резкость по звёздам найдена")
+        }
+    }
+
+    /// Резкость звёзд: средняя яркость самых ярких точек в центре кадра (зелёный канал, 2x2).
+    /// Звезда в фокусе - маленькая и яркая, не в фокусе - расплывается в тусклый кружок
+    private func starMetric(_ pb: CVPixelBuffer) -> Double {
+        CVPixelBufferLockBaseAddress(pb, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(pb) else { return 0 }
+        let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb), rb = CVPixelBufferGetBytesPerRow(pb)
+        let p = base.assumingMemoryBound(to: UInt8.self)
+        let cw = min(1600, w) / 2 * 2, ch = min(1200, h) / 2 * 2
+        let x0 = (w - cw) / 2, y0 = (h - ch) / 2
+        var hist = [Int](repeating: 0, count: 1021)
+        var n = 0
+        var y = y0
+        while y < y0 + ch {
+            var x = x0
+            while x < x0 + cw {
+                let o = y * rb + x * 4 + 1
+                let v = Int(p[o]) + Int(p[o + 4]) + Int(p[o + rb]) + Int(p[o + rb + 4])
+                hist[v] += 1
+                n += 1
+                x += 2
+            }
+            y += 2
+        }
+        var need = max(1, n / 1000)
+        var sum = 0.0, cnt = 0
+        var v = 1020
+        while v >= 0 && need > 0 {
+            let k = min(hist[v], need)
+            sum += Double(k * v)
+            cnt += k
+            need -= k
+            v -= 1
+        }
+        return cnt > 0 ? sum / Double(cnt) : 0
     }
 
     func exposureUp() {
@@ -591,6 +723,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     /// Если автофокус выключен, после наводки фокус фиксируется на найденном расстоянии
     func focusAt(_ p: CGPoint) {
         guard phase == .idle else { return }
+        starFocused = false
         let fa = focusAuto
         queue.async {
             guard let dev = self.device, (try? dev.lockForConfiguration()) != nil else { return }
@@ -1068,6 +1201,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             nightPreview = true
             applyOnQueue(currentSettingsQueue)
         }
+        let dark = nightPreview
+        DispatchQueue.main.async { if self.isDark != dark { self.isDark = dark } }
     }
 
     /// Переход от превью к съёмке. В авто ISO стартуем с яркости, которую уже подобрала автоэкспозиция превью
@@ -1188,6 +1323,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         defer { updateFrameTarget() }
         let f = lightFactor(mean: mean, limit: 1.26)
         guard abs(f - 1) > 0.02 else { return }
+        // Ночью при максимуме сенсора яркость ведёт усиление в renderFrame
+        if sensorMaxed() && (f > 1 || autoGain > 1.01) { return }
         if f < 1 && autoGain > 1 {
             // Слишком светло: сначала убираем цифровое усиление
             setAutoGain(autoGain * Float(pow(f, 1 / 2.2)))
@@ -1228,6 +1365,10 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard mode != .off, !suspended, let pb = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        if mode == .focus {
+            focusStep(pb)
+            return
+        }
         if warmupLeft > 0 {
             warmupLeft -= 1
             return
@@ -1342,16 +1483,30 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         let dst = base.assumingMemoryBound(to: UInt8.self)
         let rowN = width * 4
         let h = height
-        let g = cfg.isoAuto ? autoGain : cfg.gain
+        var g = cfg.isoAuto ? autoGain : cfg.gain
         let div: Float = cfg.lighten ? 1 : Float(max(n, 1))
-        var s: Float = g / div
-        // С цифровым усилением сначала убираем «пол» шума по каждому цвету: иначе усиление
-        // поднимает его вместе с картинкой и ночное небо выходит серо-фиолетовым
-        // В «Треках» и «Городе» берётся самая яркая точка из подкадров - ночью шум от этого
-        // поднимает фон, поэтому фон тоже опускаем
         let night = isNightLight(Double(curISO) * CMTimeGetSeconds(curDur))
-        if g > 1.01 || (cfg.lighten && n > 1 && night) { subtractBlack(div: div) }
-        if g > 1.01 && night { neutralizeSky(div: div) }
+        if cfg.isoAuto && sensorMaxed() {
+            // Ночь, сенсор на пределе. Усиление считаем по готовому кадру, а не по одному подкадру:
+            // сначала убираем «пол» шума, потом доводим небо (медиана зелёного) до яркости
+            // ночного снимка iPhone - около 50 при ☀︎ -1, светлее или темнее по ☀︎
+            subtractBlack(div: div)
+            let m = channelLevel(1, div: div)
+            let target = Float(68 * pow(pow(2.0, Double(cfg.ev)), 1.0 / 2.2))
+            let want = min(max(target / max(m, 0.5), 1), maxAutoGain)
+            // В видео усиление меняется плавно, чтобы кадры не мигали
+            setAutoGain(mode == .test || outIndex == 0 ? want : autoGain * 0.7 + want * 0.3)
+            g = autoGain
+            if g > 1.01 { neutralizeSky(div: div) }
+        } else {
+            // С цифровым усилением сначала убираем «пол» шума по каждому цвету: иначе усиление
+            // поднимает его вместе с картинкой и ночное небо выходит серо-фиолетовым.
+            // В «Треках» и «Городе» берётся самая яркая точка из подкадров - ночью шум от этого
+            // поднимает фон, поэтому фон тоже опускаем
+            if g > 1.01 || (cfg.lighten && n > 1 && night) { subtractBlack(div: div) }
+            if g > 1.01 && night { neutralizeSky(div: div) }
+        }
+        var s: Float = g / div
         var lo: Float = 0
         var hi: Float = 255
         acc.withUnsafeMutableBufferPointer { a in
@@ -1409,6 +1564,37 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
                 vDSP_vsmul(p + c, 4, &k, p + c, 4, vDSP_Length(px))
             }
         }
+    }
+
+    /// ISO и выдержка подкадра на максимуме: светлее сенсором уже не сделать
+    private func sensorMaxed() -> Bool {
+        guard let dev = device else { return false }
+        let maxDur = min(cfg.exposure, CMTimeGetSeconds(dev.activeFormat.maxExposureDuration))
+        return curISO >= dev.activeFormat.maxISO * 0.95 && CMTimeGetSeconds(curDur) >= maxDur * 0.95
+    }
+
+    /// Яркость фона по каналу (0 - синий, 1 - зелёный, 2 - красный): 60% точек темнее.
+    /// Не середина, чтобы тёмные деревья и горы внизу кадра не тянули усиление вверх
+    private func channelLevel(_ c: Int, div: Float) -> Float {
+        let px = acc.count / 4
+        guard px > 1000 else { return 1 }
+        var hist = [Int](repeating: 0, count: 1024)
+        var total = 0
+        acc.withUnsafeBufferPointer { a in
+            var i = 0
+            while i < px {
+                hist[Int(min(1023, max(0, a[i * 4 + c] / div * 4)))] += 1
+                total += 1
+                i += 37
+            }
+        }
+        var sum = 0, v = 0
+        while v < 1023 {
+            sum += hist[v]
+            if sum >= total * 6 / 10 { break }
+            v += 1
+        }
+        return Float(v) / 4
     }
 
     /// Чёрная точка по каждому каналу: 1% самых тёмных точек кадра становится чёрным
@@ -1835,7 +2021,7 @@ struct ContentView: View {
                 Text("∞")
                     .font(.system(size: 20, weight: .semibold))
                     .frame(width: 36, height: 36)
-                    .foregroundStyle(e.focus >= 0.99 ? Color.yellow : Color.white)
+                    .foregroundStyle(e.focus >= 0.99 || e.starFocused ? Color.yellow : Color.white)
                     .background(Color.white.opacity(0.12), in: Circle())
             }
             .disabled(!idle)
@@ -2282,7 +2468,7 @@ struct GuideView: View {
         Page(icon: "hand.draw", title: "Листай режимы",
              text: "Проведи пальцем по кадру влево или вправо - режим сменится, как в Камере: Кадр дня, Звёзды, Треки, Город, Облака"),
         Page(icon: "viewfinder", title: "Фокус и яркость",
-             text: "Коснись кадра - фокус и яркость в этой точке. Веди пальцем вверх или вниз - ярче или темнее. ∞ сверху - фокус на бесконечность, для звёзд"),
+             text: "Коснись кадра - фокус и яркость в этой точке. Веди пальцем вверх или вниз - ярче или темнее. ∞ сверху - ночью сам наводит резкость по звёздам, около 20 секунд"),
         Page(icon: "timer", title: "Как часто и сколько",
              text: "Внизу три кнопки: ☀︎ яркость, ⏱ как часто снимать, ⌛ сколько снимать. Выдержку приложение подбирает само под режим и свет"),
         Page(icon: "record.circle", title: "Старт и результат",
