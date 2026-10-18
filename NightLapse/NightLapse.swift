@@ -1633,26 +1633,17 @@ struct ContentView: View {
             let landscape = geo.size.width > geo.size.height
             ZStack {
                 Color.black.ignoresSafeArea()
-                if landscape {
-                    HStack(spacing: 0) {
-                        preview
-                        VStack(spacing: 10) {
-                            topBar
-                            Spacer(minLength: 0)
-                            bottomControls
-                        }
-                        .frame(width: min(360, geo.size.width * 0.42))
-                        .padding(.horizontal, 8)
-                    }
-                } else {
-                    VStack(spacing: 0) {
-                        topBar
-                            .padding(.horizontal, 16)
-                            .padding(.bottom, 6)
-                        preview
-                        bottomControls
-                            .padding(.top, 8)
-                    }
+                // Один и тот же кадр камеры в обеих ориентациях: при повороте он только двигается,
+                // а не создаётся заново - поэтому экран не пропадает на несколько секунд
+                CameraLayout(landscape: landscape) {
+                    topBar
+                        .padding(.horizontal, landscape ? 8 : 16)
+                        .padding(.bottom, landscape ? 0 : 6)
+                    preview
+                    bottomControls
+                        .padding(.top, landscape ? 0 : 8)
+                        .padding(.horizontal, landscape ? 8 : 0)
+                        .clipped()
                 }
                 if dark { darkOverlay }
                 if !guideSeen { GuideView { guideSeen = true } }
@@ -2340,6 +2331,41 @@ struct SettingsSheet: View {
                     Button("Готово") { dismiss() }
                 }
             }
+        }
+    }
+}
+
+
+// MARK: - Раскладка экрана камеры
+
+/// Верхняя панель, кадр и нижние кнопки. Вертикально - друг под другом,
+/// горизонтально - кадр слева, панель и кнопки колонкой справа. Порядок вложенных view не меняется,
+/// поэтому SwiftUI не пересоздаёт кадр камеры при повороте
+struct CameraLayout: Layout {
+    var landscape: Bool
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        proposal.replacingUnspecifiedDimensions()
+    }
+
+    func placeSubviews(in b: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        guard subviews.count == 3 else { return }
+        let top = subviews[0], mid = subviews[1], bottom = subviews[2]
+        if landscape {
+            let sw = min(380, b.width * 0.42)
+            let sx = b.maxX - sw
+            let th = top.sizeThatFits(ProposedViewSize(width: sw, height: nil)).height
+            let bh = min(b.height - th, bottom.sizeThatFits(ProposedViewSize(width: sw, height: nil)).height)
+            top.place(at: CGPoint(x: sx, y: b.minY), proposal: ProposedViewSize(width: sw, height: th))
+            bottom.place(at: CGPoint(x: sx, y: b.maxY - bh), proposal: ProposedViewSize(width: sw, height: bh))
+            mid.place(at: b.origin, proposal: ProposedViewSize(width: b.width - sw, height: b.height))
+        } else {
+            let th = top.sizeThatFits(ProposedViewSize(width: b.width, height: nil)).height
+            let bh = bottom.sizeThatFits(ProposedViewSize(width: b.width, height: nil)).height
+            top.place(at: b.origin, proposal: ProposedViewSize(width: b.width, height: th))
+            mid.place(at: CGPoint(x: b.minX, y: b.minY + th),
+                      proposal: ProposedViewSize(width: b.width, height: max(0, b.height - th - bh)))
+            bottom.place(at: CGPoint(x: b.minX, y: b.maxY - bh), proposal: ProposedViewSize(width: b.width, height: bh))
         }
     }
 }
