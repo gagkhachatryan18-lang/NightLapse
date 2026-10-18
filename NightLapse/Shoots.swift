@@ -7,6 +7,7 @@ import AVFoundation
 import Photos
 import ImageIO
 import UniformTypeIdentifiers
+import Accelerate
 
 // MARK: - Хранилище съёмок
 
@@ -96,7 +97,7 @@ enum ShootStore {
         switch look {
         case .starlapse: return dir.appendingPathComponent("starlapse_\(trail.rawValue).mov")
         case .startrail: return dir.appendingPathComponent("startrail.jpg")
-        case .timelapse: return nil
+        case .timelapse, .reel: return nil
         }
     }
 
@@ -118,13 +119,14 @@ enum ShootStore {
 // MARK: - Что делаем из кадров
 
 enum Look: String, CaseIterable, Identifiable {
-    case starlapse, timelapse, startrail
+    case starlapse, timelapse, startrail, reel
     var id: String { rawValue }
     var title: String {
         switch self {
         case .starlapse: return "Starlapse"
         case .timelapse: return "Таймлапс"
-        case .startrail: return "Фото со следами"
+        case .startrail: return "Фото"
+        case .reel: return "Рилс 3в1"
         }
     }
     var hint: String {
@@ -132,8 +134,10 @@ enum Look: String, CaseIterable, Identifiable {
         case .starlapse: return "Видео, где за звёздами тянутся хвосты"
         case .timelapse: return "Обычное видео, звёзды точками"
         case .startrail: return "Одна фотография: все кадры наложены, звёзды рисуют круги"
+        case .reel: return "Вертикальное видео 1080×1920 для Instagram: сверху таймлапс, посередине средний след, снизу длинный"
         }
     }
+    var isVideo: Bool { self != .startrail }
 }
 
 enum Trail: String, CaseIterable, Identifiable {
@@ -220,6 +224,20 @@ struct Frame {
         }
     }
 
+    /// Средняя яркость 0-255 (по каждой 16-й точке)
+    func meanLuma() -> Double {
+        var sum = 0.0, n = 0.0
+        px.withUnsafeBufferPointer { p in
+            var i = 0
+            while i + 2 < p.count {
+                sum += 0.114 * Double(p[i]) + 0.587 * Double(p[i + 1]) + 0.299 * Double(p[i + 2])
+                n += 1
+                i += 64
+            }
+        }
+        return n > 0 ? sum / n : 0
+    }
+
     func cgImage() -> CGImage? {
         guard let cs = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
         let data = Data(px) as CFData
@@ -244,8 +262,9 @@ struct Frame {
     }
 }
 
-/// Свет на сенсоре = ISO × выдержка подкадра. Меньше 20 - сумерки или день: следов звёзд там нет
-func isNightLight(_ light: Double) -> Bool { light >= 20 }
+/// Свет на сенсоре = ISO × выдержка подкадра. Звёздное небо - тысячи (ISO 5000 × 1 с),
+/// пасмурный вечер днём - около 20. Меньше 300 - сумерки или день: следов звёзд там нет
+func isNightLight(_ light: Double) -> Bool { light >= 300 }
 
 /// Из журнала съёмки: какие кадры сняты в темноте (номер кадра → да/нет). Пусто, если журнала нет
 func nightMap(_ dir: URL) -> [Int: Bool] {
@@ -297,6 +316,26 @@ final class Renderer: ObservableObject {
                 img = ShootStore.thumb(ready, maxPixel: 900)
             } else if look == .timelapse {
                 img = ShootStore.thumb(urls[urls.count / 2], maxPixel: 900)
+            } else if look == .reel, let first = ShootStore.thumb(pick[0], maxPixel: 900) {
+                var mid = Frame(w: first.width, h: first.height)
+                var accA = Frame(w: first.width, h: first.height)
+                var accB = Frame(w: first.width, h: first.height)
+                var cur = Frame(w: first.width, h: first.height)
+                let lutA = decayLUT(pow(Trail.medium.decay, Float(step)))
+                let lutB = decayLUT(1)
+                for (k, u) in pick.enumerated() {
+                    if token != self.previewToken { return }
+                    guard let c = ShootStore.thumb(u, maxPixel: 900) else { continue }
+                    cur.draw(c)
+                    if k == pick.count / 2 { mid = cur }
+                    accA.trail(with: cur, lut: lutA)
+                    accB.trail(with: cur, lut: lutB)
+                }
+                var r = Frame(w: 540, h: 960)
+                r.drawPanel(mid, y0: 0, w: 540, h: 318)
+                r.drawPanel(accA, y0: 321, w: 540, h: 318)
+                r.drawPanel(accB, y0: 642, w: 540, h: 318)
+                img = r.cgImage()
             } else if let first = ShootStore.thumb(pick[0], maxPixel: 900) {
                 var acc = Frame(w: first.width, h: first.height)
                 var cur = Frame(w: first.width, h: first.height)
@@ -318,7 +357,7 @@ final class Renderer: ObservableObject {
         }
     }
 
-    func run(_ shoot: Shoot, _ look: Look, _ trail: Trail) {
+    func run(_ shoot: Shoot, _ look: Look, _ trail: Trail, denoise: Bool) {
         guard !busy else { return }
         busy = true
         cancelled = false
@@ -328,15 +367,16 @@ final class Renderer: ObservableObject {
         let t0 = Date()
         q.async {
             let r: String
-            if let ready = ShootStore.liveURL(shoot.dir, look, trail), FileManager.default.fileExists(atPath: ready.path) {
-                r = self.saveReady(ready, isVideo: look != .startrail)
+            // Готовый Starlapse из съёмки - без шумодава, поэтому с «Убрать шум» собираем заново
+            if let ready = ShootStore.liveURL(shoot.dir, look, trail), FileManager.default.fileExists(atPath: ready.path),
+               !(denoise && look.isVideo) {
+                r = self.saveReady(ready, isVideo: look.isVideo)
+            } else if look == .startrail {
+                r = self.renderPhoto(shoot)
             } else {
-                switch look {
-                case .startrail: r = self.renderPhoto(shoot)
-                case .timelapse, .starlapse: r = self.renderVideo(shoot, look == .starlapse ? trail.decay : nil)
-                }
+                r = self.renderMovie(shoot, look, trail, denoise: denoise)
             }
-            Diag.event("Редактор: \(look.title) \(look == .starlapse ? trail.title : "") для \(shoot.id), \(shoot.frames) кадров, "
+            Diag.event("Редактор: \(look.title) \(look == .starlapse ? trail.title : "")\(denoise && look.isVideo ? " без шума" : "") для \(shoot.id), \(shoot.frames) кадров, "
                 + "\(Int(Date().timeIntervalSince(t0))) с: \(r)")
             DispatchQueue.main.async {
                 self.busy = false
@@ -405,7 +445,8 @@ final class Renderer: ObservableObject {
         var used = 0
         let done = eachFrame(urls, first.width, first.height) { cur, i in
             // Номер кадра в журнале = номер файла frame_00001 → 1
-            guard nm.isEmpty || (nm[i + 1] ?? true) else { return }
+            // Без журнала (старые съёмки) пересвеченный кадр рассвета узнаётся по яркости
+            guard nm.isEmpty ? cur.meanLuma() < 170 : (nm[i + 1] ?? true) else { return }
             acc.trail(with: cur, lut: lut)
             used += 1
         }
@@ -426,26 +467,31 @@ final class Renderer: ObservableObject {
         return ok ? "Фото со следами сохранено в Фото" : "Нет доступа к Фото. Фото лежит в папке съёмки"
     }
 
-    /// decay = nil - обычный таймлапс, иначе Starlapse с гаснущим следом
-    private func renderVideo(_ shoot: Shoot, _ decay: Float?) -> String {
+    /// Видео из кадров: таймлапс, Starlapse или рилс «3 в 1» (таймлапс, средний след, длинный след друг под другом).
+    /// denoise - убрать шум, сглаживая каждую точку по соседним кадрам
+    private func renderMovie(_ shoot: Shoot, _ look: Look, _ trail: Trail, denoise: Bool) -> String {
         let urls = ShootStore.frameURLs(shoot.dir)
         guard let first = urls.first.flatMap({ ShootStore.full($0) }) else { return "Нет кадров" }
         let w = first.width, h = first.height
+        let reel = look == .reel
+        // Рилс: 1080×1920, три полосы по 636 с чёрными промежутками 6
+        let ow = reel ? 1080 : w, oh = reel ? 1920 : h
         let name = shoot.dir.lastPathComponent.replacingOccurrences(of: "_frames", with: "")
-        let out = ShootStore.docs().appendingPathComponent(name + (decay == nil ? "_timelapse.mov" : "_starlapse.mov"))
+        let out = ShootStore.docs().appendingPathComponent(name + "_" + look.rawValue + ".mov")
         try? FileManager.default.removeItem(at: out)
         guard let writer = try? AVAssetWriter(outputURL: out, fileType: .mov) else { return "Не удалось начать запись" }
         let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
-            AVVideoCodecKey: AVVideoCodecType.hevc,
-            AVVideoWidthKey: w,
-            AVVideoHeightKey: h,
-            AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: w * h * 18]
+            // Рилс - H.264, его без перекодирования принимают все соцсети
+            AVVideoCodecKey: reel ? AVVideoCodecType.h264 : AVVideoCodecType.hevc,
+            AVVideoWidthKey: ow,
+            AVVideoHeightKey: oh,
+            AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: reel ? 20_000_000 : ow * oh * 18]
         ])
         input.expectsMediaDataInRealTime = false
         let ad = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-            kCVPixelBufferWidthKey as String: w,
-            kCVPixelBufferHeightKey as String: h
+            kCVPixelBufferWidthKey as String: ow,
+            kCVPixelBufferHeightKey as String: oh
         ])
         guard writer.canAdd(input) else { return "Не удалось начать запись" }
         writer.add(input)
@@ -453,24 +499,38 @@ final class Renderer: ObservableObject {
         writer.startSession(atSourceTime: .zero)
 
         let fps = Int32(max(shoot.fps, 1))
-        var acc = Frame(w: w, h: h)
-        let lut = decayLUT(decay ?? 1)
+        var dn = TemporalDenoise()
+        var accA = Frame(w: w, h: h)          // Starlapse (или средний след в рилсе)
+        var accB = Frame(w: w, h: h)          // длинный след в рилсе
+        let lutA = decayLUT(reel ? Trail.medium.decay : trail.decay)
+        let lutB = decayLUT(Trail.long.decay)
+        var reelFrame = Frame(w: ow, h: oh)
         var idx: Int64 = 0
         let nm = nightMap(shoot.dir)
-        let done = eachFrame(urls, w, h) { cur, i in
-            if decay != nil {
-                if nm.isEmpty || (nm[i + 1] ?? true) {
-                    acc.trail(with: cur, lut: lut)
-                } else {
-                    acc = cur
+        let done = eachFrame(urls, w, h) { raw, i in
+            var cur = raw
+            if denoise { dn.apply(&cur) }
+            let night = nm.isEmpty ? cur.meanLuma() < 170 : (nm[i + 1] ?? true)
+            if look != .timelapse {
+                if night { accA.trail(with: cur, lut: lutA) } else { accA = cur }
+                if reel {
+                    if night { accB.trail(with: cur, lut: lutB) } else { accB = cur }
                 }
             }
-            let src = decay == nil ? cur : acc
+            let src: Frame
+            if reel {
+                reelFrame.drawPanel(cur, y0: 0, w: 1080, h: 636)
+                reelFrame.drawPanel(accA, y0: 642, w: 1080, h: 636)
+                reelFrame.drawPanel(accB, y0: 1284, w: 1080, h: 636)
+                src = reelFrame
+            } else {
+                src = look == .timelapse ? cur : accA
+            }
             var pbo: CVPixelBuffer?
             if let pool = ad.pixelBufferPool {
                 CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pbo)
             } else {
-                CVPixelBufferCreate(nil, w, h, kCVPixelFormatType_32BGRA, nil, &pbo)
+                CVPixelBufferCreate(nil, ow, oh, kCVPixelFormatType_32BGRA, nil, &pbo)
             }
             guard let pb = pbo else { return }
             src.copy(to: pb)
@@ -502,7 +562,69 @@ final class Renderer: ObservableObject {
         }
         s2.wait()
         if ok { try? FileManager.default.removeItem(at: out) }
-        return ok ? "Видео сохранено в Фото" : "Нет доступа к Фото. Видео лежит в Файлы → NightLapse"
+        return ok ? (reel ? "Рилс сохранён в Фото" : "Видео сохранено в Фото") : "Нет доступа к Фото. Видео лежит в Файлы → NightLapse"
+    }
+}
+
+/// Шум по времени: точка, которая от кадра к кадру меняется чуть-чуть, - это шум, её сглаживаем.
+/// Если меняется сильно (звезда сдвинулась, проехала машина) - берём как есть, без шлейфов
+struct TemporalDenoise {
+    private var prev: [UInt8] = []
+
+    mutating func apply(_ f: inout Frame) {
+        guard prev.count == f.px.count else {
+            prev = f.px
+            return
+        }
+        let n = f.px.count
+        prev.withUnsafeMutableBufferPointer { p in
+            f.px.withUnsafeMutableBufferPointer { c in
+                guard let pp = p.baseAddress, let cp = c.baseAddress else { return }
+                var i = 0
+                while i < n {
+                    let a = Int(pp[i]), d = Int(cp[i]) - a
+                    if d > -12 && d < 12 {
+                        let v = UInt8(a + d * 2 / 5)
+                        pp[i] = v
+                        cp[i] = v
+                    } else {
+                        pp[i] = cp[i]
+                    }
+                    i += 1
+                }
+            }
+        }
+    }
+}
+
+extension Frame {
+    /// Кладёт уменьшенный кадр полосой w×h на высоте y0: заполняет полосу целиком, лишнее по краям обрезается
+    mutating func drawPanel(_ src: Frame, y0: Int, w pw: Int, h ph: Int) {
+        let s = max(Double(pw) / Double(src.w), Double(ph) / Double(src.h))
+        let sw = max(pw, Int((Double(src.w) * s).rounded())), sh = max(ph, Int((Double(src.h) * s).rounded()))
+        var tmp = [UInt8](repeating: 0, count: sw * sh * 4)
+        let srcW = src.w, srcH = src.h
+        src.px.withUnsafeBytes { sp in
+            tmp.withUnsafeMutableBytes { tp in
+                guard let sb = sp.baseAddress, let tb = tp.baseAddress else { return }
+                var a = vImage_Buffer(data: UnsafeMutableRawPointer(mutating: sb), height: vImagePixelCount(srcH),
+                                      width: vImagePixelCount(srcW), rowBytes: srcW * 4)
+                var b = vImage_Buffer(data: tb, height: vImagePixelCount(sh), width: vImagePixelCount(sw), rowBytes: sw * 4)
+                vImageScale_ARGB8888(&a, &b, nil, vImage_Flags(kvImageHighQualityResampling))
+            }
+        }
+        let x0 = (sw - pw) / 2, yc = (sh - ph) / 2
+        let rowW = self.w
+        let rows = min(ph, self.h - y0)
+        guard rows > 0 else { return }
+        px.withUnsafeMutableBytes { op in
+            tmp.withUnsafeBytes { tp in
+                guard let ob = op.baseAddress, let tb = tp.baseAddress else { return }
+                for y in 0..<rows {
+                    memcpy(ob + ((y0 + y) * rowW) * 4, tb + ((yc + y) * sw + x0) * 4, pw * 4)
+                }
+            }
+        }
     }
 }
 
@@ -607,10 +729,12 @@ struct ShootEditor: View {
     @StateObject private var r = Renderer()
     @State private var look: Look = .starlapse
     @State private var trail: Trail = .medium
+    @AppStorage("denoise") private var denoise = true
     @State private var confirmDelete = false
 
     /// Собрано во время съёмки - сохранится мгновенно
     private var isReady: Bool {
+        if denoise && look.isVideo { return false }
         guard let u = ShootStore.liveURL(shoot.dir, look, trail) else { return false }
         return FileManager.default.fileExists(atPath: u.path)
     }
@@ -625,7 +749,7 @@ struct ShootEditor: View {
                     }
                     if r.previewBusy { ProgressView() }
                 }
-                .aspectRatio(16 / 9, contentMode: .fit)
+                .aspectRatio(look == .reel ? 0.75 : 16 / 9, contentMode: .fit)
                 .clipShape(RoundedRectangle(cornerRadius: 12))
 
                 Picker("Что сделать", selection: $look) {
@@ -645,6 +769,11 @@ struct ShootEditor: View {
                     }
                 }
 
+                if look.isVideo {
+                    Toggle("Убрать шум", isOn: $denoise)
+                        .disabled(r.busy)
+                }
+
                 Text(look.hint)
                     .font(.footnote)
                     .foregroundStyle(.secondary)
@@ -661,7 +790,7 @@ struct ShootEditor: View {
                     }
                 } else {
                     Button {
-                        r.run(shoot, look, trail)
+                        r.run(shoot, look, trail, denoise: denoise)
                     } label: {
                         Label(isReady ? "Сохранить в Фото (уже готово)" : "Собрать и сохранить в Фото", systemImage: "square.and.arrow.down")
                             .frame(maxWidth: .infinity)
