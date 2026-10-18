@@ -464,7 +464,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         nc.addObserver(forName: UIApplication.didReceiveMemoryWarningNotification, object: nil, queue: .main) { _ in
             Diag.event("Мало памяти")
         }
-        Diag.event("Запуск приложения, \(Diag.model())")
+        Diag.event("Найтлапс открыт, \(Diag.model())")
 
         ticker = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.tick() }
         tick()
@@ -1537,11 +1537,15 @@ struct CameraPreview: UIViewRepresentable {
     let onTap: (CGPoint, CGPoint) -> Void
     /// Вертикальный сдвиг пальца (в точках) с прошлого вызова
     let onPan: (CGFloat) -> Void
+    /// Свайп вбок: +1 - следующий режим, -1 - предыдущий
+    var onSwipe: (Int) -> Void = { _ in }
 
     final class PView: UIView {
         var onTap: ((CGPoint, CGPoint) -> Void)?
         var onPan: ((CGFloat) -> Void)?
+        var onSwipe: ((Int) -> Void)?
         private var lastY: CGFloat = 0
+        private var axis = 0
         override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
         var pl: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
 
@@ -1554,13 +1558,21 @@ struct CameraPreview: UIViewRepresentable {
         }
 
         @objc func panned(_ g: UIPanGestureRecognizer) {
-            let y = g.translation(in: self).y
+            let t = g.translation(in: self)
             switch g.state {
-            case .began: lastY = y
+            case .began:
+                lastY = t.y
+                axis = 0
             case .changed:
-                onPan?(y - lastY)
-                lastY = y
-            default: break
+                // Направление решается по первым миллиметрам: вбок - смена режима, вверх-вниз - яркость
+                if axis == 0 && hypot(t.x, t.y) > 14 { axis = abs(t.x) > abs(t.y) ? 2 : 1 }
+                if axis == 1 { onPan?(t.y - lastY) }
+                lastY = t.y
+            case .ended:
+                if axis == 2 && abs(t.x) > 50 { onSwipe?(t.x < 0 ? 1 : -1) }
+                axis = 0
+            default:
+                axis = 0
             }
         }
 
@@ -1581,6 +1593,7 @@ struct CameraPreview: UIViewRepresentable {
         v.backgroundColor = .black
         v.onTap = onTap
         v.onPan = onPan
+        v.onSwipe = onSwipe
         let e = engine
         DispatchQueue.main.async { e.attachPreview(v.pl) }
         return v
@@ -1589,6 +1602,7 @@ struct CameraPreview: UIViewRepresentable {
     func updateUIView(_ uiView: PView, context: Context) {
         uiView.onTap = onTap
         uiView.onPan = onPan
+        uiView.onSwipe = onSwipe
     }
 }
 
@@ -1604,6 +1618,7 @@ struct ContentView: View {
     @State private var markTick = 0
     @State private var openParam: Param?
     @State private var showShoots = false
+    @AppStorage("guideSeen") private var guideSeen = false
     @State private var shootToOpen: URL?
 
     enum Param { case brightness, interval, duration }
@@ -1640,6 +1655,7 @@ struct ContentView: View {
                     }
                 }
                 if dark { darkOverlay }
+                if !guideSeen { GuideView { guideSeen = true } }
             }
         }
         .onAppear {
@@ -1749,6 +1765,10 @@ struct ContentView: View {
                               guard idle else { return }
                               e.nudgeBrightness(Double(-dy) / 120)
                               keepMark()
+                          },
+                          onSwipe: { d in
+                              guard idle else { return }
+                              select((LapseScene.allCases.firstIndex(of: e.sceneKind) ?? 0) + 1 + d)
                           })
             if let m = focusMark { focusIndicator(at: m) }
             VStack(spacing: 6) {
@@ -2117,6 +2137,81 @@ struct ContentView: View {
     }
 }
 
+// MARK: - Подсказки при первом запуске
+
+struct GuideView: View {
+    let onDone: () -> Void
+    @State private var page = 0
+
+    private struct Page {
+        let icon: String
+        let title: String
+        let text: String
+    }
+
+    private let pages: [Page] = [
+        Page(icon: "hand.draw", title: "Листай режимы",
+             text: "Проведи пальцем по кадру влево или вправо - режим сменится, как в Камере: Кадр дня, Звёзды, Треки, Город, Облака"),
+        Page(icon: "viewfinder", title: "Фокус и яркость",
+             text: "Коснись кадра - фокус и яркость в этой точке. Веди пальцем вверх или вниз - ярче или темнее. ∞ сверху - фокус на бесконечность, для звёзд"),
+        Page(icon: "timer", title: "Как часто и сколько",
+             text: "Внизу три кнопки: ☀︎ яркость, ⏱ как часто снимать, ⌛ сколько снимать. Выдержку приложение подбирает само под режим и свет"),
+        Page(icon: "record.circle", title: "Старт и результат",
+             text: "Красная кнопка - старт и стоп, «Тест» - пробный кадр. После «Стоп» откроется редактор: таймлапс, Starlapse и фото со следами. Все съёмки - в миниатюре слева"),
+        Page(icon: "moon.fill", title: "Ночью",
+             text: "Луна сверху гасит экран, чтобы не светил. Если телефон нагреется, пауза между кадрами сама станет длиннее. Исходные кадры всегда в Файлы → NightLapse")
+    ]
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.88).ignoresSafeArea()
+            VStack(spacing: 18) {
+                HStack {
+                    Spacer()
+                    Button("Пропустить") { onDone() }
+                        .font(.footnote)
+                        .foregroundStyle(Color.white.opacity(0.7))
+                }
+                TabView(selection: $page) {
+                    ForEach(pages.indices, id: \.self) { i in
+                        VStack(spacing: 16) {
+                            Image(systemName: pages[i].icon)
+                                .font(.system(size: 54, weight: .light))
+                                .foregroundStyle(Color.yellow)
+                            Text(pages[i].title)
+                                .font(.title2.bold())
+                            Text(pages[i].text)
+                                .font(.body)
+                                .multilineTextAlignment(.center)
+                                .foregroundStyle(Color.white.opacity(0.85))
+                                .padding(.horizontal, 12)
+                        }
+                        .tag(i)
+                    }
+                }
+                .tabViewStyle(.page(indexDisplayMode: .always))
+                .frame(maxHeight: 380)
+                Button {
+                    if page < pages.count - 1 {
+                        withAnimation { page += 1 }
+                    } else {
+                        onDone()
+                    }
+                } label: {
+                    Text(page < pages.count - 1 ? "Дальше" : "Понятно")
+                        .font(.headline)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                        .background(Color.yellow, in: Capsule())
+                        .foregroundStyle(Color.black)
+                }
+            }
+            .padding(24)
+            .foregroundStyle(Color.white)
+        }
+    }
+}
+
 // MARK: - Лента режимов, общая для найтлапса и кадра дня
 
 /// 0 - Кадр дня, дальше режимы найтлапса по порядку
@@ -2165,6 +2260,7 @@ struct ModeCarousel: View {
 struct SettingsSheet: View {
     @ObservedObject var e: LapseEngine
     @Environment(\.dismiss) private var dismiss
+    @AppStorage("guideSeen") private var guideSeen = false
 
     var body: some View {
         NavigationStack {
@@ -2231,12 +2327,11 @@ struct SettingsSheet: View {
                 }
 
                 Section("Подсказки") {
-                    Text("Коснись кадра - фокус и замер яркости в этой точке. Веди пальцем вверх-вниз - ярче или темнее")
-                    Text("∞ сверху - фокус обратно на бесконечность, для звёзд")
-                    Text("Режимы внизу листаются пальцем, как в Камере")
+                    Button("Показать подсказки снова") {
+                        guideSeen = false
+                        dismiss()
+                    }
                 }
-                .font(.footnote)
-                .foregroundStyle(.secondary)
             }
             .navigationTitle("Настройки")
             .navigationBarTitleDisplayMode(.inline)
