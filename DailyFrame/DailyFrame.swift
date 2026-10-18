@@ -506,12 +506,15 @@ struct DFPreview: UIViewRepresentable {
 
     var onTap: (CGPoint, CGPoint) -> Void = { _, _ in }
     var onPan: (CGFloat) -> Void = { _ in }
+    var onSwipe: (Int) -> Void = { _ in }
 
     final class PView: UIView {
         weak var cam: DailyCamera?
         var onTap: ((CGPoint, CGPoint) -> Void)?
         var onPan: ((CGFloat) -> Void)?
+        var onSwipe: ((Int) -> Void)?
         private var lastY: CGFloat = 0
+        private var axis = 0
         override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
         var pl: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
 
@@ -533,13 +536,21 @@ struct DFPreview: UIViewRepresentable {
         }
 
         @objc func panned(_ g: UIPanGestureRecognizer) {
-            let y = g.translation(in: self).y
+            let t = g.translation(in: self)
             switch g.state {
-            case .began: lastY = y
+            case .began:
+                lastY = t.y
+                axis = 0
             case .changed:
-                onPan?(y - lastY)
-                lastY = y
-            default: break
+                // Направление решается по первым миллиметрам: вбок - смена режима, вверх-вниз - яркость
+                if axis == 0 && hypot(t.x, t.y) > 14 { axis = abs(t.x) > abs(t.y) ? 2 : 1 }
+                if axis == 1 { onPan?(t.y - lastY) }
+                lastY = t.y
+            case .ended:
+                if axis == 2 && abs(t.x) > 50 { onSwipe?(t.x < 0 ? 1 : -1) }
+                axis = 0
+            default:
+                axis = 0
             }
         }
 
@@ -554,6 +565,7 @@ struct DFPreview: UIViewRepresentable {
         v.cam = cam
         v.onTap = onTap
         v.onPan = onPan
+        v.onSwipe = onSwipe
         v.pl.session = cam.session
         v.pl.videoGravity = .resizeAspect
         v.backgroundColor = .black
@@ -564,6 +576,7 @@ struct DFPreview: UIViewRepresentable {
     func updateUIView(_ uiView: PView, context: Context) {
         uiView.onTap = onTap
         uiView.onPan = onPan
+        uiView.onSwipe = onSwipe
     }
 }
 
@@ -740,6 +753,10 @@ struct CameraView: View {
                       onPan: { dy in
                           cam.nudgeBias(Float(-dy) / 120)
                           keepMark()
+                      },
+                      onSwipe: { d in
+                          // Кадр дня - первый режим: свайп влево ведёт в «Звёзды»
+                          if d > 0, let first = LapseScene.allCases.first { onScene(first) }
                       })
             // Призрак и сетка ложатся ровно на картинку камеры (кадр 4:3), фото другой формы обрезается по центру
             overlayLayer
