@@ -15,6 +15,7 @@ targets:
         TARGETED_DEVICE_FAMILY: "1"
         MARKETING_VERSION: "3.0"
         CURRENT_PROJECT_VERSION: "1"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
     info:
       path: NightLapse/Info.plist
       properties:
