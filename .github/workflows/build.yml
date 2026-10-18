@@ -13,6 +13,17 @@ jobs:
       - name: Install XcodeGen
         run: brew install xcodegen
 
+      - name: App icon
+        shell: bash
+        run: |
+          D=NightLapse/Assets.xcassets/AppIcon.appiconset
+          mkdir -p "$D"
+          printf '%s' '{"info":{"author":"xcode","version":1}}' > NightLapse/Assets.xcassets/Contents.json
+          base64 -D < icon/icon.b64 > /tmp/icon.jpg
+          sips -s format png -z 1024 1024 /tmp/icon.jpg --out "$D/AppIcon.png"
+          printf '%s' '{"images":[{"filename":"AppIcon.png","idiom":"universal","platform":"ios","size":"1024x1024"}],"info":{"author":"xcode","version":1}}' > "$D/Contents.json"
+          ls -la "$D"
+
       - name: Generate Xcode project
         run: xcodegen generate
 
