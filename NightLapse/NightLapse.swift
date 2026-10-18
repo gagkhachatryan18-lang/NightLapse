@@ -1211,8 +1211,11 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         DispatchQueue.main.async { self.effExposure = t }
     }
 
+    /// Цифровое усиление только по просьбе: ночью кадр остаётся таким, каким его видит сенсор
+    /// (как на превью во время теста). ☀︎ выше 0 разрешает усиление: +1 - до 2 раз, +2 - до 4 раз
     private func setAutoGain(_ g: Float) {
-        autoGain = min(max(g, 1), maxAutoGain)
+        let cap = min(maxAutoGain, max(1, Float(pow(2.0, Double(cfg.ev)))))
+        autoGain = min(max(g, 1), cap)
         let v = autoGain
         DispatchQueue.main.async { self.autoGainShown = v }
     }
@@ -1340,7 +1343,10 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         var s: Float = g / div
         // С цифровым усилением сначала убираем «пол» шума по каждому цвету: иначе усиление
         // поднимает его вместе с картинкой и ночное небо выходит серо-фиолетовым
-        if g > 1.01 { subtractBlack(div: div) }
+        // В «Треках» и «Городе» берётся самая яркая точка из подкадров - ночью шум от этого
+        // поднимает фон, поэтому фон тоже опускаем
+        let night = isNightLight(Double(curISO) * CMTimeGetSeconds(curDur))
+        if g > 1.01 || (cfg.lighten && n > 1 && night) { subtractBlack(div: div) }
         var lo: Float = 0
         var hi: Float = 255
         acc.withUnsafeMutableBufferPointer { a in
