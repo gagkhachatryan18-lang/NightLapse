@@ -334,7 +334,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
     /// Фокус обратно на бесконечность
     /// ∞: днём - линза на бесконечность. Ночью положение 1.0 у iPhone даёт размытые звёзды-кружки,
-    /// поэтому ночью ∞ сам ищет резкость по звёздам (около 20 секунд)
+    /// поэтому ночью ∞ сам ищет резкость по звёздам (около 30 секунд)
     func focusInfinity() {
         guard phase == .idle else { return }
         focusAuto = false
@@ -363,12 +363,12 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         guard phase == .idle else { return }
         phase = .test
         status = "Фокус по звёздам..."
-        subTotal = 18
+        subTotal = 23
         subDone = 0
         UIApplication.shared.isIdleTimerDisabled = true
         queue.async {
             guard let dev = self.device else { return }
-            self.focusPlan = stride(from: 0.70, through: 1.0001, by: 0.03).map { Float(min($0, 1)) }
+            self.focusPlan = stride(from: 0.40, through: 1.0001, by: 0.04).map { Float(min($0, 1)) }
             self.focusFine = false
             self.focusResults = []
             self.focusIdx = 0
@@ -435,34 +435,41 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         }
     }
 
-    /// Резкость звёзд: средняя яркость самых ярких точек в центре кадра (зелёный канал, 2x2).
-    /// Звезда в фокусе - маленькая и яркая, не в фокусе - расплывается в тусклый кружок
+    /// Резкость звёзд: насколько звёзды выделяются над фоном рядом с ними (зелёный канал, 2x2).
+    /// Звезда в фокусе - яркая точка на тёмном фоне, не в фокусе - кружок, у которого в 4 точках
+    /// от центра почти так же светло. Свечение у горизонта и общий фон на это не влияют
     private func starMetric(_ pb: CVPixelBuffer) -> Double {
         CVPixelBufferLockBaseAddress(pb, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
         guard let base = CVPixelBufferGetBaseAddress(pb) else { return 0 }
         let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb), rb = CVPixelBufferGetBytesPerRow(pb)
         let p = base.assumingMemoryBound(to: UInt8.self)
-        let cw = min(1600, w) / 2 * 2, ch = min(1200, h) / 2 * 2
-        let x0 = (w - cw) / 2, y0 = (h - ch) / 2
+        let bw = min(1600, w) / 2, bh = min(1200, h) / 2
+        let x0 = (w - bw * 2) / 2, y0 = (h - bh * 2) / 2
+        var b = [Int32](repeating: 0, count: bw * bh)
+        for by in 0..<bh {
+            let row = (y0 + by * 2) * rb + x0 * 4 + 1
+            for bx in 0..<bw {
+                let o = row + bx * 8
+                b[by * bw + bx] = Int32(p[o]) + Int32(p[o + 4]) + Int32(p[o + rb]) + Int32(p[o + rb + 4])
+            }
+        }
+        let d = 4
         var hist = [Int](repeating: 0, count: 1021)
         var n = 0
-        var y = y0
-        while y < y0 + ch {
-            var x = x0
-            while x < x0 + cw {
-                let o = y * rb + x * 4 + 1
-                let v = Int(p[o]) + Int(p[o + 4]) + Int(p[o + rb]) + Int(p[o + rb + 4])
-                hist[v] += 1
+        for by in d..<(bh - d) {
+            for bx in d..<(bw - d) {
+                let i = by * bw + bx
+                let ring = (b[i - d] + b[i + d] + b[i - d * bw] + b[i + d * bw]) / 4
+                let hp = Int(b[i] - ring)
+                if hp > 0 { hist[min(hp, 1020)] += 1 }
                 n += 1
-                x += 2
             }
-            y += 2
         }
-        var need = max(1, n / 1000)
+        var need = max(1, n / 10000)
         var sum = 0.0, cnt = 0
         var v = 1020
-        while v >= 0 && need > 0 {
+        while v > 0 && need > 0 {
             let k = min(hist[v], need)
             sum += Double(k * v)
             cnt += k
@@ -2468,7 +2475,7 @@ struct GuideView: View {
         Page(icon: "hand.draw", title: "Листай режимы",
              text: "Проведи пальцем по кадру влево или вправо - режим сменится, как в Камере: Кадр дня, Звёзды, Треки, Город, Облака"),
         Page(icon: "viewfinder", title: "Фокус и яркость",
-             text: "Коснись кадра - фокус и яркость в этой точке. Веди пальцем вверх или вниз - ярче или темнее. ∞ сверху - ночью сам наводит резкость по звёздам, около 20 секунд"),
+             text: "Коснись кадра - фокус и яркость в этой точке. Веди пальцем вверх или вниз - ярче или темнее. ∞ сверху - ночью сам наводит резкость по звёздам, около 30 секунд"),
         Page(icon: "timer", title: "Как часто и сколько",
              text: "Внизу три кнопки: ☀︎ яркость, ⏱ как часто снимать, ⌛ сколько снимать. Выдержку приложение подбирает само под режим и свет"),
         Page(icon: "record.circle", title: "Старт и результат",
