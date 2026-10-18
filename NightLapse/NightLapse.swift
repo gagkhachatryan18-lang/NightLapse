@@ -1108,7 +1108,14 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     /// Сколько света нужно добавить или убрать. Целевая яркость: 118 (средне-серый) со сдвигом на коррекцию в EV.
     /// Считаем в линейном свете (гамма 2.2)
     private func lightFactor(mean: Float, limit: Double) -> Double {
-        let target = 118.0 * pow(pow(2.0, Double(cfg.ev)), 1.0 / 2.2)
+        // Днём - средне-серый 118. Ночью (сенсор на пределе) небо должно остаться тёмным, как на ночном
+        // снимке iPhone: яркость неба около 50, а не серое «как днём»
+        var base = 118.0
+        if let dev = device {
+            let maxDur = min(cfg.exposure, CMTimeGetSeconds(dev.activeFormat.maxExposureDuration))
+            if curISO >= dev.activeFormat.maxISO * 0.95 && CMTimeGetSeconds(curDur) >= maxDur * 0.95 { base = 60 }
+        }
+        let target = base * pow(pow(2.0, Double(cfg.ev)), 1.0 / 2.2)
         let f = pow(target / max(Double(mean), 1.0), 2.2)
         return min(max(f, 1.0 / limit), limit)
     }
@@ -1211,11 +1218,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         DispatchQueue.main.async { self.effExposure = t }
     }
 
-    /// Цифровое усиление только по просьбе: ночью кадр остаётся таким, каким его видит сенсор
-    /// (как на превью во время теста). ☀︎ выше 0 разрешает усиление: +1 - до 2 раз, +2 - до 4 раз
     private func setAutoGain(_ g: Float) {
-        let cap = min(maxAutoGain, max(1, Float(pow(2.0, Double(cfg.ev)))))
-        autoGain = min(max(g, 1), cap)
+        autoGain = min(max(g, 1), maxAutoGain)
         let v = autoGain
         DispatchQueue.main.async { self.autoGainShown = v }
     }
@@ -1347,6 +1351,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         // поднимает фон, поэтому фон тоже опускаем
         let night = isNightLight(Double(curISO) * CMTimeGetSeconds(curDur))
         if g > 1.01 || (cfg.lighten && n > 1 && night) { subtractBlack(div: div) }
+        if g > 1.01 && night { neutralizeSky(div: div) }
         var lo: Float = 0
         var hi: Float = 255
         acc.withUnsafeMutableBufferPointer { a in
@@ -1358,6 +1363,52 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             }
         }
         return out
+    }
+
+    /// Ночью при усилении небо уходит в фиолетовый: красный выше зелёного. Подравниваем каналы так,
+    /// чтобы фон был как на ночном снимке iPhone - нейтральный с лёгкой синевой (R:G:B около 0.93 : 1 : 1.16).
+    /// Поправка меняется плавно от кадра к кадру, чтобы видео не мигало
+    private var skyScale: [Float] = [1, 1, 1]
+
+    private func neutralizeSky(div: Float) {
+        let px = acc.count / 4
+        guard px > 1000 else { return }
+        var hist = [Int](repeating: 0, count: 3 * 1024)  // шаг 0.25, тёмное небо - всего несколько единиц
+        var total = 0
+        acc.withUnsafeBufferPointer { a in
+            var i = 0
+            while i < px {
+                for c in 0..<3 {
+                    hist[c * 1024 + Int(min(1023, max(0, a[i * 4 + c] / div * 4)))] += 1
+                }
+                total += 1
+                i += 37
+            }
+        }
+        var med: [Float] = [0, 0, 0]
+        for c in 0..<3 {
+            var sum = 0, v = 0
+            while v < 1023 {
+                sum += hist[c * 1024 + v]
+                if sum >= total / 2 { break }
+                v += 1
+            }
+            med[c] = Float(max(v, 2)) / 4
+        }
+        // BGRA: 0 - синий, 1 - зелёный, 2 - красный
+        let want: [Float] = [med[1] * 1.16 / med[0], 1, med[1] * 0.93 / med[2]]
+        for c in [0, 2] {
+            let w = min(max(want[c], 0.7), 1.4)
+            skyScale[c] = skyScale[c] * 0.8 + w * 0.2
+        }
+        if mode == .test || outIndex == 0 { skyScale = [min(max(want[0], 0.7), 1.4), 1, min(max(want[2], 0.7), 1.4)] }
+        acc.withUnsafeMutableBufferPointer { a in
+            guard let p = a.baseAddress else { return }
+            for c in [0, 2] {
+                var k = skyScale[c]
+                vDSP_vsmul(p + c, 4, &k, p + c, 4, vDSP_Length(px))
+            }
+        }
     }
 
     /// Чёрная точка по каждому каналу: 1% самых тёмных точек кадра становится чёрным
