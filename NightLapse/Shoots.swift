@@ -1664,6 +1664,7 @@ struct ShootsView: View {
                 path = [s]
             }
         }
+        .traceScreen("Съёмки")
     }
 
     private func reload() {
@@ -2222,6 +2223,7 @@ struct ShootEditor: View {
         } message: {
             Text("\(shoot.frames) кадров будут удалены навсегда. Видео и фото, уже сохранённые в галерее телефона, останутся")
         }
+        .traceScreen("Редактор")
     }
 }
 
@@ -2333,6 +2335,12 @@ enum Diag {
                 }
             }
             try? settings.write(to: tmp.appendingPathComponent("device_and_settings.txt"), atomically: true, encoding: .utf8)
+            // Самопроверка и отчёты iOS о вылетах
+            try? Trace.audit().full.write(to: tmp.appendingPathComponent("audit.txt"), atomically: true, encoding: .utf8)
+            let sys = ((try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? [])
+                .filter { $0.lastPathComponent.hasPrefix("system_") }
+                .sorted { $0.lastPathComponent > $1.lastPathComponent }
+            for u in sys.prefix(5) { try? fm.copyItem(at: u, to: tmp.appendingPathComponent(u.lastPathComponent)) }
 
             for s in ShootStore.list().prefix(3) {
                 let sd = tmp.appendingPathComponent(s.id, isDirectory: true)
@@ -2379,9 +2387,23 @@ enum Diag {
 struct ReportRow: View {
     @State private var busy = false
     @State private var url: URL?
+    @State private var audit = ("Проверяю...", "")
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
+            // Самопроверка: приложение само смотрит свой журнал за сутки
+            DisclosureGroup {
+                Text(audit.1)
+                    .font(.caption2.monospaced())
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } label: {
+                Label(audit.0, systemImage: "stethoscope")
+            }
+            .task {
+                let r = await Task.detached { Trace.audit() }.value
+                audit = (r.short, r.full)
+            }
             if let u = url {
                 ShareLink(item: u) {
                     Label("Отправить отчёт", systemImage: "square.and.arrow.up")
@@ -2970,6 +2992,7 @@ struct ExportSheet: View {
             .navigationTitle("Экспорт")
             .navigationBarTitleDisplayMode(.inline)
         }
+        .traceScreen("Экспорт")
     }
 
     /// Битрейт и примерный размер файла
