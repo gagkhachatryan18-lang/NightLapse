@@ -350,6 +350,14 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     @Published var startHold: Int = 3 { didSet { UserDefaults.standard.set(startHold, forKey: "startHold") } }
 
     /// Резкость по звёздам найдена для текущего объектива (запоминается между запусками)
+    /// Вернуть обычный автофокус
+    func resetFocusAuto() {
+        guard phase == .idle else { return }
+        starFocused = false
+        focusAuto = true
+        applyCamera(forceFocus: true)
+    }
+
     @Published var starFocused = false { didSet { UserDefaults.standard.set(starFocused, forKey: "starFocused") } }
     @Published var isDark = false
 
@@ -367,7 +375,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     func starFocus() {
         guard phase == .idle else { return }
         phase = .test
-        status = "Не трогай телефон, ищу резкость по звёздам..."
+        status = "Навожу резкость по звёздам, не трогай телефон..."
         let hold = startHold
         subTotal = 23
         subDone = 0
@@ -438,7 +446,11 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             self.starFocused = true
             self.subDone = 0
             self.applyCamera(forceFocus: true)
-            self.finished("Резкость по звёздам найдена")
+            self.finished("Резкость найдена")
+            if let next = self.afterFocus {
+                self.afterFocus = nil
+                next()
+            }
         }
     }
 
@@ -787,8 +799,19 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         return min(12, max(3, Int((3.0 / max(sensorExposure, 0.05)).rounded(.up))))
     }
 
+    /// Ночью в Найтлапсе резкость по звёздам нужна до первого кадра: если её ещё нет, ищем сами
+    var needsStarFocus: Bool { sceneKind == .stars && isDark && !starFocused }
+
+    /// Что сделать сразу после поиска резкости (тест или старт, которые его вызвали)
+    private var afterFocus: (() -> Void)?
+
     func testFrame() {
         guard phase == .idle else { return }
+        if needsStarFocus {
+            afterFocus = { [weak self] in self?.testFrame() }
+            starFocus()
+            return
+        }
         let c = makeConfig(name: "test")
         phase = .test
         subTotal = c.subNeeded
@@ -819,6 +842,11 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     func start() {
         guard phase == .idle else { return }
         guard saveVideo || saveFrames else { status = "Включи сохранение видео или кадров"; return }
+        if needsStarFocus {
+            afterFocus = { [weak self] in self?.start() }
+            starFocus()
+            return
+        }
         UIApplication.shared.isIdleTimerDisabled = true
         if startDelayMin > 0 {
             startAt = Date().addingTimeInterval(Double(startDelayMin) * 60)
@@ -899,6 +927,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             startAt = nil
             finished("Отменено")
         case .test:
+            afterFocus = nil
             let s = currentSettings()
             queue.async {
                 self.mode = .off
@@ -1981,6 +2010,7 @@ struct ContentView: View {
     var onSwitch: () -> Void = {}
     @StateObject private var e = LapseEngine()
     @State private var dark = false
+    @State private var showFocusMenu = false
     /// Экономия батареи: через 30 с после старта экран сам гаснет
     @AppStorage("autoDark") private var autoDark = true
     @State private var showTest = false
@@ -2081,21 +2111,36 @@ struct ContentView: View {
             Spacer(minLength: 0)
             if shooting { recTimer }
             Spacer(minLength: 0)
-            Button { e.focusInfinity() } label: {
-                Text("∞")
-                    .font(.system(size: 20, weight: .semibold))
-                    .frame(width: 36, height: 36)
-                    .foregroundStyle(e.starFocused ? Color.yellow
-                        : (e.sceneKind == .stars && e.isDark ? Color.red : (e.focus >= 0.99 ? Color.yellow : Color.white)))
-                    .background(Color.white.opacity(0.12), in: Circle())
+            // Резкость простыми словами: ночью найдётся сама при «Тест» или «Старт», здесь - по желанию
+            Button { showFocusMenu = true } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: e.starFocused ? "checkmark.circle.fill" : (e.needsStarFocus ? "sparkles" : "viewfinder"))
+                    Text(focusLabel)
+                }
+                .font(.system(size: 13, weight: .semibold))
+                .padding(.horizontal, 11)
+                .frame(height: 34)
+                .foregroundStyle(e.starFocused ? Color.yellow : Color.white)
+                .background(Color.white.opacity(0.12), in: Capsule())
             }
-            .simultaneousGesture(LongPressGesture(minimumDuration: 0.5).onEnded { _ in
-                // Долгое нажатие на ∞ - ручной фокус с лупой
-                guard idle else { return }
-                withAnimation(.easeOut(duration: 0.15)) { openParam = .focus }
-            })
             .disabled(!idle)
-            .accessibilityLabel("Фокус на бесконечность. Долгое нажатие - ручной фокус")
+            .accessibilityLabel("Резкость: \(focusLabel)")
+            .confirmationDialog("Резкость", isPresented: $showFocusMenu, titleVisibility: .visible) {
+                if e.isDark {
+                    Button("Найти по звёздам (около 30 с)") { e.starFocus() }
+                } else {
+                    Button("Далеко: пейзаж, горизонт") { e.focusInfinity() }
+                }
+                Button("Настроить вручную с лупой") {
+                    withAnimation(.easeOut(duration: 0.15)) { openParam = .focus }
+                }
+                Button("Обычная, как в Камере") { e.resetFocusAuto() }
+                Button("Отмена", role: .cancel) {}
+            } message: {
+                Text(e.isDark
+                     ? "Ночью резкость по звёздам находится сама при первом «Тест» или «Старт»"
+                     : "Днём коснись кадра - резкость будет в этой точке")
+            }
             roundIcon("moon.fill") { dark = true }
             roundIcon("gearshape.fill") { showSettings = true }
                 .disabled(!idle)
@@ -2290,7 +2335,7 @@ struct ContentView: View {
         HStack(spacing: 8) {
             paramChip(.brightness, "sun.max.fill", String(format: "%+.1f", e.evComp), warn: evWarn != nil)
             paramChip(.interval, "timer", expText(e.intervalSeconds), warn: intervalWarn != nil)
-            paramChip(.duration, "hourglass", e.autoStopMin == 0 ? "∞" : durText(Double(e.autoStopMin) * 60), warn: durationWarn != nil)
+            paramChip(.duration, "hourglass", e.autoStopMin == 0 ? "Без лимита" : durText(Double(e.autoStopMin) * 60), warn: durationWarn != nil)
         }
     }
 
@@ -2339,12 +2384,16 @@ struct ContentView: View {
         return nil
     }
 
-    private var focusWarn: String? {
-        guard e.sceneKind == .stars, e.isDark, !e.starFocused else { return nil }
-        return "Нажми ∞: фокус по звёздам ещё не найден"
-    }
 
-    private var firstWarning: String? { focusWarn ?? evWarn ?? intervalWarn ?? durationWarn }
+    private var firstWarning: String? { evWarn ?? intervalWarn ?? durationWarn }
+
+    /// Подпись кнопки резкости: одно-два слова
+    private var focusLabel: String {
+        if e.starFocused { return "Резко" }
+        if e.needsStarFocus { return "Резкость: сама" }
+        if e.focusAuto { return "Авто" }
+        return e.focus >= 0.99 ? "Далеко" : "Вручную"
+    }
 
     private func paramChip(_ p: Param, _ icon: String, _ value: String, warn: Bool = false) -> some View {
         let on = openParam == p
@@ -2396,7 +2445,7 @@ struct ContentView: View {
                         .tint(.yellow)
                     stepButton("plus") { nudgeFocus(0.005) }
                 }
-                Text("Фокус \(String(format: "%.3f", e.focus)). Лупа: середина кадра в 4 раза крупнее - добейся, чтобы звёзды стали самыми мелкими точками")
+                Text("Середина кадра увеличена в 4 раза. Двигай, пока звёзды не станут самыми мелкими точками")
                     .font(.caption2)
                     .foregroundStyle(Color.white.opacity(0.6))
                     .multilineTextAlignment(.center)
@@ -2609,7 +2658,7 @@ struct GuideView: View {
         Page(icon: "hand.draw", title: "Листай режимы",
              text: "Проведи пальцем по кадру влево или вправо - режим сменится, как в Камере: Кадр дня, Найтлапс, Таймлапс"),
         Page(icon: "viewfinder", title: "Фокус и яркость",
-             text: "Коснись кадра - фокус и яркость в этой точке. Веди пальцем вверх или вниз - ярче или темнее. ∞ сверху - ночью сам наводит резкость по звёздам, около 30 секунд. Долгое нажатие на ∞ - ручной фокус с лупой"),
+             text: "Коснись кадра - фокус и яркость в этой точке. Веди пальцем вверх или вниз - ярче или темнее. Ночью резкость по звёздам наводится сама перед первым кадром. Кнопка «Резкость» сверху - если хочешь вручную"),
         Page(icon: "timer", title: "Как часто и сколько",
              text: "Внизу три кнопки: ☀︎ яркость, ⏱ как часто снимать, ⌛ сколько снимать. Выдержку приложение подбирает само под режим и свет"),
         Page(icon: "record.circle", title: "Старт и результат",
