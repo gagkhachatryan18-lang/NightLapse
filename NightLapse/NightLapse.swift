@@ -2445,6 +2445,7 @@ struct ContentView: View {
                 .presentationDetents([.medium, .large])
         }
         .traceScreen("Камера")
+        .modifier(CameraTrace(e: e, open: openParam.map { "\($0)" } ?? "ничего"))
     }
 
     /// Шторки ночью тоже в красном: всё окрашивается красным, фон - чёрный
@@ -2674,7 +2675,7 @@ struct ContentView: View {
                 if !focusHintSeen && e.needsStarFocus {
                     HStack(spacing: 8) {
                         Image(systemName: "viewfinder")
-                        Text("Фокус наведётся сам по звёздам перед первым кадром, около 30 секунд")
+                        Text("Фокус наведётся сам по звёздам перед первым кадром, около 15 секунд")
                         Button { focusHintSeen = true } label: { Image(systemName: "xmark") }
                             .accessibilityLabel("Понятно")
                     }
@@ -2790,7 +2791,7 @@ struct ContentView: View {
             let left = e.batteryHoursEstimate
             if left < hours {
                 return e.autoStopMin == 0
-                    ? "Заряда хватит примерно на \(e.hoursText(left)). На всю ночь подключи пауэрбанк"
+                    ? "Заряда хватит примерно на \(e.hoursText(left)). Для долгой съёмки подключи пауэрбанк"
                     : "Заряда хватит примерно на \(e.hoursText(left)), а съёмка - \(durText(Double(e.autoStopMin) * 60)). Подключи пауэрбанк"
             }
         }
@@ -2864,7 +2865,8 @@ struct ContentView: View {
                         .tint(t.accent)
                     stepButton("plus") { nudgeFocus(0.005) }
                 }
-                Text("Середина кадра увеличена в 4 раза. Двигай, пока звёзды не станут самыми мелкими точками")
+                Text(e.isDark ? "Середина кадра увеличена в 4 раза. Двигай, пока звёзды не станут самыми мелкими точками"
+                     : "Середина кадра увеличена в 4 раза. Двигай, пока детали не станут самыми чёткими")
                     .font(.footnote)
                     .foregroundStyle(t.dim)
                     .multilineTextAlignment(.center)
