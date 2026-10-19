@@ -267,8 +267,14 @@ final class Store: ObservableObject {
         }
     }
 
-    func addPhoto(data: Data, ext: String, shot: Shot) -> Photo? {
-        let name = Photo.nameFmt.string(from: Date()) + "." + ext
+    func addPhoto(data: Data, ext: String, shot: Shot, date: Date = Date()) -> Photo? {
+        // Имя файла - дата снимка; если такая секунда уже занята, сдвигаем на секунду
+        var d = date
+        var name = Photo.nameFmt.string(from: d) + "." + ext
+        while FileManager.default.fileExists(atPath: dir.appendingPathComponent(name).path) {
+            d = d.addingTimeInterval(1)
+            name = Photo.nameFmt.string(from: d) + "." + ext
+        }
         let url = dir.appendingPathComponent(name)
         do { try data.write(to: url) } catch { return nil }
         meta.shots[name] = shot
@@ -276,6 +282,25 @@ final class Store: ObservableObject {
         saveMeta()
         reload()
         return Photo(name: name, url: url)
+    }
+
+    /// Добавить снимки из галереи: дата берётся из самого снимка (EXIF), чтобы порядок кадров был верным
+    func importImages(_ items: [(Data, String)]) -> Int {
+        var n = 0
+        for (data, ext) in items {
+            var date = Date()
+            if let src = CGImageSourceCreateWithData(data as CFData, nil),
+               let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+               let exif = props[kCGImagePropertyExifDictionary] as? [CFString: Any],
+               let str = exif[kCGImagePropertyExifDateTimeOriginal] as? String {
+                let f = DateFormatter()
+                f.locale = Locale(identifier: "en_US_POSIX")
+                f.dateFormat = "yyyy:MM:dd HH:mm:ss"
+                if let d = f.date(from: str) { date = d }
+            }
+            if addPhoto(data: data, ext: ext, shot: Shot(q: [], g: [], lens: "import"), date: date) != nil { n += 1 }
+        }
+        return n
     }
 
     func delete(_ p: Photo) {
@@ -1371,6 +1396,9 @@ struct ArchiveView: View {
     @AppStorage("remindMin") private var remindMin = 20 * 60
     @AppStorage("copyToPhotos") private var copyToPhotos = true
     @State private var viewing: Photo?
+    @State private var picked: [PhotosPickerItem] = []
+    @State private var importing = false
+    @State private var importNote = ""
     @State private var confirmDelete: Photo?
 
     private var timeBinding: Binding<Date> {
@@ -1474,8 +1502,18 @@ struct ArchiveView: View {
     private var gridCard: some View {
         card {
             Text("Кадры: \(store.photos.count)").font(.headline)
+            PhotosPicker(selection: $picked, maxSelectionCount: 0, matching: .images) {
+                Label(importing ? "Добавляю..." : "Добавить из галереи телефона", systemImage: "photo.badge.plus")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .disabled(importing)
+            .onChange(of: picked) { importPicked() }
+            if !importNote.isEmpty {
+                Text(importNote).font(.footnote).foregroundStyle(.secondary)
+            }
             if store.photos.isEmpty {
-                Text("Пока пусто. Сними первый кадр белой кнопкой")
+                Text("Пока пусто. Сними первый кадр белой кнопкой или добавь снимки из галереи")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             } else {
@@ -1493,6 +1531,30 @@ struct ArchiveView: View {
                     }
                 }
             }
+        }
+    }
+
+    private func importPicked() {
+        let items = picked
+        guard !items.isEmpty else { return }
+        importing = true
+        importNote = ""
+        Task {
+            var got: [(Data, String)] = []
+            for it in items {
+                if let d = try? await it.loadTransferable(type: Data.self) {
+                    let ext = (it.supportedContentTypes.first?.preferredFilenameExtension ?? "jpg").lowercased()
+                    if ["heic", "jpg", "jpeg"].contains(ext) {
+                        got.append((d, ext == "jpeg" ? "jpg" : ext))
+                    } else if let j = UIImage(data: d)?.jpegData(compressionQuality: 0.95) {
+                        got.append((j, "jpg"))   // PNG и прочее - в JPEG, как остальные кадры
+                    }
+                }
+            }
+            let n = store.importImages(got)
+            importing = false
+            picked = []
+            importNote = n > 0 ? "Добавлено снимков: \(n). Они встали по дате съёмки" : "Не удалось добавить снимки"
         }
     }
 
