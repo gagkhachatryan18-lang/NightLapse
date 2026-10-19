@@ -1019,7 +1019,9 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         }
     }
 
-    private func finished(_ msg: String) {
+    private func finished(_ msg0: String) {
+        let msg = stoppedByBattery ? "Заряд кончался, съёмка остановлена заранее. " + msg0 : msg0
+        stoppedByBattery = false
         phase = .idle
         status = msg
         LiveStatus.shared.end(note: msg)
@@ -1053,6 +1055,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     @Published var batteryWarn: String?
     private var batStart: (Date, Int)?
     private var batWarnLogged = false
+    private var stoppedByBattery = false
 
     private var charging: Bool {
         let s = UIDevice.current.batteryState
@@ -1065,8 +1068,12 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         return r > 0.5 ? r : 10
     }
 
-    /// Сколько часов продержится батарея до 5% при обычном расходе (для подсказки до старта)
-    var batteryHoursEstimate: Double { max(0, Double(battery - 5)) / batteryRate }
+    /// На этом заряде съёмка останавливается сама, с запасом: на морозе телефон может выключиться и при 5%,
+    /// а видео и кадры ещё нужно дописать
+    static let batteryStop = 8
+
+    /// Сколько часов продержится батарея до остановки при обычном расходе (для подсказки до старта)
+    var batteryHoursEstimate: Double { max(0, Double(battery - Self.batteryStop)) / batteryRate }
 
     private func watchBattery(_ now: Date) {
         guard battery >= 0 else { return }
@@ -1086,7 +1093,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         if hours >= 1.0 / 6 && used >= 2 {
             let rate = used / hours
             UserDefaults.standard.set(rate, forKey: "batRate")
-            batteryLeftH = max(0, Double(battery - 5)) / rate
+            batteryLeftH = max(0, Double(battery - Self.batteryStop)) / rate
         }
         var warn: String?
         if let left = batteryLeftH {
@@ -1099,11 +1106,15 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
                 warn = "Заряда осталось примерно на \(hoursText(left)). Подключи пауэрбанк"
             }
         }
-        if battery <= 4 {
-            // Пока телефон не выключился сам: останавливаем съёмку, чтобы видео и кадры сохранились целыми
+        if battery <= Self.batteryStop {
+            // Пока телефон не выключился сам: останавливаем съёмку, чтобы видео и кадры успели сохраниться
             Diag.event("Батарея \(battery)%: съёмка остановлена, чтобы сохранить видео")
+            stoppedByBattery = true
             stop()
             return
+        }
+        if warn == nil && battery <= Self.batteryStop + 5 {
+            warn = "Заряд \(battery)%: на \(Self.batteryStop)% съёмка остановится сама и всё сохранит"
         }
         if warn != batteryWarn {
             batteryWarn = warn
