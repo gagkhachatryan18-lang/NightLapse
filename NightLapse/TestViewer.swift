@@ -96,6 +96,7 @@ struct TestViewer: View {
             idx = 0
         }
         .onChange(of: idx) { message = "" }
+        .traceScreen("Тесты")
     }
 
     /// Оценка яркости кадра простыми словами
