@@ -134,8 +134,8 @@ enum LapseScene: String, CaseIterable, Identifiable {
     }
     var hint: String {
         switch self {
-        case .stars: return "Ночь и звёзды. Следы, Starlapse и фото со следами - в редакторе"
-        case .clouds: return "День, закат, облака. Выдержка сама подстроится под свет"
+        case .stars: return "Ночное небо"
+        case .clouds: return "День, закат, облака"
         }
     }
     /// Снимок каждые N секунд по умолчанию
@@ -2458,7 +2458,7 @@ struct ContentView: View {
         HStack(spacing: 8) {
             paramChip(.brightness, "sun.max.fill", String(format: "%+.1f", e.evComp), warn: evWarn != nil)
             paramChip(.interval, "timer", expText(e.intervalSeconds), warn: intervalWarn != nil)
-            paramChip(.duration, "hourglass", e.autoStopMin == 0 ? "Без лимита" : durText(Double(e.autoStopMin) * 60), warn: durationWarn != nil)
+            paramChip(.duration, "hourglass", e.autoStopMin == 0 ? "Пока не остановлю" : durText(Double(e.autoStopMin) * 60), warn: durationWarn != nil)
         }
     }
 
@@ -2722,7 +2722,7 @@ struct ContentView: View {
         let interval = max(e.intervalSeconds, 0.01)
         let fps = Double(max(e.fps, 1))
         let videoPerHour = 3600 / interval / fps
-        var s = "\(e.sceneKind.hint)\n1 час съёмки = \(String(format: "%.1f", videoPerHour)) с видео"
+        var s = "\(e.sceneKind.hint) · 1 час съёмки = \(String(format: "%.1f", videoPerHour)) с видео"
         if e.autoStopMin > 0 {
             s += ", за \(durText(Double(e.autoStopMin) * 60)) - \(String(format: "%.1f", videoPerHour * Double(e.autoStopMin) / 60)) с"
         }
