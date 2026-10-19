@@ -262,6 +262,38 @@ struct Frame {
     }
 }
 
+/// Баланс белого в редакторе: тепло (синий ↔ жёлтый) и оттенок (зелёный ↔ пурпурный).
+/// Кадры на диске не меняются, поправка ложится на всё, что собирает редактор
+struct Grade: Equatable {
+    var temp: Float = 0
+    var tint: Float = 0
+    var isNeutral: Bool { abs(temp) < 0.01 && abs(tint) < 0.01 }
+
+    /// Таблицы для синего, зелёного и красного
+    func luts() -> [[UInt8]] {
+        let kb = 1 - 0.3 * temp, kr = 1 + 0.3 * temp, kg = 1 - 0.18 * tint
+        let mk: (Float) -> [UInt8] = { k in (0..<256).map { UInt8(min(255, max(0, (Float($0) * k).rounded()))) } }
+        return [mk(kb), mk(kg), mk(kr)]
+    }
+}
+
+extension Frame {
+    mutating func apply(_ g: Grade) {
+        guard !g.isNeutral else { return }
+        let t = g.luts()
+        let n = px.count
+        px.withUnsafeMutableBufferPointer { p in
+            var i = 0
+            while i + 2 < n {
+                p[i] = t[0][Int(p[i])]
+                p[i + 1] = t[1][Int(p[i + 1])]
+                p[i + 2] = t[2][Int(p[i + 2])]
+                i += 4
+            }
+        }
+    }
+}
+
 /// Свет на сенсоре = ISO × выдержка подкадра. Звёздное небо - тысячи (ISO 5000 × 1 с),
 /// пасмурный вечер днём - около 20. Меньше 300 - сумерки или день: следов звёзд там нет
 func isNightLight(_ light: Double) -> Bool { light >= 300 }
@@ -298,11 +330,32 @@ final class Renderer: ObservableObject {
     func cancel() { cancelled = true }
 
     /// Быстрый просмотр на маленьких кадрах (не больше 150 кадров)
-    func makePreview(_ shoot: Shoot, _ look: Look, _ trail: Trail) {
+    // Последний собранный просмотр без цвета: при движении ползунков цвета пересобирать его не нужно
+    private var baseKey = ""
+    private var base: CGImage?
+
+    func makePreview(_ shoot: Shoot, _ look: Look, _ trail: Trail, _ grade: Grade = Grade()) {
         previewToken += 1
         let token = previewToken
         previewBusy = true
+        let key = "\(shoot.id)|\(look.rawValue)|\(trail.rawValue)"
         q.async {
+            if key == self.baseKey, let b = self.base {
+                var img: CGImage? = b
+                if !grade.isNeutral {
+                    var f = Frame(w: b.width, h: b.height)
+                    f.draw(b)
+                    f.apply(grade)
+                    img = f.cgImage()
+                }
+                let ui = img.map { UIImage(cgImage: $0) }
+                DispatchQueue.main.async {
+                    guard token == self.previewToken else { return }
+                    self.preview = ui
+                    self.previewBusy = false
+                }
+                return
+            }
             let urls = ShootStore.frameURLs(shoot.dir)
             guard !urls.isEmpty else {
                 DispatchQueue.main.async { self.previewBusy = false }
@@ -348,6 +401,16 @@ final class Renderer: ObservableObject {
                 }
                 img = acc.cgImage()
             }
+            if token == self.previewToken, let c = img {
+                self.base = c
+                self.baseKey = key
+            }
+            if !grade.isNeutral, let c = img {
+                var f = Frame(w: c.width, h: c.height)
+                f.draw(c)
+                f.apply(grade)
+                img = f.cgImage()
+            }
             let ui = img.map { UIImage(cgImage: $0) }
             DispatchQueue.main.async {
                 guard token == self.previewToken else { return }
@@ -357,7 +420,7 @@ final class Renderer: ObservableObject {
         }
     }
 
-    func run(_ shoot: Shoot, _ look: Look, _ trail: Trail, denoise: Bool) {
+    func run(_ shoot: Shoot, _ look: Look, _ trail: Trail, denoise: Bool, grade: Grade = Grade()) {
         guard !busy else { return }
         busy = true
         cancelled = false
@@ -370,12 +433,12 @@ final class Renderer: ObservableObject {
             // Готовый Starlapse из съёмки - без шумодава, поэтому с «Убрать шум» собираем заново
             // Если между кадрами были паузы, готовые следы из съёмки пунктирные - собираем заново с дорисовкой
             if let ready = ShootStore.liveURL(shoot.dir, look, trail), FileManager.default.fileExists(atPath: ready.path),
-               !(denoise && look.isVideo), !GapFill.needed(shoot.dir) {
+               !(denoise && look.isVideo), !GapFill.needed(shoot.dir), grade.isNeutral {
                 r = self.saveReady(ready, isVideo: look.isVideo)
             } else if look == .startrail {
-                r = self.renderPhoto(shoot)
+                r = self.renderPhoto(shoot, grade)
             } else {
-                r = self.renderMovie(shoot, look, trail, denoise: denoise)
+                r = self.renderMovie(shoot, look, trail, denoise: denoise, grade: grade)
             }
             Diag.event("Редактор: \(look.title) \(look == .starlapse ? trail.title : "")\(denoise && look.isVideo ? " без шума" : "") для \(shoot.id), \(shoot.frames) кадров, "
                 + "\(Int(Date().timeIntervalSince(t0))) с: \(r)")
@@ -437,7 +500,7 @@ final class Renderer: ObservableObject {
         DispatchQueue.main.async { self.progress = p }
     }
 
-    private func renderPhoto(_ shoot: Shoot) -> String {
+    private func renderPhoto(_ shoot: Shoot, _ grade: Grade) -> String {
         let urls = ShootStore.frameURLs(shoot.dir)
         guard let first = urls.first.flatMap({ ShootStore.full($0) }) else { return "Нет кадров" }
         var acc = Frame(w: first.width, h: first.height)
@@ -450,6 +513,7 @@ final class Renderer: ObservableObject {
             // Без журнала (старые съёмки) пересвеченный кадр рассвета узнаётся по яркости
             guard nm.isEmpty ? raw.meanLuma() < 170 : (nm[i + 1] ?? true) else { return }
             var cur = raw
+            cur.apply(grade)
             gap.apply(&cur)
             acc.trail(with: cur, lut: lut)
             used += 1
@@ -473,7 +537,7 @@ final class Renderer: ObservableObject {
 
     /// Видео из кадров: таймлапс, Starlapse или рилс «3 в 1» (таймлапс, средний след, длинный след друг под другом).
     /// denoise - убрать шум, сглаживая каждую точку по соседним кадрам
-    private func renderMovie(_ shoot: Shoot, _ look: Look, _ trail: Trail, denoise: Bool) -> String {
+    private func renderMovie(_ shoot: Shoot, _ look: Look, _ trail: Trail, denoise: Bool, grade: Grade) -> String {
         let urls = ShootStore.frameURLs(shoot.dir)
         guard let first = urls.first.flatMap({ ShootStore.full($0) }) else { return "Нет кадров" }
         let w = first.width, h = first.height
@@ -514,6 +578,7 @@ final class Renderer: ObservableObject {
         let gap = GapFill(shoot.dir)
         let done = eachFrame(urls, w, h) { raw, i in
             var cur = raw
+            cur.apply(grade)
             if denoise { dn.apply(&cur) }
             let night = nm.isEmpty ? cur.meanLuma() < 170 : (nm[i + 1] ?? true)
             if look != .timelapse {
@@ -591,8 +656,9 @@ struct TemporalDenoise {
                 var i = 0
                 while i < n {
                     let a = Int(pp[i]), d = Int(cp[i]) - a
-                    if d > -12 && d < 12 {
-                        let v = UInt8(a + d * 2 / 5)
+                    // Бережный уровень: только мелкое мерцание, звёзды и движение не трогаем
+                    if d > -9 && d < 9 {
+                        let v = UInt8(a + d / 3)
                         pp[i] = v
                         cp[i] = v
                     } else {
@@ -739,10 +805,14 @@ struct ShootEditor: View {
     @State private var trail: Trail = .medium
     @AppStorage("denoise") private var denoise = true
     @State private var confirmDelete = false
+    @State private var grade = Grade()
+    @State private var reportURL: URL?
+    @State private var reportBusy = false
 
     /// Собрано во время съёмки - сохранится мгновенно
     private var isReady: Bool {
         if denoise && look.isVideo { return false }
+        if !grade.isNeutral || GapFill.needed(shoot.dir) { return false }
         guard let u = ShootStore.liveURL(shoot.dir, look, trail) else { return false }
         return FileManager.default.fileExists(atPath: u.path)
     }
@@ -782,6 +852,27 @@ struct ShootEditor: View {
                         .disabled(r.busy)
                 }
 
+                VStack(spacing: 6) {
+                    HStack {
+                        Text("Цвет").font(.footnote).foregroundStyle(.secondary)
+                        Spacer()
+                        if !grade.isNeutral {
+                            Button("Сбросить") { grade = Grade() }.font(.footnote)
+                        }
+                    }
+                    HStack {
+                        Image(systemName: "snowflake").foregroundStyle(.blue)
+                        Slider(value: $grade.temp, in: -1...1)
+                        Image(systemName: "sun.max.fill").foregroundStyle(.orange)
+                    }
+                    HStack {
+                        Circle().fill(Color.green).frame(width: 14, height: 14)
+                        Slider(value: $grade.tint, in: -1...1)
+                        Circle().fill(Color.pink).frame(width: 14, height: 14)
+                    }
+                }
+                .disabled(r.busy)
+
                 Text(look.hint)
                     .font(.footnote)
                     .foregroundStyle(.secondary)
@@ -798,7 +889,7 @@ struct ShootEditor: View {
                     }
                 } else {
                     Button {
-                        r.run(shoot, look, trail, denoise: denoise)
+                        r.run(shoot, look, trail, denoise: denoise, grade: grade)
                     } label: {
                         Label(isReady ? "Сохранить в Фото (уже готово)" : "Собрать и сохранить в Фото", systemImage: "square.and.arrow.down")
                             .frame(maxWidth: .infinity)
@@ -809,6 +900,31 @@ struct ShootEditor: View {
                         Text(r.message).font(.footnote).foregroundStyle(.secondary)
                     }
                 }
+
+                // Отчёт по этой съёмке: журнал, настройки и пара кадров. Его можно прислать в чат с Claude
+                Group {
+                    if let u = reportURL {
+                        ShareLink(item: u) {
+                            Label("Отправить отчёт", systemImage: "square.and.arrow.up").frame(maxWidth: .infinity)
+                        }
+                    } else {
+                        Button {
+                            reportBusy = true
+                            Diag.makeReport { u in
+                                reportURL = u
+                                reportBusy = false
+                            }
+                        } label: {
+                            HStack {
+                                Label("Собрать отчёт для улучшения", systemImage: "doc.text.magnifyingglass")
+                                if reportBusy { ProgressView() }
+                            }
+                            .frame(maxWidth: .infinity)
+                        }
+                        .disabled(reportBusy)
+                    }
+                }
+                .buttonStyle(.bordered)
 
                 Divider().padding(.vertical, 4)
 
@@ -833,9 +949,10 @@ struct ShootEditor: View {
         .navigationBarTitleDisplayMode(.inline)
         .navigationBarBackButtonHidden(r.busy)
         .interactiveDismissDisabled(r.busy)
-        .onAppear { r.makePreview(shoot, look, trail) }
-        .onChange(of: look) { r.makePreview(shoot, look, trail) }
-        .onChange(of: trail) { r.makePreview(shoot, look, trail) }
+        .onAppear { r.makePreview(shoot, look, trail, grade) }
+        .onChange(of: look) { r.makePreview(shoot, look, trail, grade) }
+        .onChange(of: trail) { r.makePreview(shoot, look, trail, grade) }
+        .onChange(of: grade) { r.makePreview(shoot, look, trail, grade) }
         .onDisappear { r.cancel() }
         .alert("Удалить исходники?", isPresented: $confirmDelete) {
             Button("Удалить навсегда", role: .destructive) {
