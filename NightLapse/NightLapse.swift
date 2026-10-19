@@ -23,13 +23,13 @@ struct NightLapseApp: App {
             Group {
                 if mode == .night {
                     ContentView(onSwitch: { switchTo(.daily) })
-                        .tint(.red)
+                        .tint(Pal(night: false).accent)
                 } else {
                     RootView(onSwitch: { switchTo(.night) }, onScene: { sc in
                         UserDefaults.standard.set(sc.rawValue, forKey: "pendingScene")
                         switchTo(.night)
                     })
-                        .tint(.orange)
+                        .tint(Pal(night: false).accent)
                 }
             }
             .preferredColorScheme(.dark)
@@ -654,10 +654,146 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         configured = true
         AVCaptureDevice.requestAccess(for: .video) { ok in
             DispatchQueue.main.async {
-                if ok { self.changeCamera() } else { self.status = "Нет доступа к камере: Настройки → NightLapse" }
+                if ok {
+                    self.changeCamera()
+                    self.resumeIfInterrupted()
+                } else {
+                    self.status = "Нет доступа к камере: Настройки → NightLapse"
+                }
             }
         }
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { _ in }
+    }
+
+    // MARK: Пробные RAW-кадры (эксперимент)
+
+    private let photoOut = AVCapturePhotoOutput()
+    private var rawLeft = 0
+    private var rawTotal = 0
+    private var rawSaved = 0
+    private var rawFormat: OSType = 0
+
+    /// Серия RAW (DNG) по 1 с на максимальном ISO - сравнить с нашим кадром в Lightroom.
+    /// Камера на время переключается в фото-формат, потом возвращается обратно
+    func rawTest(count: Int = 5) {
+        guard phase == .idle else { return }
+        phase = .test
+        subTotal = count
+        subDone = 0
+        status = "RAW: готовлю камеру..."
+        UIApplication.shared.isIdleTimerDisabled = true
+        let focusPos = focus
+        queue.async {
+            guard let dev = self.device else { return self.rawDone("Камера недоступна") }
+            self.session.beginConfiguration()
+            if !self.session.outputs.contains(self.photoOut), self.session.canAddOutput(self.photoOut) {
+                self.session.addOutput(self.photoOut)
+            }
+            self.session.commitConfiguration()
+            // Ищем формат, где фото-выход отдаёт Bayer RAW, начиная с самого большого фото
+            func px(_ f: AVCaptureDevice.Format) -> Int {
+                f.supportedMaxPhotoDimensions.map { Int($0.width) * Int($0.height) }.max() ?? 0
+            }
+            var found: OSType?
+            for f in dev.formats.sorted(by: { px($0) > px($1) }).prefix(16) {
+                if (try? dev.lockForConfiguration()) != nil {
+                    dev.activeFormat = f
+                    dev.unlockForConfiguration()
+                }
+                if let r = self.photoOut.availableRawPhotoPixelFormatTypes.first(where: { AVCapturePhotoOutput.isBayerRAWPixelFormat($0) }) {
+                    found = r
+                    if let big = f.supportedMaxPhotoDimensions.max(by: { Int($0.width) * Int($0.height) < Int($1.width) * Int($1.height) }) {
+                        self.photoOut.maxPhotoDimensions = big
+                    }
+                    break
+                }
+            }
+            guard let raw = found else { return self.rawDone("RAW на этой камере недоступен") }
+            self.rawFormat = raw
+            if (try? dev.lockForConfiguration()) != nil {
+                let d = min(1.0, CMTimeGetSeconds(dev.activeFormat.maxExposureDuration))
+                dev.setExposureModeCustom(duration: CMTime(seconds: d, preferredTimescale: 1_000_000),
+                                          iso: dev.activeFormat.maxISO, completionHandler: nil)
+                if dev.isLockingFocusWithCustomLensPositionSupported {
+                    dev.setFocusModeLocked(lensPosition: focusPos, completionHandler: nil)
+                }
+                dev.unlockForConfiguration()
+            }
+            self.rawLeft = count
+            self.rawTotal = count
+            self.rawSaved = 0
+            DispatchQueue.main.async { self.status = "RAW: снимаю, не трогай телефон" }
+            // Дать выдержке и фокусу встать
+            self.queue.asyncAfter(deadline: .now() + 2.5) { self.shootRaw() }
+        }
+    }
+
+    private func shootRaw() {
+        let st = AVCapturePhotoSettings(rawPixelFormatType: rawFormat)
+        st.maxPhotoDimensions = photoOut.maxPhotoDimensions
+        photoOut.capturePhoto(with: st, delegate: self)
+    }
+
+    fileprivate func rawFinished(_ data: Data?) {
+        queue.async {
+            if let d = data {
+                let dir = Self.docs().appendingPathComponent("RAW", isDirectory: true)
+                try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                let f = DateFormatter()
+                f.dateFormat = "yyyy-MM-dd_HH-mm-ss"
+                let n = self.rawTotal - self.rawLeft + 1
+                if (try? d.write(to: dir.appendingPathComponent("raw_\(f.string(from: Date()))_\(n).dng"))) != nil { self.rawSaved += 1 }
+            }
+            self.rawLeft -= 1
+            let done = self.rawTotal - self.rawLeft
+            DispatchQueue.main.async {
+                self.subDone = done
+                self.status = "RAW: снято \(done) из \(self.rawTotal)"
+            }
+            if self.rawLeft > 0 {
+                self.queue.asyncAfter(deadline: .now() + 0.3) { self.shootRaw() }
+            } else {
+                self.rawDone(self.rawSaved > 0
+                             ? "RAW: \(self.rawSaved) кадров в Файлы → NightLapse → RAW"
+                             : "RAW не сохранился")
+            }
+        }
+    }
+
+    /// Убрать фото-выход и вернуть видео-формат и настройки
+    private func rawDone(_ msg: String) {
+        session.beginConfiguration()
+        if session.outputs.contains(photoOut) { session.removeOutput(photoOut) }
+        session.commitConfiguration()
+        Diag.event(msg)
+        DispatchQueue.main.async {
+            self.subDone = 0
+            self.changeCamera()
+            self.finished(msg)
+        }
+    }
+
+    /// Если приложение закрылось посреди съёмки (вылет, система выгрузила), при следующем открытии
+    /// в течение 15 минут съёмка продолжается сама через 10 секунд. Новая съёмка помнит, что она продолжение
+    private func resumeIfInterrupted() {
+        guard phase == .idle, let last = ShootStore.list().first, !last.done,
+              let lastFrame = ShootStore.frameURLs(last.dir).last,
+              let t = (try? FileManager.default.attributesOfItem(atPath: lastFrame.path))?[.modificationDate] as? Date,
+              Date().timeIntervalSince(t) < 15 * 60 else { return }
+        let info = ShootStore.readInfo(last.dir)
+        if let u = info["until"] as? Double, u > 0 {
+            guard u > Date().timeIntervalSince1970 + 60 else { return }   // время съёмки уже вышло
+            resumeUntil = Date(timeIntervalSince1970: u)
+        }
+        resumeOf = last.id
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm"
+        Diag.event("Съёмка \(last.id) оборвалась в \(f.string(from: t)), продолжаю")
+        UIApplication.shared.isIdleTimerDisabled = true
+        startAt = Date().addingTimeInterval(10)
+        countdown = 10
+        phase = .waiting
+        status = "Съёмка оборвалась в \(f.string(from: t)). Продолжаю - не трогай телефон"
     }
 
     private func currentSettings() -> CamSettings {
@@ -878,7 +1014,11 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         setExtra(0)
         let now = Date()
         recStart = now
-        autoStopAt = autoStopMin > 0 ? now.addingTimeInterval(Double(autoStopMin) * 60) : nil
+        autoStopAt = resumeUntil ?? (autoStopMin > 0 ? now.addingTimeInterval(Double(autoStopMin) * 60) : nil)
+        infoUntil = autoStopAt?.timeIntervalSince1970
+        infoContinues = resumeOf
+        resumeUntil = nil
+        resumeOf = nil
         phase = .recording
         status = "Не трогай телефон \(startHold) с..."
         let hold = startHold
@@ -935,6 +1075,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         switch phase {
         case .waiting:
             startAt = nil
+            resumeUntil = nil
+            resumeOf = nil
             finished("Отменено")
         case .test:
             afterFocus = nil
@@ -1063,6 +1205,12 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     private var batWarnLogged = false
     /// Почему съёмка остановилась сама (заряд, память) - допишется к итоговому сообщению
     private var stopReason: String?
+    /// Для записи в info.json: до какого времени снимать и какую оборванную съёмку продолжает эта
+    private var infoUntil: Double?
+    private var infoContinues: String?
+    /// Продолжение оборванной съёмки: до какого времени снимать
+    private var resumeUntil: Date?
+    private var resumeOf: String?
 
     private var charging: Bool {
         let s = UIDevice.current.batteryState
@@ -1836,7 +1984,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
                 ShootStore.writeInfo(dir, ["fps": Int(cfg.fps), "scene": cfg.scene, "interval": cfg.interval,
                                            "created": Date().timeIntervalSince1970, "done": false,
                                            "exposure": cfg.exposure, "pause": cfg.pause, "ev": Double(cfg.ev),
-                                           "device": Diag.model(), "camera": Diag.device])
+                                           "device": Diag.model(), "camera": Diag.device,
+                                           "until": infoUntil ?? 0, "continues": infoContinues ?? ""])
                 Diag.beginShoot(dir, "режим \(cfg.scene), интервал \(cfg.interval) с, выдержка \(cfg.exposure) с, "
                     + "пауза \(cfg.pause) с, яркость \(cfg.ev) EV, \(cfg.fps) к/с, подкадров \(cfg.subNeeded)")
             }
@@ -2191,6 +2340,8 @@ struct ContentView: View {
     /// Экономия батареи: через 30 с после старта экран сам гаснет
     @AppStorage("autoDark") private var autoDark = true
     @State private var showTest = false
+    /// Сколько пробных кадров сохранено
+    @State private var savedTests = 0
     @State private var showSettings = false
     @State private var focusMark: CGPoint?
     @StateObject private var pole = PoleFinder()
@@ -2236,7 +2387,11 @@ struct ContentView: View {
             }
         }
         .onDisappear { e.shutdown() }
-        .onChange(of: e.testCount) { showTest = true }
+        .onChange(of: e.testCount) {
+            showTest = true
+            savedTests = TestStore.list().count
+        }
+        .task { savedTests = TestStore.list().count }
         .onChange(of: e.zoom) {
             e.changeCamera()
             e.syncExposure()
@@ -2275,11 +2430,17 @@ struct ContentView: View {
         .sheet(isPresented: $showShoots, onDismiss: { shootToOpen = nil }) {
             ShootsView(open: shootToOpen)
         }
-        .sheet(isPresented: $showTest) { testSheet }
+        .sheet(isPresented: $showTest) { nightSheet(testSheet) }
         .sheet(isPresented: $showSettings) {
-            SettingsSheet(e: e)
+            nightSheet(SettingsSheet(e: e))
                 .presentationDetents([.medium, .large])
         }
+    }
+
+    /// Шторки ночью тоже в красном: всё окрашивается красным, фон - чёрный
+    private func nightSheet<V: View>(_ v: V) -> some View {
+        v.colorMultiply(t.night ? Color(red: 1, green: 0.32, blue: 0.27) : Color.white)
+            .presentationBackground(t.night ? Color.black : Color(white: 0.11))
     }
 
     // MARK: Верхняя полоса
@@ -2300,9 +2461,10 @@ struct ContentView: View {
                 .padding(.horizontal, 11)
                 .frame(height: 34)
                 .foregroundStyle(e.starFocused ? t.accent : t.text)
-                .background(t.fill, in: Capsule())
+                .background(e.starFocused ? t.accent.opacity(0.18) : t.fill, in: Capsule())
             }
             .disabled(!idle)
+            .opacity(shooting ? 0 : 1)
             .accessibilityLabel(focusLabel)
             .confirmationDialog("Фокус", isPresented: $showFocusMenu, titleVisibility: .visible) {
                 Button("Вручную") {
@@ -2313,8 +2475,10 @@ struct ContentView: View {
             }
             roundIcon("moon") { dark = true }
                 .accessibilityLabel("Погасить экран")
-            roundIcon("gearshape") { showSettings = true }
-                .accessibilityLabel("Настройки")
+            if !shooting {
+                roundIcon("gearshape") { showSettings = true }
+                    .accessibilityLabel("Настройки")
+            }
                 .disabled(!idle)
         }
         .padding(.top, 4)
@@ -2399,12 +2563,7 @@ struct ContentView: View {
                     PolePill(p: pole, pal: t)
                 }
                 Spacer()
-                if shooting {
-                    HStack {
-                        recordingInfo
-                        Spacer()
-                    }
-                } else if idle {
+                if idle {
                     zoomRow
                 }
             }
@@ -2480,7 +2639,7 @@ struct ContentView: View {
     }
 
     private var statusLine: String {
-        var s = e.phase == .waiting ? "Ожидание старта" : e.status
+        var s = e.status
         if e.pauses > 0 && (e.phase == .recording || e.phase == .paused) { s += " · пауз: \(e.pauses)" }
         if e.cooling && (e.phase == .recording || e.phase == .paused) { s += " · пауза +\(Int(e.coolExtra)) с от нагрева" }
         if e.phase == .recording && e.effExposure > 0 && e.effExposure < e.exposureSeconds - 0.01 {
@@ -2523,29 +2682,56 @@ struct ContentView: View {
                     .multilineTextAlignment(.center)
                 modeCarousel
             } else if e.phase == .recording || e.phase == .paused {
-                if let w = e.batteryWarn {
-                    Text(w)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(t.warn)
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal, 16)
-                } else {
-                    Text(e.batteryLeftH.map { "Заряда хватит примерно на \(e.hoursText($0)). Не двигай телефон" }
-                         ?? "Не двигай телефон. Луна вверху гасит экран, касание - снова включает")
-                        .font(.footnote)
-                        .foregroundStyle(t.dim)
-                }
+                dashboard
             }
             shutterRow
         }
         .padding(.bottom, 8)
+        .animation(.easeInOut(duration: 0.25), value: e.phase)
+        .animation(.easeInOut(duration: 0.2), value: openParam)
+        .animation(.easeInOut(duration: 0.2), value: firstWarning)
+    }
+
+    /// Во время съёмки - только главное, крупно: сколько идёт, сколько кадров, сколько видео и хватит ли заряда
+    private var dashboard: some View {
+        VStack(spacing: 10) {
+            HStack(spacing: 0) {
+                dashCell("Идёт", hms(e.elapsed))
+                dashCell("Кадров", "\(e.framesDone)")
+                dashCell("Видео", String(format: "%.1f с", Double(e.framesDone) / Double(max(e.fps, 1))))
+            }
+            .padding(.vertical, 10)
+            .background(t.fill, in: RoundedRectangle(cornerRadius: 14))
+            .padding(.horizontal, 16)
+            if let w = e.batteryWarn {
+                Text(w)
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(t.warn)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 16)
+            } else {
+                Text(e.batteryLeftH.map { "Заряда хватит примерно на \(e.hoursText($0))" } ?? "Не двигай телефон")
+                    .font(.footnote)
+                    .foregroundStyle(t.dim)
+            }
+        }
+        .transition(.opacity)
+    }
+
+    private func dashCell(_ label: String, _ value: String) -> some View {
+        VStack(spacing: 2) {
+            Text(label).font(.system(size: 11, weight: .medium)).foregroundStyle(t.dim)
+            Text(value).font(.system(size: 22, weight: .semibold).monospacedDigit()).foregroundStyle(t.text)
+                .lineLimit(1).minimumScaleFactor(0.6)
+        }
+        .frame(maxWidth: .infinity)
     }
 
     private var paramRow: some View {
         HStack(spacing: 8) {
             paramChip(.brightness, "Яркость", String(format: "%+.1f", e.evComp), warn: evWarn != nil)
-            paramChip(.interval, "Кадр каждые", expText(e.intervalSeconds), warn: intervalWarn != nil)
-            paramChip(.duration, "Сколько снимать", e.autoStopMin == 0 ? "Пока не остановлю" : durText(Double(e.autoStopMin) * 60), warn: durationWarn != nil)
+            paramChip(.interval, "Интервал", expText(e.intervalSeconds), warn: intervalWarn != nil)
+            paramChip(.duration, "Длительность", e.autoStopMin == 0 ? "Пока не остановлю" : durText(Double(e.autoStopMin) * 60), warn: durationWarn != nil)
         }
     }
 
@@ -2567,13 +2753,13 @@ struct ContentView: View {
     private var intervalWarn: String? {
         if e.sceneKind == .stars {
             if e.intervalSeconds > 30.5 {
-                return "Редкие кадры: видео выйдет коротким и рывками, следы - с разрывами"
+                return "Большой интервал: видео выйдет коротким и рывками, следы - с разрывами"
             }
             if e.intervalSeconds < e.starLimit - 0.5 {
-                return "Кадр короче \(Int(e.starLimit)) с: ночью будет больше шума"
+                return "Интервал меньше \(Int(e.starLimit)) с: ночью будет больше шума"
             }
         } else if e.intervalSeconds > 60.5 {
-            return "Редкие кадры: облака будут прыгать, а не плыть"
+            return "Большой интервал: облака будут прыгать, а не плыть"
         }
         return nil
     }
@@ -2646,7 +2832,7 @@ struct ContentView: View {
             case .interval:
                 HStack(spacing: 16) {
                     stepButton("minus") { e.intervalDown() }
-                    Text("Снимок каждые \(expText(e.intervalSeconds))")
+                    Text("Интервал \(expText(e.intervalSeconds))")
                         .font(.subheadline.weight(.semibold))
                         .monospacedDigit()
                         .frame(minWidth: 170)
@@ -2709,8 +2895,8 @@ struct ContentView: View {
         switch e.sceneKind {
         case .stars:
             return e.pauseSeconds > 1.5
-                ? "Кадр \(ex), остальное - пауза. Следы между кадрами редактор дорисует"
-                : "Кадр \(ex), почти без пауз - следы сплошные"
+                ? "Выдержка \(ex), остальное - пауза. Следы между кадрами редактор дорисует"
+                : "Выдержка \(ex), почти без пауз - следы сплошные"
         case .clouds:
             return "Выдержка до \(ex), днём сама короче"
         }
@@ -2737,11 +2923,11 @@ struct ContentView: View {
 
     private var shutterRow: some View {
         HStack {
-            thumbButton
+            thumbButton.opacity(shooting ? 0 : 1).disabled(shooting)
             Spacer()
             shutterButton
             Spacer()
-            testButton
+            testButton.opacity(shooting ? 0 : 1)
         }
         .padding(.horizontal, 28)
     }
@@ -2811,6 +2997,19 @@ struct ContentView: View {
         .background(t.fill, in: Circle())
         .contentShape(Circle())
         .opacity(idle || e.phase == .test ? 1 : 0.3)
+        .overlay(alignment: .topTrailing) {
+            // Сколько пробных кадров сохранено - касание открывает их
+            if savedTests > 0 && idle {
+                Text("\(savedTests)")
+                    .font(.system(size: 11, weight: .bold).monospacedDigit())
+                    .foregroundStyle(t.onAccent)
+                    .frame(minWidth: 20, minHeight: 20)
+                    .background(t.accent, in: Capsule())
+                    .offset(x: 4, y: -4)
+                    .onTapGesture { showTest = true }
+                    .accessibilityLabel("Прошлые тесты: \(savedTests)")
+            }
+        }
         .onTapGesture { if idle { e.testFrame() } }
         .onLongPressGesture(minimumDuration: 0.5) { if idle { showTest = true } }
         .accessibilityAddTraits(.isButton)
@@ -2877,7 +3076,7 @@ struct GuideView: View {
         Page(icon: "viewfinder", title: "Фокус и яркость",
              text: "Ночью фокус по звёздам наводится сам перед первым кадром. Коснись кадра - фокус в этой точке, веди пальцем вверх-вниз - ярче или темнее"),
         Page(icon: "slider.horizontal.3", title: "Три кнопки внизу",
-             text: "Яркость, как часто снимать кадр и сколько снимать. Если значение покраснело - так может выйти плохо, но снимать всё равно можно"),
+             text: "Яркость, интервал между кадрами и длительность съёмки. Если значение покраснело - так может выйти плохо, но снимать всё равно можно"),
         Page(icon: "record.circle", title: "Старт, тест и экспорт",
              text: "Красная кнопка - старт и стоп. «Тест» - пробный кадр, долгое нажатие на него - все прошлые тесты с увеличением. После «Стоп» откроется редактор: видео и фото, «Экспорт» с размером и качеством, склейка оборванной съёмки"),
         Page(icon: "moon", title: "Ночью",
@@ -3014,7 +3213,7 @@ struct SettingsSheet: View {
                         HStack(spacing: 10) {
                             Button("Авто") { e.wbAuto = true }
                                 .buttonStyle(.bordered)
-                                .tint(e.wbAuto ? .yellow : .gray)
+                                .tint(e.wbAuto ? Pal(night: false).accent : .gray)
                             Slider(value: Binding(get: { e.wbTemp }, set: { v in
                                 e.wbTemp = v
                                 if e.wbAuto { e.wbAuto = false }
@@ -3069,6 +3268,17 @@ struct SettingsSheet: View {
                     Text("Приложение ведёт журнал: настройки, яркость, ISO, нагрев, ошибки по каждому кадру. Само ничего не отправляет. Собери отчёт и пришли файл в чат с Claude")
                 }
 
+                Section {
+                    Button("Снять 5 RAW-кадров по 1 с") {
+                        dismiss()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { e.rawTest() }
+                    }
+                } header: {
+                    Text("Эксперимент: RAW")
+                } footer: {
+                    Text("Сырые кадры (DNG) для сравнения в Lightroom. Лягут в Файлы → На iPhone → NightLapse → RAW")
+                }
+
                 Section("Подсказки") {
                     Button("Показать подсказки снова") {
                         guideSeen = false
@@ -3119,5 +3329,14 @@ struct CameraLayout: Layout {
                       proposal: ProposedViewSize(width: b.width, height: max(0, b.height - th - bh)))
             bottom.place(at: CGPoint(x: b.minX, y: b.maxY - bh), proposal: ProposedViewSize(width: b.width, height: bh))
         }
+    }
+}
+
+
+// MARK: - RAW: приём готового снимка
+
+extension LapseEngine: AVCapturePhotoCaptureDelegate {
+    func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
+        rawFinished(error == nil && photo.isRawPhoto ? photo.fileDataRepresentation() : nil)
     }
 }
