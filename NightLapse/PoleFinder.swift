@@ -80,7 +80,9 @@ final class PoleFinder: NSObject, ObservableObject, CLLocationManagerDelegate {
         let dot = max(-1, min(1, px * cx + py * cy + pzz * cz))
         let off = acos(dot) * 180 / .pi
         arrow = CGVector(dx: daz, dy: dalt)
+        let was = centered
         centered = off < 4
+        if centered && !was { Haptic.success() }   // нашёл - телефон коротко отзовётся
         if centered {
             text = "Полюс в центре: следы будут кругами"
         } else {
@@ -112,23 +114,27 @@ final class PoleFinder: NSObject, ObservableObject, CLLocationManagerDelegate {
 /// Плашка на превью: «Где Полярная звезда?» → стрелка и подсказка
 struct PolePill: View {
     @ObservedObject var p: PoleFinder
+    var pal = Pal(night: false)
 
     var body: some View {
-        Button { p.toggle() } label: {
+        Button {
+            Haptic.tap()
+            p.toggle()
+        } label: {
             HStack(spacing: 6) {
                 if p.on {
                     Image(systemName: p.centered ? "checkmark.circle.fill" : "arrow.up")
                         .rotationEffect(p.centered ? .zero : .radians(atan2(p.arrow.dx, p.arrow.dy)))
-                        .foregroundStyle(p.centered ? Color.green : Color.yellow)
+                        .foregroundStyle(p.centered ? (pal.night ? pal.accent : Color(red: 0.45, green: 0.80, blue: 0.50)) : pal.accent)
                     Text(p.text)
                     Image(systemName: "xmark").font(.caption2).opacity(0.6)
                 } else {
-                    Image(systemName: "star.circle")
+                    Image(systemName: "location.north.circle")
                     Text("Где Полярная звезда?")
                 }
             }
-            .font(.caption.weight(.semibold))
-            .foregroundStyle(Color.white)
+            .font(.footnote.weight(.semibold))
+            .foregroundStyle(pal.text)
             .padding(.horizontal, 11)
             .padding(.vertical, 6)
             .background(Color.black.opacity(0.55), in: Capsule())
