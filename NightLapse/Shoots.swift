@@ -1230,7 +1230,7 @@ struct ShootEditor: View {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Видео").font(.footnote).foregroundStyle(.secondary)
                     Picker("Видео", selection: $look) {
-                        ForEach([Look.starlapse, .timelapse, .reel]) { Text($0.title).tag($0) }
+                        ForEach([Look.starlapse, .timelapse]) { Text($0.title).tag($0) }
                     }
                     .pickerStyle(.segmented)
                     Text("Фото").font(.footnote).foregroundStyle(.secondary)
@@ -1352,6 +1352,14 @@ struct ShootEditor: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
+                    // Рилс не среди вариантов: отдельная кнопка внизу, собирается из тех же настроек цвета
+                    Button {
+                        r.run(shoot, .reel, trail, denoise: denoise, grade: grade, deflicker: deflicker)
+                    } label: {
+                        Label("Ещё: Рилс 3 в 1 для Instagram", systemImage: "rectangle.portrait.on.rectangle.portrait")
+                            .font(.footnote)
+                    }
+                    .buttonStyle(.bordered)
                     if !r.message.isEmpty {
                         Text(r.message).font(.footnote).foregroundStyle(.secondary)
                     }
