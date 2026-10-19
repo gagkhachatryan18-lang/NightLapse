@@ -2478,8 +2478,8 @@ struct ContentView: View {
             if !shooting {
                 roundIcon("gearshape") { showSettings = true }
                     .accessibilityLabel("Настройки")
+                    .disabled(!idle)
             }
-                .disabled(!idle)
         }
         .padding(.top, 4)
     }
