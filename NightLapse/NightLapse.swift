@@ -375,14 +375,15 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     func starFocus() {
         guard phase == .idle else { return }
         phase = .test
-        status = "Навожу фокус по звёздам, около 30 с. Не трогай телефон"
+        status = "Навожу фокус по звёздам, около 15 с. Не трогай телефон"
         let hold = startHold
-        subTotal = 23
+        subTotal = 20
         subDone = 0
         UIApplication.shared.isIdleTimerDisabled = true
         queue.async {
             guard let dev = self.device else { return }
-            self.focusPlan = stride(from: 0.40, through: 1.0001, by: 0.04).map { Float(min($0, 1)) }
+            // Грубо через 0.05 (13 положений), потом точно ±0.03 вокруг лучшего: всего 20 шагов по 0.75 с
+            self.focusPlan = stride(from: 0.40, through: 1.0001, by: 0.05).map { Float(min($0, 1)) }
             self.focusFine = false
             self.focusResults = []
             self.focusIdx = 0
@@ -407,7 +408,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             dev.setFocusModeLocked(lensPosition: min(max(p, 0), 1), completionHandler: nil)
         }
         dev.unlockForConfiguration()
-        focusSkip = 2
+        focusSkip = 1
         focusAcc = 0
         focusN = 0
     }
@@ -419,10 +420,14 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         }
         focusAcc += starMetric(pb)
         focusN += 1
-        guard focusN >= 3 else { return }
+        guard focusN >= 2 else { return }
         focusResults.append((focusPlan[focusIdx], focusAcc / Double(focusN)))
         let done = focusResults.count
-        DispatchQueue.main.async { self.subDone = done }
+        DispatchQueue.main.async {
+            self.subDone = done
+            let left = max(1, Int((Double(max(0, self.subTotal - done)) * 0.75).rounded()))
+            self.status = "Навожу фокус по звёздам: осталось около \(left) с. Не трогай телефон"
+        }
         focusIdx += 1
         if focusIdx < focusPlan.count {
             setLens(focusPlan[focusIdx])
@@ -446,7 +451,6 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             self.starFocused = true
             self.subDone = 0
             self.applyCamera(forceFocus: true)
-            Haptic.success()
             self.finished("Фокус по звёздам наведён")
             if let next = self.afterFocus {
                 self.afterFocus = nil
@@ -916,7 +920,6 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
     func stop() {
         guard phase == .recording || phase == .paused else { return }
-        Haptic.heavy()
         if cooling {
             cooling = false
             setExtra(0)
@@ -1114,7 +1117,6 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             // Пока телефон не выключился сам: останавливаем съёмку, чтобы видео и кадры успели сохраниться
             Diag.event("Батарея \(battery)%: съёмка остановлена, чтобы сохранить видео")
             stopReason = "Заряд кончался, съёмка остановлена заранее. "
-            Haptic.warn()
             stop()
             return
         }
@@ -1125,7 +1127,6 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             batteryWarn = warn
             if let w = warn, !batWarnLogged {
                 batWarnLogged = true
-                Haptic.warn()
                 Diag.event("Заряд: " + w)
             }
             LiveStatus.shared.update(note: warn ?? "")
@@ -1161,13 +1162,6 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         checkCooling(state, now)
         if phase == .recording || phase == .paused {
             watchBattery(now)
-            // Память: останавливаемся заранее, пока видео ещё можно дописать
-            if freeGB > 0 && freeGB < 1.0 && phase != .saving {
-                stopReason = "Память почти кончилась, съёмка остановлена заранее. "
-                Diag.event("Свободно \(String(format: "%.1f", freeGB)) ГБ: съёмка остановлена")
-                Haptic.warn()
-                stop()
-            }
         }
         // Отсчёт «не трогай телефон»: сколько секунд осталось до первого кадра
         if phase == .recording || phase == .test || phase == .idle, status.hasPrefix("Не трогай телефон") {
@@ -1591,6 +1585,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             mode = .off
             DispatchQueue.main.async { self.applyCamera() }
             let img = frame.flatMap { makeThumb($0, maxSide: 2000) }
+            // Каждый тест сохраняется: до старта можно пролистать, увеличить и экспортировать
+            if let cg = frame.flatMap({ makeThumb($0, maxSide: 4000) })?.cgImage { TestStore.save(cg) }
             let note = cfg.isoAuto ? "Тест готов. ISO подобран: \(Int(curISO))" : "Тест готов: проверь яркость и резкость"
             Diag.event("Тест: подкадров \(n), сенсор \(String(format: "%.4f", CMTimeGetSeconds(curDur))) с, ISO \(Int(curISO)), "
                 + "усиление \(String(format: "%.2f", autoGain)), яркость \(String(format: "%.0f", mean)), выдержка \(cfg.exposure) с")
@@ -2119,9 +2115,42 @@ struct CameraPreview: UIViewRepresentable {
 
 // MARK: - Главный экран, как Камера iPhone
 
+// MARK: - Значок батареи
+
+/// Батарейка, заполненная ровно на настоящий процент заряда
+struct BatteryGlyph: View {
+    let level: Int
+    var charging = false
+    var color: Color = .white
+
+    var body: some View {
+        HStack(spacing: 1) {
+            ZStack(alignment: .leading) {
+                RoundedRectangle(cornerRadius: 2.5).stroke(color, lineWidth: 1)
+                GeometryReader { g in
+                    RoundedRectangle(cornerRadius: 1.2)
+                        .fill(color)
+                        .frame(width: max(0, (g.size.width - 3) * CGFloat(min(max(level, 0), 100)) / 100))
+                        .padding(1.5)
+                }
+                if charging {
+                    Image(systemName: "bolt.fill")
+                        .font(.system(size: 7, weight: .bold))
+                        .foregroundStyle(Color.black)
+                        .frame(maxWidth: .infinity)
+                }
+            }
+            .frame(width: 20, height: 10)
+            RoundedRectangle(cornerRadius: 0.8).fill(color).frame(width: 1.5, height: 4)
+        }
+        .accessibilityLabel(level >= 0 ? "Заряд \(level)%" : "Заряд неизвестен")
+    }
+}
+
 // MARK: - Отклик и цвета
 
-/// Вибрация: ночью понятно, что нажатие сработало, не глядя на экран
+/// Вибрация только одна - когда съёмка реально началась: понятно без взгляда на экран.
+/// Во время съёмки телефон не вибрирует, чтобы не сдвинуть кадр
 enum Haptic {
     static func tap() { UIImpactFeedbackGenerator(style: .light).impactOccurred() }
     static func heavy() { UIImpactFeedbackGenerator(style: .heavy).impactOccurred() }
@@ -2310,28 +2339,23 @@ struct ContentView: View {
         }
     }
 
-    /// Значок батареи по уровню, с молнией на зарядке
-    private var batteryIcon: String {
+    private var charging: Bool {
         let st = UIDevice.current.batteryState
-        if st == .charging || st == .full { return "battery.100.bolt" }
-        switch e.battery {
-        case ..<13: return "battery.0"
-        case ..<38: return "battery.25"
-        case ..<63: return "battery.50"
-        case ..<88: return "battery.75"
-        default: return "battery.100"
-        }
+        return st == .charging || st == .full
     }
 
     private var infoChip: some View {
         HStack(spacing: 8) {
-            Label(e.battery >= 0 ? "\(e.battery)%" : "-", systemImage: batteryIcon)
+            HStack(spacing: 4) {
+                BatteryGlyph(level: e.battery, charging: charging, color: (0..<20).contains(e.battery) ? t.warn : t.dim)
+                Text(e.battery >= 0 ? "\(e.battery)%" : "-")
+            }
             Label(String(format: "%.0f ГБ", e.freeGB), systemImage: "internaldrive")
             if e.hot {
                 Image(systemName: "thermometer.high").foregroundStyle(t.warn)
             }
         }
-        .font(.caption2.monospacedDigit())
+        .font(.caption.monospacedDigit())
         .labelStyle(.titleAndIcon)
         .foregroundStyle(t.dim)
     }
@@ -2409,8 +2433,7 @@ struct ContentView: View {
             ForEach(e.zoomOptions) { z in
                 let sel = abs(z.value - e.zoom) < 0.01
                 Button {
-                    Haptic.tap()
-                    e.zoom = z.value
+                            e.zoom = z.value
                 } label: {
                     Text(sel ? z.title : z.title.replacingOccurrences(of: "x", with: ""))
                         .font(.system(size: sel ? 14 : 13, weight: .bold))
@@ -2542,10 +2565,10 @@ struct ContentView: View {
 
     private var evWarn: String? {
         if nightish {
-            if e.evComp < -2.05 { return "☀︎ слишком низко: ночью кадр выйдет почти чёрным. Лучше от -2 до +0.5" }
-            if e.evComp > 0.55 { return "☀︎ слишком высоко: ночью будет много шума. Лучше от -2 до +0.5" }
+            if e.evComp < -2.05 { return "Яркость слишком низкая: ночью кадр выйдет почти чёрным. Лучше от -2 до +0.5" }
+            if e.evComp > 0.55 { return "Яркость слишком высокая: ночью будет много шума. Лучше от -2 до +0.5" }
         } else if e.evComp < -2.55 || e.evComp > 1.55 {
-            return "☀︎ далеко от нормы: днём лучше от -2.5 до +1.5"
+            return "Яркость далеко от нормы: днём лучше от -2.5 до +1.5"
         }
         return nil
     }
@@ -2597,7 +2620,6 @@ struct ContentView: View {
     private func paramChip(_ p: Param, _ label: String, _ value: String, warn: Bool = false) -> some View {
         let on = openParam == p
         return Button {
-            Haptic.tap()
             withAnimation(.easeOut(duration: 0.15)) { openParam = on ? nil : p }
         } label: {
             VStack(spacing: 1) {
@@ -2706,7 +2728,6 @@ struct ContentView: View {
     /// Режимы листаются пальцем или касанием, как в Камере
     private var modeCarousel: some View {
         ModeCarousel(selected: (LapseScene.allCases.firstIndex(of: e.sceneKind) ?? 0) + 1, accent: t.accent, text: t.text) {
-            Haptic.tap()
             select($0)
         }
     }
@@ -2760,8 +2781,7 @@ struct ContentView: View {
         Button {
             switch e.phase {
             case .idle:
-                Haptic.tap()
-                e.start()
+                    e.start()
             case .recording, .paused: e.stop()
             case .test, .waiting: e.cancel()
             case .saving: break
@@ -2785,25 +2805,25 @@ struct ContentView: View {
         .accessibilityLabel(idle ? "Старт" : "Стоп")
     }
 
+    /// Касание - пробный кадр, долгое нажатие - прошлые пробные кадры
     private var testButton: some View {
-        Button {
-            Haptic.tap()
-            e.testFrame()
-        } label: {
-            VStack(spacing: 1) {
-                if e.phase == .test {
-                    ProgressView()
-                } else {
-                    Image(systemName: "camera.aperture").font(.system(size: 18, weight: .semibold))
-                }
-                Text("Тест").font(.system(size: 11, weight: .semibold))
+        VStack(spacing: 1) {
+            if e.phase == .test {
+                ProgressView()
+            } else {
+                Image(systemName: "camera.aperture").font(.system(size: 18, weight: .regular))
             }
-            .foregroundStyle(t.text)
-            .frame(width: 56, height: 56)
-            .background(t.fill, in: Circle())
+            Text("Тест").font(.system(size: 11, weight: .semibold))
         }
-        .disabled(!idle)
+        .foregroundStyle(t.text)
+        .frame(width: 56, height: 56)
+        .background(t.fill, in: Circle())
+        .contentShape(Circle())
         .opacity(idle || e.phase == .test ? 1 : 0.3)
+        .onTapGesture { if idle { e.testFrame() } }
+        .onLongPressGesture(minimumDuration: 0.5) { if idle { showTest = true } }
+        .accessibilityAddTraits(.isButton)
+        .accessibilityLabel("Тест. Долгое нажатие - прошлые пробные кадры")
     }
 
     private var planLine: String {
@@ -2843,45 +2863,8 @@ struct ContentView: View {
             .onTapGesture { dark = false }
     }
 
-    /// Оценка пробного кадра простыми словами: по средней яркости картинки
-    private var testVerdict: (String, Bool)? {
-        guard let cg = e.lastImage?.cgImage,
-              let ctx = CGContext(data: nil, width: 32, height: 18, bitsPerComponent: 8, bytesPerRow: 128,
-                                  space: CGColorSpaceCreateDeviceRGB(),
-                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
-        else { return nil }
-        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: 32, height: 18))
-        guard let d = ctx.data?.assumingMemoryBound(to: UInt8.self) else { return nil }
-        var sum = 0
-        for i in 0..<(32 * 18) { sum += (Int(d[i * 4]) * 77 + Int(d[i * 4 + 1]) * 150 + Int(d[i * 4 + 2]) * 29) >> 8 }
-        let m = sum / (32 * 18)
-        if m < 10 { return ("Темно: почти ничего не видно. Подними яркость", false) }
-        if m > 150 { return ("Светло: может пересветить. Убавь яркость", false) }
-        return ("Яркость нормальная, можно снимать", true)
-    }
-
     private var testSheet: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
-            if let img = e.lastImage {
-                Image(uiImage: img).resizable().scaledToFit()
-                if let v = testVerdict {
-                    VStack {
-                        Spacer()
-                        Label(v.0, systemImage: v.1 ? "checkmark.circle" : "exclamationmark.triangle")
-                            .font(.footnote.weight(.semibold))
-                            .foregroundStyle(v.1 ? t.text : t.warn)
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 10)
-                            .background(Color.black.opacity(0.7), in: Capsule())
-                            .padding(.bottom, 24)
-                    }
-                }
-            } else {
-                Text("Пока нет кадра").foregroundStyle(.secondary)
-            }
-        }
-        .presentationDragIndicator(.visible)
+        TestViewer(pal: t)
     }
 }
 
@@ -2905,7 +2888,7 @@ struct GuideView: View {
         Page(icon: "slider.horizontal.3", title: "Три кнопки внизу",
              text: "Яркость, как часто снимать кадр и сколько снимать. Если значение покраснело - так может выйти плохо, но снимать всё равно можно"),
         Page(icon: "record.circle", title: "Старт, тест и экспорт",
-             text: "Красная кнопка - старт и стоп, «Тест» - пробный кадр. После «Стоп» откроется редактор: видео (Starlapse, Таймлапс) и фото (Следы, Звёзды). «Экспорт» - в галерею или в приложение"),
+             text: "Красная кнопка - старт и стоп. «Тест» - пробный кадр, долгое нажатие на него - все прошлые тесты с увеличением. После «Стоп» откроется редактор: видео и фото, «Экспорт» с размером и качеством, склейка оборванной съёмки"),
         Page(icon: "moon", title: "Ночью",
              text: "Интерфейс сам становится красным, чтобы не слепить. Луна вверху гасит экран. «Где Полярная звезда?» на кадре подскажет, куда навести, чтобы следы стали кругами. Приложение следит за зарядом и памятью и остановится заранее, всё сохранив")
     ]
@@ -3030,7 +3013,7 @@ struct SettingsSheet: View {
                 }
 
                 Section {
-                    Toggle("Качество 4K", isOn: $e.uhd)
+                    Toggle("Снимать в 4K", isOn: $e.uhd)
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
                             Text("Баланс белого")
@@ -3055,7 +3038,7 @@ struct SettingsSheet: View {
                 }
 
                 Section("Сохранение") {
-                    Toggle("Сразу сохранять видео в Фото", isOn: $e.saveVideo)
+                    Toggle("Сразу экспортировать видео в Фото", isOn: $e.saveVideo)
                     Picker("Кадров в секунду", selection: $e.fps) {
                         Text("24").tag(24)
                         Text("25").tag(25)
