@@ -24,10 +24,18 @@ enum Trace {
         guard !started else { return }
         started = true
         let d = UserDefaults.standard
+        // Новая сборка: файл приложения поменялся - это не вылет, а установка
+        let exe = Bundle.main.executableURL
+            .flatMap { try? FileManager.default.attributesOfItem(atPath: $0.path)[.modificationDate] as? Date }?
+            .timeIntervalSince1970 ?? 0
+        let updated = abs(d.double(forKey: "trace.exe") - exe) > 1
+        d.set(exe, forKey: "trace.exe")
         // Приложение было на экране и не ушло в фон - значит прошлый запуск оборвался
-        if d.string(forKey: "trace.phase") == "active" {
+        if updated {
+            Diag.event("Установлена новая сборка")
+        } else if d.string(forKey: "trace.phase") == "active" {
             Diag.event("Вылет: прошлый запуск оборвался на экране «\(d.string(forKey: "trace.screen") ?? "?")», "
-                + "последнее нажатие \(d.string(forKey: "trace.tap") ?? "-") (или приложение переустановили)")
+                + "последнее нажатие \(d.string(forKey: "trace.tap") ?? "-")")
         }
         d.set("active", forKey: "trace.phase")
         let nc = NotificationCenter.default
@@ -50,6 +58,11 @@ enum Trace {
         }
         watchdog()
         MXMetricManager.shared.add(sub)
+    }
+
+    /// Что поменялось после нажатия: вкладка, инструмент, параметр, зум...
+    static func state(_ s: String) {
+        Diag.event("→ " + s)
     }
 
     // MARK: Экраны
@@ -284,5 +297,36 @@ final class SystemReports: NSObject, MXMetricManagerSubscriber {
                 Diag.event("iOS прислал отчёт о зависании на \(String(format: "%.1f", h.hangDuration.converted(to: .seconds).value)) с")
             }
         }
+    }
+}
+
+/// Камера: что меняется от нажатий - открытый параметр, зум, режим, значения
+struct CameraTrace: ViewModifier {
+    @ObservedObject var e: LapseEngine
+    let open: String
+
+    func body(content: Content) -> some View {
+        content
+            .onChange(of: open) { Trace.state("Открыто: \(open)") }
+            .onChange(of: e.zoom) { Trace.state("Зум: \(e.zoom)") }
+            .onChange(of: e.scene) { Trace.state("Режим: \(e.scene)") }
+            .onChange(of: e.intervalSeconds) { Trace.state("Интервал: \(e.intervalSeconds) с") }
+            .onChange(of: e.evComp) { Trace.state("Яркость: \(String(format: "%.1f", e.evComp))") }
+            .onChange(of: e.autoStopMin) { Trace.state("Длительность: \(e.autoStopMin) мин") }
+            .onChange(of: e.focusAuto) { Trace.state("Фокус: \(e.focusAuto ? "авто" : "вручную")") }
+            .onChange(of: e.phase) { Trace.state("Состояние: \(e.phase)") }
+    }
+}
+
+/// Редактор: вкладка, инструмент, вид, длина следа
+struct EditorTrace: ViewModifier {
+    let tab: String, tool: String, look: String, trail: String
+
+    func body(content: Content) -> some View {
+        content
+            .onChange(of: tab) { Trace.state("Вкладка: \(tab)") }
+            .onChange(of: tool) { Trace.state("Инструмент: \(tool)") }
+            .onChange(of: look) { Trace.state("Вид: \(look)") }
+            .onChange(of: trail) { Trace.state("След: \(trail)") }
     }
 }
