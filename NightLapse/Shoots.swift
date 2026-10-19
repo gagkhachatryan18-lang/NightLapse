@@ -534,6 +534,11 @@ final class Renderer: ObservableObject {
     @Published var message = ""
     @Published var preview: UIImage?
     @Published var previewBusy = false
+    /// Последний экспорт в приложение - его можно отправить через «Поделиться»
+    @Published var lastFile: URL?
+    /// Куда экспорт: в галерею (Фото) или в приложение (Файлы → NightLapse → Экспорт)
+    private var toPhotos = true
+    private var exportName = ""
 
     private var cancelled = false
     private var previewToken = 0
@@ -633,9 +638,14 @@ final class Renderer: ObservableObject {
         }
     }
 
-    func run(_ shoot: Shoot, _ look: Look, _ trail: Trail, denoise: Bool, grade: Grade = Grade(), deflicker: Bool = true) {
+    func run(_ shoot: Shoot, _ look: Look, _ trail: Trail, denoise: Bool, grade: Grade = Grade(), deflicker: Bool = true,
+             toPhotos: Bool = true) {
         guard !busy else { return }
         busy = true
+        self.toPhotos = toPhotos
+        lastFile = nil
+        exportName = shoot.dir.lastPathComponent.replacingOccurrences(of: "_frames", with: "") + "_" + look.rawValue
+            + (look == .starlapse ? "_" + trail.rawValue : "")
         cancelled = false
         progress = 0
         message = look == .deep ? "Выравниваю кадры по звёздам..." : (look == .startrail ? "Накладываю кадры..." : "Собираю видео...")
@@ -668,6 +678,8 @@ final class Renderer: ObservableObject {
 
     /// Уже собрано во время съёмки: просто копия в Фото, файл остаётся в папке съёмки
     private func saveReady(_ url: URL, isVideo: Bool) -> String {
+        DispatchQueue.main.async { self.progress = 1 }
+        if !toPhotos { return keepInApp(url, move: false) }
         let sem = DispatchSemaphore(value: 0)
         var ok = false
         var data: Data?
@@ -685,6 +697,22 @@ final class Renderer: ObservableObject {
         sem.wait()
         DispatchQueue.main.async { self.progress = 1 }
         return ok ? "Сохранено в Фото" : "Нет доступа к Фото. Файл лежит в папке съёмки"
+    }
+
+    /// Экспорт в приложение: файл кладётся в Файлы → На iPhone → NightLapse → Экспорт
+    private func keepInApp(_ src: URL, move: Bool) -> String {
+        let fm = FileManager.default
+        let dir = ShootStore.docs().appendingPathComponent("Экспорт", isDirectory: true)
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dest = dir.appendingPathComponent(exportName + "." + src.pathExtension)
+        try? fm.removeItem(at: dest)
+        do {
+            if move { try fm.moveItem(at: src, to: dest) } else { try fm.copyItem(at: src, to: dest) }
+        } catch {
+            return "Не удалось сохранить в приложении: \(error.localizedDescription)"
+        }
+        DispatchQueue.main.async { self.lastFile = dest }
+        return "Сохранено в приложении: Файлы → На iPhone → NightLapse → Экспорт"
     }
 
     /// Читает кадры по 4 сразу на разных ядрах, потом склеивает по порядку
@@ -741,6 +769,7 @@ final class Renderer: ObservableObject {
         guard let img = acc.geometry(grade).cgImage(), let jpg = ShootStore.jpeg(img) else { return "Не удалось собрать фото" }
         // Копия рядом с исходниками, на случай если в Фото нет доступа
         try? jpg.write(to: shoot.dir.appendingPathComponent("startrail.jpg"))
+        if !toPhotos { return keepInApp(shoot.dir.appendingPathComponent("startrail.jpg"), move: false) }
         let sem = DispatchSemaphore(value: 0)
         var ok = false
         PHPhotoLibrary.shared().performChanges({
@@ -897,6 +926,7 @@ final class Renderer: ObservableObject {
         }
         guard let img = out.geometry(grade).cgImage(), let jpg = ShootStore.jpeg(img) else { return "Не удалось собрать фото" }
         try? jpg.write(to: shoot.dir.appendingPathComponent("stars_deep.jpg"))
+        if !toPhotos { return keepInApp(shoot.dir.appendingPathComponent("stars_deep.jpg"), move: false) }
         let sem = DispatchSemaphore(value: 0)
         var ok = false
         PHPhotoLibrary.shared().performChanges({
@@ -1004,6 +1034,7 @@ final class Renderer: ObservableObject {
         writer.finishWriting { sem.signal() }
         sem.wait()
         guard writer.status == .completed, idx > 0 else { return "Ошибка записи видео" }
+        if !toPhotos { return keepInApp(out, move: true) }
         var ok = false
         let s2 = DispatchSemaphore(value: 0)
         PHPhotoLibrary.shared().performChanges({
@@ -1183,6 +1214,7 @@ struct ShootEditor: View {
     @State private var look: Look = .starlapse
     /// Видео 3 в 1: вертикально, сверху как снято, ниже средний и длинный след
     @State private var stack3 = false
+    @State private var askExport = false
     /// Что собирать на самом деле: с «3 в 1» любое видео превращается в вертикальное из трёх полос
     private var eff: Look { stack3 && look.isVideo ? .reel : look }
     @State private var trail: Trail = .medium
@@ -1357,13 +1389,30 @@ struct ShootEditor: View {
                     }
                 } else {
                     Button {
-                        r.run(shoot, eff, trail, denoise: denoise, grade: grade, deflicker: deflicker)
+                        askExport = true
                     } label: {
                         Label(isReady ? "Экспорт в Фото (уже готово)" : "Экспорт в Фото", systemImage: "square.and.arrow.up")
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
+                    .confirmationDialog("Куда экспортировать?", isPresented: $askExport, titleVisibility: .visible) {
+                        Button("В галерею (Фото)") {
+                            r.run(shoot, eff, trail, denoise: denoise, grade: grade, deflicker: deflicker, toPhotos: true)
+                        }
+                        Button("В приложение (Файлы)") {
+                            r.run(shoot, eff, trail, denoise: denoise, grade: grade, deflicker: deflicker, toPhotos: false)
+                        }
+                        Button("Отмена", role: .cancel) {}
+                    } message: {
+                        Text("В приложении файл лежит в Файлы → На iPhone → NightLapse → Экспорт, его можно сразу отправить")
+                    }
+                    if let f = r.lastFile {
+                        ShareLink(item: f) {
+                            Label("Поделиться", systemImage: "square.and.arrow.up")
+                        }
+                        .buttonStyle(.bordered)
+                    }
                     if !r.message.isEmpty {
                         Text(r.message).font(.footnote).foregroundStyle(.secondary)
                     }
