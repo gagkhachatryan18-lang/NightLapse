@@ -457,7 +457,7 @@ struct ExportOpts: Equatable {
 
     /// Коротко для журнала
     var summary: String {
-        "\(toPhotos ? "в Фото" : "в приложение"), \(res.title), \(fps == 0 ? "к/с как снято" : "\(fps) к/с"), \(quality.title)\(h264 ? ", H.264" : "")"
+        "\(toPhotos ? "в галерею" : "в приложение"), \(res.title), \(fps == 0 ? "к/с как снято" : "\(fps) к/с"), \(quality.title)\(h264 ? ", H.264" : "")"
     }
 }
 
@@ -689,6 +689,64 @@ final class Renderer: ObservableObject {
     private var baseKey = ""
     private var base: CGImage?
 
+    // MARK: Просмотр видео в редакторе
+
+    /// Короткий черновик видео для просмотра прямо в редакторе: до 120 кадров, маленьких.
+    /// Цвет и кадр применяются на лету при показе, поэтому ползунки видно сразу во время просмотра
+    @Published var clip: [Frame] = []
+    @Published var clipBusy = false
+    private var clipKey = ""
+    private var clipToken = 0
+    private let cq = DispatchQueue(label: "nightlapse.clip", qos: .userInitiated)
+
+    func makeClip(_ shoot: Shoot, _ look: Look, _ trail: Trail) {
+        guard look.isVideo else {
+            clip = []
+            clipKey = ""
+            return
+        }
+        let key = "\(shoot.id)|\(look.rawValue)|\(trail.rawValue)|\(FramePlan.excluded(shoot.dir).count)"
+        if key == clipKey && !clip.isEmpty { return }
+        clipKey = key
+        clipToken += 1
+        let token = clipToken
+        clipBusy = true
+        cq.async {
+            let urls = ShootStore.frameURLs(shoot.dir)
+            let ex = FramePlan.excluded(shoot.dir)
+            let idx = (0..<urls.count).filter { !ex.contains($0 + 1) }
+            let step = max(1, idx.count / 120)
+            let nm = nightMap(shoot.dir)
+            var out: [Frame] = []
+            var acc: Frame?
+            let lut = decayLUT(pow(trail.decay, Float(step)))
+            for k in stride(from: 0, to: idx.count, by: step) {
+                if token != self.clipToken { return }
+                let i = idx[k]
+                guard let c = ShootStore.thumb(urls[i], maxPixel: 480) else { continue }
+                var cur = Frame(w: c.width, h: c.height)
+                cur.draw(c)
+                if look == .starlapse {
+                    let night = nm.isEmpty ? cur.meanLuma() < 170 : (nm[i + 1] ?? true)
+                    if var a = acc, a.w == cur.w, night {
+                        a.trail(with: cur, lut: lut)
+                        acc = a
+                    } else {
+                        acc = cur
+                    }
+                    out.append(acc ?? cur)
+                } else {
+                    out.append(cur)
+                }
+            }
+            DispatchQueue.main.async {
+                guard token == self.clipToken else { return }
+                self.clip = out
+                self.clipBusy = false
+            }
+        }
+    }
+
     func makePreview(_ shoot: Shoot, _ look: Look, _ trail: Trail, _ grade: Grade = Grade()) {
         previewToken += 1
         let token = previewToken
@@ -846,7 +904,7 @@ final class Renderer: ObservableObject {
         }
         sem.wait()
         DispatchQueue.main.async { self.progress = 1 }
-        return ok ? "Сохранено в Фото" : "Нет доступа к Фото. Файл лежит в папке съёмки"
+        return ok ? "Сохранено в галерее телефона" : "Нет доступа к галерее телефона. Файл лежит в папке съёмки"
     }
 
     /// Экспорт в приложение: файл кладётся в Файлы → На iPhone → NightLapse → Экспорт
@@ -1069,7 +1127,7 @@ final class Renderer: ObservableObject {
             sem.signal()
         }
         sem.wait()
-        return ok ? "Фото со следами сохранено в Фото" : "Нет доступа к Фото. Фото лежит в папке съёмки"
+        return ok ? "Фото со следами сохранено в галерее телефона" : "Нет доступа к галерее телефона. Фото лежит в папке съёмки"
     }
 
     /// Фото «Звёзды»: до 40 ночных кадров из середины съёмки выравниваются по звёздам и усредняются.
@@ -1213,7 +1271,7 @@ final class Renderer: ObservableObject {
             sem.signal()
         }
         sem.wait()
-        return ok ? "Фото «Звёзды» из \(used) кадров сохранено в Фото" : "Нет доступа к Фото. Фото лежит в папке съёмки"
+        return ok ? "Фото «Звёзды» из \(used) кадров сохранено в галерее телефона" : "Нет доступа к галерее телефона. Фото лежит в папке съёмки"
     }
 
     /// Видео из кадров: таймлапс, Starlapse или рилс «3 в 1» (таймлапс, средний след, длинный след друг под другом).
@@ -1338,7 +1396,7 @@ final class Renderer: ObservableObject {
         }
         s2.wait()
         if ok { try? FileManager.default.removeItem(at: out) }
-        return ok ? (reel ? "Видео 3 в 1 сохранено в Фото" : "Видео сохранено в Фото") : "Нет доступа к Фото. Видео лежит в Файлы → NightLapse"
+        return ok ? (reel ? "Видео 3 в 1 сохранено в галерее телефона" : "Видео сохранено в галерее телефона") : "Нет доступа к галерее телефона. Видео лежит в Файлы → NightLapse"
     }
 }
 
@@ -1523,6 +1581,10 @@ struct ShootEditor: View {
     /// Видео 3 в 1: вертикально, сверху как снято, ниже средний и длинный след
     @State private var stack3 = false
     @State private var askExport = false
+    /// Просмотр черновика видео
+    @State private var playing = false
+    @State private var clipIdx = 0
+    private let ticker = Timer.publish(every: 1.0 / 15, on: .main, in: .common).autoconnect()
     @State private var exportOpts = ExportOpts()
     /// Съёмка, начатая вскоре после этой (до 12 часов), - кандидат на склейку
     @State private var nextShoot: Shoot?
@@ -1545,6 +1607,14 @@ struct ShootEditor: View {
         if deflicker && look.isVideo { return false }
         guard let u = ShootStore.liveURL(shoot.dir, eff, trail) else { return false }
         return FileManager.default.fileExists(atPath: u.path)
+    }
+
+    /// Текущий кадр черновика с цветом и кадрированием - ползунки видны сразу
+    private var clipImage: UIImage? {
+        guard !r.clip.isEmpty else { return nil }
+        var f = r.clip[min(clipIdx, r.clip.count - 1)]
+        f.apply(grade)
+        return f.geometry(grade).cgImage().map { UIImage(cgImage: $0) }
     }
 
     /// Сколько прошло от конца этой съёмки до начала следующей
@@ -1577,13 +1647,45 @@ struct ShootEditor: View {
             VStack(spacing: 14) {
                 ZStack {
                     Color(white: 0.08)
-                    if let p = r.preview {
+                    if (playing || clipIdx > 0), let img = clipImage {
+                        Image(uiImage: img).resizable().scaledToFit()
+                    } else if let p = r.preview {
                         Image(uiImage: p).resizable().scaledToFit()
                     }
-                    if r.previewBusy { ProgressView() }
+                    if r.previewBusy && !playing { ProgressView() }
+                    if look.isVideo {
+                        VStack {
+                            Spacer()
+                            HStack(spacing: 10) {
+                                Button {
+                                    if r.clip.isEmpty { r.makeClip(shoot, eff, trail) }
+                                    playing.toggle()
+                                } label: {
+                                    Group {
+                                        if r.clipBusy && playing { ProgressView().tint(.white) }
+                                        else { Image(systemName: playing ? "pause.fill" : "play.fill") }
+                                    }
+                                    .font(.system(size: 18, weight: .semibold))
+                                    .foregroundStyle(Color.white)
+                                    .frame(width: 44, height: 44)
+                                    .background(Color.black.opacity(0.55), in: Circle())
+                                }
+                                if !r.clip.isEmpty {
+                                    Slider(value: Binding(get: { Double(clipIdx) }, set: { clipIdx = Int($0) }),
+                                           in: 0...Double(max(r.clip.count - 1, 1)))
+                                        .tint(Pal(night: false).accent)
+                                }
+                            }
+                            .padding(10)
+                        }
+                    }
                 }
                 .aspectRatio(eff == .reel ? 0.75 : 16 / 9, contentMode: .fit)
                 .clipShape(RoundedRectangle(cornerRadius: 12))
+                .onReceive(ticker) { _ in
+                    guard playing, !r.clip.isEmpty else { return }
+                    clipIdx = (clipIdx + 1) % r.clip.count
+                }
 
                 // Что собрать: видео отдельно, фото отдельно - пять вариантов в одну строку не помещаются
                 VStack(alignment: .leading, spacing: 6) {
@@ -1612,14 +1714,6 @@ struct ShootEditor: View {
                 }
 
                 if look.isVideo {
-                    Toggle(isOn: $stack3) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("3 в 1 вертикально")
-                            Text("Для сторис и коротких видео: сверху как снято, ниже средний и длинный след")
-                                .font(.caption).foregroundStyle(.secondary)
-                        }
-                    }
-                    .disabled(r.busy)
                     Toggle("Убрать шум", isOn: $denoise)
                         .disabled(r.busy)
                     Toggle("Выровнять яркость (без мерцания)", isOn: $deflicker)
@@ -1714,7 +1808,7 @@ struct ShootEditor: View {
                     Button {
                         askExport = true
                     } label: {
-                        Label(isReady ? "Экспорт в Фото (уже готово)" : "Экспорт в Фото", systemImage: "square.and.arrow.up")
+                        Label("Экспорт", systemImage: "square.and.arrow.up")
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.borderedProminent)
@@ -1810,12 +1904,26 @@ struct ShootEditor: View {
         }
         .sheet(isPresented: $showFrames, onDismiss: {
             FramePlan.save(shoot.dir, excluded)
+            r.clip = []
+            clipIdx = 0
+            playing = false
             r.makePreview(shoot, eff, trail, grade)
         }) {
             FramePicker(shoot: shoot, excluded: $excluded)
         }
-        .onChange(of: look) { r.makePreview(shoot, eff, trail, grade) }
-        .onChange(of: trail) { r.makePreview(shoot, eff, trail, grade) }
+        .onChange(of: look) {
+            r.makePreview(shoot, eff, trail, grade)
+            clipIdx = 0
+            r.clip = []
+            if !look.isVideo { playing = false }
+            if playing { r.makeClip(shoot, eff, trail) }
+        }
+        .onChange(of: trail) {
+            r.makePreview(shoot, eff, trail, grade)
+            clipIdx = 0
+            r.clip = []
+            if playing { r.makeClip(shoot, eff, trail) }
+        }
         .onChange(of: grade) { r.makePreview(shoot, eff, trail, grade) }
         .onChange(of: stack3) { r.makePreview(shoot, eff, trail, grade) }
         .onDisappear { r.cancel() }
@@ -1827,7 +1935,7 @@ struct ShootEditor: View {
             }
             Button("Отмена", role: .cancel) {}
         } message: {
-            Text("\(shoot.frames) кадров будут удалены навсегда. Видео и фото, уже сохранённые в Фото, останутся")
+            Text("\(shoot.frames) кадров будут удалены навсегда. Видео и фото, уже сохранённые в галерее телефона, останутся")
         }
     }
 }
@@ -2430,19 +2538,14 @@ struct ExportSheet: View {
                                 ForEach(ExportOpts.Quality.allCases) { Text($0.title).tag($0) }
                             }
                             .pickerStyle(.segmented)
-                            Text("Выше качество - больше файл. Для мессенджеров хватит обычного")
-                                .font(.footnote).foregroundStyle(.secondary)
                         }
                     }
                     section("Куда") {
                         Picker("Куда", selection: $opts.toPhotos) {
-                            Text("В галерею").tag(true)
-                            Text("В приложение").tag(false)
+                            Text("Галерея телефона").tag(true)
+                            Text("Приложение").tag(false)
                         }
                         .pickerStyle(.segmented)
-                        Text(opts.toPhotos ? "Файл появится в Фото"
-                             : "Файл ляжет в Файлы → На iPhone → NightLapse → Экспорт, его можно сразу отправить кнопкой «Поделиться»")
-                            .font(.footnote).foregroundStyle(.secondary)
                     }
                     Button(action: onExport) {
                         Text("Экспорт")
