@@ -127,7 +127,7 @@ enum Look: String, CaseIterable, Identifiable {
         case .timelapse: return "Таймлапс"
         case .startrail: return "Следы"
         case .deep: return "Звёзды"
-        case .reel: return "Рилс 3в1"
+        case .reel: return "3 в 1"
         }
     }
     var hint: String {
@@ -1014,7 +1014,7 @@ final class Renderer: ObservableObject {
         }
         s2.wait()
         if ok { try? FileManager.default.removeItem(at: out) }
-        return ok ? (reel ? "Рилс сохранён в Фото" : "Видео сохранено в Фото") : "Нет доступа к Фото. Видео лежит в Файлы → NightLapse"
+        return ok ? (reel ? "Видео 3 в 1 сохранено в Фото" : "Видео сохранено в Фото") : "Нет доступа к Фото. Видео лежит в Файлы → NightLapse"
     }
 }
 
@@ -1181,6 +1181,10 @@ struct ShootEditor: View {
     @Environment(\.dismiss) private var dismiss
     @StateObject private var r = Renderer()
     @State private var look: Look = .starlapse
+    /// Видео 3 в 1: вертикально, сверху как снято, ниже средний и длинный след
+    @State private var stack3 = false
+    /// Что собирать на самом деле: с «3 в 1» любое видео превращается в вертикальное из трёх полос
+    private var eff: Look { stack3 && look.isVideo ? .reel : look }
     @State private var trail: Trail = .medium
     @AppStorage("denoise") private var denoise = true
     @State private var confirmDelete = false
@@ -1196,7 +1200,7 @@ struct ShootEditor: View {
         if denoise && look.isVideo { return false }
         if !grade.isNeutral || GapFill.needed(shoot.dir) || !excluded.isEmpty { return false }
         if deflicker && look.isVideo { return false }
-        guard let u = ShootStore.liveURL(shoot.dir, look, trail) else { return false }
+        guard let u = ShootStore.liveURL(shoot.dir, eff, trail) else { return false }
         return FileManager.default.fileExists(atPath: u.path)
     }
 
@@ -1223,7 +1227,7 @@ struct ShootEditor: View {
                     }
                     if r.previewBusy { ProgressView() }
                 }
-                .aspectRatio(look == .reel ? 0.75 : 16 / 9, contentMode: .fit)
+                .aspectRatio(eff == .reel ? 0.75 : 16 / 9, contentMode: .fit)
                 .clipShape(RoundedRectangle(cornerRadius: 12))
 
                 // Что собрать: видео отдельно, фото отдельно - пять вариантов в одну строку не помещаются
@@ -1241,7 +1245,7 @@ struct ShootEditor: View {
                 }
                 .disabled(r.busy)
 
-                if look == .starlapse {
+                if look == .starlapse && !stack3 {
                     VStack(alignment: .leading, spacing: 6) {
                         Text("Длина следа").font(.footnote).foregroundStyle(.secondary)
                         Picker("Длина следа", selection: $trail) {
@@ -1253,6 +1257,14 @@ struct ShootEditor: View {
                 }
 
                 if look.isVideo {
+                    Toggle(isOn: $stack3) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("3 в 1 вертикально")
+                            Text("Для сторис и коротких видео: сверху как снято, ниже средний и длинный след")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    .disabled(r.busy)
                     Toggle("Убрать шум", isOn: $denoise)
                         .disabled(r.busy)
                     Toggle("Выровнять яркость (без мерцания)", isOn: $deflicker)
@@ -1309,7 +1321,7 @@ struct ShootEditor: View {
                     gradeRow("Света", $grade.highlights)
                     gradeRow("Виньетка", $grade.vignette)
 
-                    if look != .reel {
+                    if eff != .reel {
                         Text("Кадр").font(.footnote).foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(.top, 6)
@@ -1345,21 +1357,13 @@ struct ShootEditor: View {
                     }
                 } else {
                     Button {
-                        r.run(shoot, look, trail, denoise: denoise, grade: grade, deflicker: deflicker)
+                        r.run(shoot, eff, trail, denoise: denoise, grade: grade, deflicker: deflicker)
                     } label: {
                         Label(isReady ? "Сохранить в Фото (уже готово)" : "Собрать и сохранить в Фото", systemImage: "square.and.arrow.down")
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
-                    // Рилс не среди вариантов: отдельная кнопка внизу, собирается из тех же настроек цвета
-                    Button {
-                        r.run(shoot, .reel, trail, denoise: denoise, grade: grade, deflicker: deflicker)
-                    } label: {
-                        Label("Ещё: Рилс 3 в 1 для Instagram", systemImage: "rectangle.portrait.on.rectangle.portrait")
-                            .font(.footnote)
-                    }
-                    .buttonStyle(.bordered)
                     if !r.message.isEmpty {
                         Text(r.message).font(.footnote).foregroundStyle(.secondary)
                     }
@@ -1415,17 +1419,18 @@ struct ShootEditor: View {
         .interactiveDismissDisabled(r.busy)
         .onAppear {
             excluded = FramePlan.excluded(shoot.dir)
-            r.makePreview(shoot, look, trail, grade)
+            r.makePreview(shoot, eff, trail, grade)
         }
         .sheet(isPresented: $showFrames, onDismiss: {
             FramePlan.save(shoot.dir, excluded)
-            r.makePreview(shoot, look, trail, grade)
+            r.makePreview(shoot, eff, trail, grade)
         }) {
             FramePicker(shoot: shoot, excluded: $excluded)
         }
-        .onChange(of: look) { r.makePreview(shoot, look, trail, grade) }
-        .onChange(of: trail) { r.makePreview(shoot, look, trail, grade) }
-        .onChange(of: grade) { r.makePreview(shoot, look, trail, grade) }
+        .onChange(of: look) { r.makePreview(shoot, eff, trail, grade) }
+        .onChange(of: trail) { r.makePreview(shoot, eff, trail, grade) }
+        .onChange(of: grade) { r.makePreview(shoot, eff, trail, grade) }
+        .onChange(of: stack3) { r.makePreview(shoot, eff, trail, grade) }
         .onDisappear { r.cancel() }
         .alert("Удалить исходники?", isPresented: $confirmDelete) {
             Button("Удалить навсегда", role: .destructive) {
