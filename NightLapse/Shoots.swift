@@ -1156,8 +1156,23 @@ struct ShootsView: View {
         NavigationStack(path: $path) {
             List {
                 if loaded && shoots.isEmpty {
-                    Text("Пока нет съёмок. После «Стоп» съёмка появится здесь")
-                        .foregroundStyle(.secondary)
+                    VStack(spacing: 12) {
+                        Image(systemName: "moon.stars")
+                            .font(.system(size: 44, weight: .light))
+                            .foregroundStyle(Pal(night: false).accent)
+                        Text("Пока нет съёмок").font(.headline)
+                        Text("Поставь телефон на штатив, нажми красную кнопку, а утром - «Стоп». Съёмка появится здесь, и откроется редактор")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                        Button("Вернуться к съёмке") { dismiss() }
+                            .buttonStyle(.borderedProminent)
+                            .tint(Pal(night: false).accent)
+                            .foregroundStyle(Color.black)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 32)
+                    .listRowBackground(Color.clear)
                 }
                 ForEach(shoots) { s in
                     NavigationLink(value: s) {
@@ -1372,7 +1387,7 @@ struct ShootEditor: View {
                     Text("Свет").font(.footnote).foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.top, 6)
-                    gradeRow("Экспозиция", $grade.exposure)
+                    gradeRow("Яркость", $grade.exposure)
                     gradeRow("Тени", $grade.shadows)
                     gradeRow("Света", $grade.highlights)
                     gradeRow("Виньетка", $grade.vignette)
