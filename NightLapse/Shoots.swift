@@ -344,6 +344,143 @@ struct Grade: Equatable {
 }
 
 extension Frame {
+    /// Сдвинуть небо: по частям кадра (сдвиг за интервал × k), с плавным переходом между частями
+    func shifted(_ sh: [SIMD2<Float>], by k: Float) -> Frame {
+        let gx = GapFill.gx, gy = GapFill.gy
+        let w = self.w, h = self.h
+        var out = Frame(w: w, h: h)
+        out.ok = ok
+        px.withUnsafeBufferPointer { p in
+            out.px.withUnsafeMutableBufferPointer { d in
+                DispatchQueue.concurrentPerform(iterations: 8) { part in
+                    for y in (part * h / 8)..<((part + 1) * h / 8) {
+                        let fy = min(max(Float(y) * Float(gy) / Float(h) - 0.5, 0), Float(gy - 1))
+                        let ty0 = Int(fy), ty1 = min(ty0 + 1, gy - 1), wy = fy - Float(ty0)
+                        for x in 0..<w {
+                            let fx = min(max(Float(x) * Float(gx) / Float(w) - 0.5, 0), Float(gx - 1))
+                            let tx0 = Int(fx), tx1 = min(tx0 + 1, gx - 1), wx = fx - Float(tx0)
+                            let d0 = sh[ty0 * gx + tx0] * (1 - wx) + sh[ty0 * gx + tx1] * wx
+                            let d1 = sh[ty1 * gx + tx0] * (1 - wx) + sh[ty1 * gx + tx1] * wx
+                            let dd = (d0 * (1 - wy) + d1 * wy) * k
+                            // Звезда из точки p уходит в p + dd, значит сюда приходит то, что было в x - dd
+                            let sx = min(max(Int((Float(x) - dd.x).rounded()), 0), w - 1)
+                            let sy = min(max(Int((Float(y) - dd.y).rounded()), 0), h - 1)
+                            let o = (y * w + x) * 4, q = (sy * w + sx) * 4
+                            d[o] = p[q]; d[o + 1] = p[q + 1]; d[o + 2] = p[q + 2]; d[o + 3] = 255
+                        }
+                    }
+                }
+            }
+        }
+        return out
+    }
+
+    /// Плавный переход: a при t = 0, b при t = 1
+    static func mix(_ a: Frame, _ b: Frame, _ t: Float) -> Frame {
+        guard a.w == b.w, a.h == b.h else { return a }
+        var out = a
+        let k = Int(t * 256)
+        b.px.withUnsafeBufferPointer { q in
+            out.px.withUnsafeMutableBufferPointer { d in
+                for i in 0..<d.count { d[i] = UInt8((Int(d[i]) * (256 - k) + Int(q[i]) * k) >> 8) }
+            }
+        }
+        return out
+    }
+}
+
+// MARK: - Настройки экспорта
+
+/// Как экспортировать: куда, размер, частота кадров, качество. Готовые наборы под площадки
+struct ExportOpts: Equatable {
+    enum Res: Int, CaseIterable, Identifiable {
+        case p720 = 720, p1080 = 1080, p1440 = 1440, full = 0
+        var id: Int { rawValue }
+        var title: String { self == .full ? "Как снято" : "\(rawValue)p" }
+    }
+    enum Quality: Int, CaseIterable, Identifiable {
+        case normal, high, max
+        var id: Int { rawValue }
+        var title: String { ["Обычное", "Высокое", "Максимум"][rawValue] }
+        /// Битрейт на пиксель кадра (при 30 к/с)
+        var bpp: Int { [4, 10, 18][rawValue] }
+    }
+    enum Preset: String, CaseIterable, Identifiable {
+        case original, instagram, youtube, telegram, whatsapp
+        var id: String { rawValue }
+        var title: String {
+            switch self {
+            case .original: return "Как снято"
+            case .instagram: return "Instagram"
+            case .youtube: return "YouTube"
+            case .telegram: return "Telegram"
+            case .whatsapp: return "WhatsApp"
+            }
+        }
+        var icon: String {
+            switch self {
+            case .original: return "sparkles"
+            case .instagram: return "camera"
+            case .youtube: return "play.rectangle"
+            case .telegram: return "paperplane"
+            case .whatsapp: return "message"
+            }
+        }
+    }
+
+    var toPhotos = true
+    var res: Res = .full
+    /// 0 - как в настройках съёмки
+    var fps = 0
+    var quality: Quality = .high
+    /// H.264 - для соцсетей, которые не любят HEVC
+    var h264 = false
+
+    static func preset(_ p: Preset) -> ExportOpts {
+        var o = ExportOpts()
+        switch p {
+        case .original: break
+        case .instagram: o.res = .p1080; o.fps = 30; o.quality = .high; o.h264 = true
+        case .youtube: o.res = .full; o.fps = 30; o.quality = .max
+        case .telegram: o.res = .p1080; o.fps = 30; o.quality = .normal; o.h264 = true
+        case .whatsapp: o.res = .p720; o.fps = 30; o.quality = .normal; o.h264 = true
+        }
+        return o
+    }
+
+    /// Размер кадра на выходе: короткая сторона не больше выбранной, чётные стороны
+    func fit(_ w: Int, _ h: Int) -> (Int, Int) {
+        guard res != .full else { return (w, h) }
+        let k = min(1, Double(res.rawValue) / Double(min(w, h)))
+        return (max(2, Int(Double(w) * k) & ~1), max(2, Int(Double(h) * k) & ~1))
+    }
+
+    /// Коротко для журнала
+    var summary: String {
+        "\(toPhotos ? "в Фото" : "в приложение"), \(res.title), \(fps == 0 ? "к/с как снято" : "\(fps) к/с"), \(quality.title)\(h264 ? ", H.264" : "")"
+    }
+}
+
+extension Frame {
+    /// Уменьшить кадр (качественно, через Accelerate)
+    func scaled(_ nw: Int, _ nh: Int) -> Frame {
+        guard nw != w || nh != h else { return self }
+        var out = Frame(w: nw, h: nh)
+        out.ok = ok
+        let sw = w, sh = h
+        px.withUnsafeBytes { sp in
+            out.px.withUnsafeMutableBytes { dp in
+                var src = vImage_Buffer(data: UnsafeMutableRawPointer(mutating: sp.baseAddress!), height: vImagePixelCount(sh),
+                                        width: vImagePixelCount(sw), rowBytes: sw * 4)
+                var dst = vImage_Buffer(data: dp.baseAddress!, height: vImagePixelCount(nh), width: vImagePixelCount(nw), rowBytes: nw * 4)
+                vImageScale_ARGB8888(&src, &dst, nil, vImage_Flags(kvImageHighQualityResampling))
+            }
+        }
+        return out
+    }
+}
+
+extension Frame {
     mutating func apply(_ g: Grade) {
         guard !g.toneNeutral else { return }
         if abs(g.vignette) >= 0.01 { vignette(g.vignette) }
@@ -539,6 +676,7 @@ final class Renderer: ObservableObject {
     /// Куда экспорт: в галерею (Фото) или в приложение (Файлы → NightLapse → Экспорт)
     private var toPhotos = true
     private var exportName = ""
+    private var opts = ExportOpts()
 
     private var cancelled = false
     private var previewToken = 0
@@ -639,10 +777,11 @@ final class Renderer: ObservableObject {
     }
 
     func run(_ shoot: Shoot, _ look: Look, _ trail: Trail, denoise: Bool, grade: Grade = Grade(), deflicker: Bool = true,
-             toPhotos: Bool = true) {
+             opts: ExportOpts = ExportOpts()) {
         guard !busy else { return }
         busy = true
-        self.toPhotos = toPhotos
+        self.toPhotos = opts.toPhotos
+        self.opts = opts
         lastFile = nil
         exportName = shoot.dir.lastPathComponent.replacingOccurrences(of: "_frames", with: "") + "_" + look.rawValue
             + (look == .starlapse ? "_" + trail.rawValue : "")
@@ -650,6 +789,12 @@ final class Renderer: ObservableObject {
         progress = 0
         message = look == .deep ? "Выравниваю кадры по звёздам..." : (look == .startrail ? "Накладываю кадры..." : "Собираю видео...")
         UIApplication.shared.isIdleTimerDisabled = true
+        // Если ненадолго свернуть приложение, сборка ещё несколько минут продолжится
+        var bg = UIBackgroundTaskIdentifier.invalid
+        bg = UIApplication.shared.beginBackgroundTask(withName: "NightLapseExport") {
+            UIApplication.shared.endBackgroundTask(bg)
+            bg = .invalid
+        }
         let t0 = Date()
         q.async {
             let r: String
@@ -657,7 +802,8 @@ final class Renderer: ObservableObject {
             // Если между кадрами были паузы, готовые следы из съёмки пунктирные - собираем заново с дорисовкой
             if let ready = ShootStore.liveURL(shoot.dir, look, trail), FileManager.default.fileExists(atPath: ready.path),
                !(denoise && look.isVideo), !GapFill.needed(shoot.dir), grade.isNeutral,
-               !(deflicker && look.isVideo), FramePlan.excluded(shoot.dir).isEmpty {
+               !(deflicker && look.isVideo), FramePlan.excluded(shoot.dir).isEmpty,
+               self.opts.res == .full, self.opts.fps == 0, !self.opts.h264 {
                 r = self.saveReady(ready, isVideo: look.isVideo)
             } else if look == .startrail {
                 r = self.renderPhoto(shoot, grade)
@@ -667,11 +813,15 @@ final class Renderer: ObservableObject {
                 r = self.renderMovie(shoot, look, trail, denoise: denoise, grade: grade, deflicker: deflicker)
             }
             Diag.event("Редактор: \(look.title) \(look == .starlapse ? trail.title : "")\(denoise && look.isVideo ? " без шума" : "") для \(shoot.id), \(shoot.frames) кадров, "
-                + "\(Int(Date().timeIntervalSince(t0))) с: \(r)")
+                + "\(Int(Date().timeIntervalSince(t0))) с: \(r). Экспорт: \(opts.summary)"
+                + (grade.isNeutral ? "" : String(format: ". Правка: тепло %.2f оттенок %.2f насыщ %.2f контраст %.2f яркость %.2f тени %.2f света %.2f виньетка %.2f наклон %.1f° формат %@",
+                                                  grade.temp, grade.tint, grade.sat, grade.contrast, grade.exposure, grade.shadows,
+                                                  grade.highlights, grade.vignette, grade.angle, grade.crop.title)))
             DispatchQueue.main.async {
                 self.busy = false
                 self.message = r
                 UIApplication.shared.isIdleTimerDisabled = false
+                if bg != .invalid { UIApplication.shared.endBackgroundTask(bg) }
             }
         }
     }
@@ -739,6 +889,115 @@ final class Renderer: ObservableObject {
         return true
     }
 
+    // MARK: Склейка съёмок
+
+    /// Склеить оборванную съёмку с продолжением в новую съёмку. Кадры не копируются (жёсткие ссылки,
+    /// места почти не занимает), а разрыв между ними дорисовывается: небо сдвигается так, как двигались
+    /// звёзды в конце первой съёмки, и плавно переходит во вторую. Земля - плавный переход
+    func merge(_ a: Shoot, _ b: Shoot, done: @escaping (Bool) -> Void) {
+        guard !busy else { return }
+        busy = true
+        cancelled = false
+        progress = 0
+        message = "Склеиваю..."
+        q.async {
+            let r = self.mergeNow(a, b)
+            Diag.event("Склейка \(a.id) + \(b.id): \(r.1)")
+            DispatchQueue.main.async {
+                self.busy = false
+                self.message = r.1
+                done(r.0)
+            }
+        }
+    }
+
+    private func mergeNow(_ a: Shoot, _ b: Shoot) -> (Bool, String) {
+        let fm = FileManager.default
+        let ua = ShootStore.frameURLs(a.dir), ub = ShootStore.frameURLs(b.dir)
+        guard let la = ua.last, let fb = ub.first,
+              let ia = ShootStore.full(la), let ib = ShootStore.full(fb) else { return (false, "Нет кадров для склейки") }
+        let w = ia.width, h = ia.height
+        guard ib.width == w, ib.height == h else { return (false, "У съёмок разный размер кадра - склеить нельзя") }
+        let name = a.dir.lastPathComponent.replacingOccurrences(of: "_frames", with: "") + "_склейка_frames"
+        let dir = ShootStore.docs().appendingPathComponent(name, isDirectory: true)
+        try? fm.removeItem(at: dir)
+        do { try fm.createDirectory(at: dir, withIntermediateDirectories: true) } catch { return (false, "Не удалось создать папку") }
+
+        // Сколько кадров пропало: по времени файлов и интервалу
+        let info = ShootStore.readInfo(a.dir)
+        let interval = max(1, (info["interval"] as? Double) ?? 8)
+        func mtime(_ u: URL) -> Date? { (try? fm.attributesOfItem(atPath: u.path))?[.modificationDate] as? Date }
+        var missing = 0
+        if let t1 = mtime(la), let t2 = mtime(fb) {
+            missing = min(120, max(0, Int((t2.timeIntervalSince(t1) / interval).rounded()) - 1))
+        }
+
+        var n = 0
+        func next() -> URL {
+            n += 1
+            return dir.appendingPathComponent(String(format: "frame_%05d.jpg", n))
+        }
+        let total = ua.count + missing + ub.count
+        for u in ua {
+            if cancelled { return (false, "Остановлено") }
+            let d = next()
+            if (try? fm.linkItem(at: u, to: d)) == nil { try? fm.copyItem(at: u, to: d) }
+        }
+        report(n, total)
+
+        // Дорисовка разрыва
+        if missing > 0 {
+            var fa = Frame(w: w, h: h), fbF = Frame(w: w, h: h)
+            fa.draw(ia)
+            fbF.draw(ib)
+            // Сдвиг неба за один интервал - по последним кадрам первой съёмки
+            var step: [SIMD2<Float>]?
+            let k = min(ua.count - 1, max(1, Int((90 / interval).rounded())))
+            if k >= 1, let ic = ShootStore.full(ua[ua.count - 1 - k]) {
+                var fc = Frame(w: w, h: h)
+                fc.draw(ic)
+                step = GapFill.skyShift(fc, fa).map { arr in arr.map { v in v / Float(k) } }
+            }
+            let sample = Array(ua.suffix(6))
+            let mask = SkyMask.build(sample, w: w, h: h)
+            for j in 1...missing {
+                if cancelled { return (false, "Остановлено") }
+                let t = Float(j) / Float(missing + 1)
+                let skyA = step.map { fa.shifted($0, by: Float(j)) } ?? fa
+                let skyB = step.map { fbF.shifted($0, by: -Float(missing + 1 - j)) } ?? fbF
+                let sky = Frame.mix(skyA, skyB, t)
+                let ground = Frame.mix(fa, fbF, t)
+                let out = mask?.blend(sky: sky, ground: ground) ?? sky
+                if let cg = out.cgImage(), let jpg = ShootStore.jpeg(cg) { try? jpg.write(to: next()) }
+                report(n, total)
+            }
+        }
+        for u in ub {
+            if cancelled { return (false, "Остановлено") }
+            let d = next()
+            if (try? fm.linkItem(at: u, to: d)) == nil { try? fm.copyItem(at: u, to: d) }
+        }
+        // Журнал первой съёмки, дальше второй с новыми номерами кадров
+        var log = (try? String(contentsOf: a.dir.appendingPathComponent("log.csv"), encoding: .utf8)) ?? ""
+        if let lb = try? String(contentsOf: b.dir.appendingPathComponent("log.csv"), encoding: .utf8) {
+            let off = ua.count + missing
+            for line in lb.split(separator: "\n").dropFirst() {
+                var c = line.split(separator: ",", omittingEmptySubsequences: false).map(String.init)
+                if c.count > 1, let f = Int(c[1]) { c[1] = String(f + off) }
+                log += (log.hasSuffix("\n") || log.isEmpty ? "" : "\n") + c.joined(separator: ",")
+            }
+        }
+        try? log.write(to: dir.appendingPathComponent("log.csv"), atomically: true, encoding: .utf8)
+        var ni = info
+        ni["done"] = true
+        ni["merged"] = [a.id, b.id]
+        ShootStore.writeInfo(dir, ni)
+        report(total, total)
+        return (true, missing > 0
+                ? "Склейка готова: \(total) кадров, дорисовано \(missing). Она в списке съёмок"
+                : "Склейка готова: \(total) кадров. Она в списке съёмок")
+    }
+
     private func report(_ i: Int, _ n: Int) {
         let p = Double(i) / Double(max(n, 1))
         DispatchQueue.main.async { self.progress = p }
@@ -795,7 +1054,9 @@ final class Renderer: ObservableObject {
             }
             acc = mk.blend(sky: acc, ground: ground)
         }
-        guard let img = acc.geometry(grade).cgImage(), let jpg = ShootStore.jpeg(img) else { return "Не удалось собрать фото" }
+        let accOut = acc.geometry(grade)
+        let pf = opts.fit(accOut.w, accOut.h)
+        guard let img = accOut.scaled(pf.0, pf.1).cgImage(), let jpg = ShootStore.jpeg(img) else { return "Не удалось собрать фото" }
         // Копия рядом с исходниками, на случай если в Фото нет доступа
         try? jpg.write(to: shoot.dir.appendingPathComponent("startrail.jpg"))
         if !toPhotos { return keepInApp(shoot.dir.appendingPathComponent("startrail.jpg"), move: false) }
@@ -938,7 +1199,9 @@ final class Renderer: ObservableObject {
                 }
             }
         }
-        guard let img = out.geometry(grade).cgImage(), let jpg = ShootStore.jpeg(img) else { return "Не удалось собрать фото" }
+        let deepOut = out.geometry(grade)
+        let df = opts.fit(deepOut.w, deepOut.h)
+        guard let img = deepOut.scaled(df.0, df.1).cgImage(), let jpg = ShootStore.jpeg(img) else { return "Не удалось собрать фото" }
         try? jpg.write(to: shoot.dir.appendingPathComponent("stars_deep.jpg"))
         if !toPhotos { return keepInApp(shoot.dir.appendingPathComponent("stars_deep.jpg"), move: false) }
         let sem = DispatchSemaphore(value: 0)
@@ -962,17 +1225,18 @@ final class Renderer: ObservableObject {
         let reel = look == .reel
         // Рилс: 1080×1920, три полосы по 636 с чёрными промежутками 6
         let geo = reel ? (w, h) : grade.outSize(w, h)
-        let ow = reel ? 1080 : geo.0, oh = reel ? 1920 : geo.1
+        let fitted = reel ? (1080, 1920) : opts.fit(geo.0, geo.1)
+        let ow = fitted.0, oh = fitted.1
         let name = shoot.dir.lastPathComponent.replacingOccurrences(of: "_frames", with: "")
         let out = ShootStore.docs().appendingPathComponent(name + "_" + look.rawValue + ".mov")
         try? FileManager.default.removeItem(at: out)
         guard let writer = try? AVAssetWriter(outputURL: out, fileType: .mov) else { return "Не удалось начать запись" }
         let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
             // Рилс - H.264, его без перекодирования принимают все соцсети
-            AVVideoCodecKey: reel ? AVVideoCodecType.h264 : AVVideoCodecType.hevc,
+            AVVideoCodecKey: reel || opts.h264 ? AVVideoCodecType.h264 : AVVideoCodecType.hevc,
             AVVideoWidthKey: ow,
             AVVideoHeightKey: oh,
-            AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: reel ? 20_000_000 : ow * oh * 18]
+            AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: reel ? 20_000_000 : min(ow * oh * opts.quality.bpp, 160_000_000)]
         ])
         input.expectsMediaDataInRealTime = false
         let ad = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: [
@@ -985,7 +1249,7 @@ final class Renderer: ObservableObject {
         guard writer.startWriting() else { return "Не удалось начать запись" }
         writer.startSession(atSourceTime: .zero)
 
-        let fps = Int32(max(shoot.fps, 1))
+        let fps = Int32(max(opts.fps > 0 ? opts.fps : shoot.fps, 1))
         var dn = TemporalDenoise()
         var accA = Frame(w: w, h: h)          // Starlapse (или средний след в рилсе)
         var accB = Frame(w: w, h: h)          // длинный след в рилсе
@@ -1005,6 +1269,7 @@ final class Renderer: ObservableObject {
             mask = SkyMask.build(sample, w: w, h: h)
         }
         let done = eachFrame(urls, w, h) { raw, i in
+            if writer.status == .failed { return }   // запись уже сломалась - не тратим время
             if ex.contains(i + 1) { return }
             var cur = raw
             if let k = flick[i + 1] { cur.scale(k) }
@@ -1039,7 +1304,7 @@ final class Renderer: ObservableObject {
                 CVPixelBufferCreate(nil, ow, oh, kCVPixelFormatType_32BGRA, nil, &pbo)
             }
             guard let pb = pbo else { return }
-            src.copy(to: pb)
+            (src.w == ow && src.h == oh ? src : src.scaled(ow, oh)).copy(to: pb)
             var tries = 0
             while !input.isReadyForMoreMediaData && tries < 500 {
                 usleep(10_000)
@@ -1057,7 +1322,11 @@ final class Renderer: ObservableObject {
         let sem = DispatchSemaphore(value: 0)
         writer.finishWriting { sem.signal() }
         sem.wait()
-        guard writer.status == .completed, idx > 0 else { return "Ошибка записи видео" }
+        guard writer.status == .completed, idx > 0 else {
+            let why = writer.error?.localizedDescription ?? "неизвестно"
+            Diag.event("Ошибка записи видео: \(why), записано кадров \(idx), статус \(writer.status.rawValue)")
+            return "Ошибка записи видео. Если приложение сворачивалось во время сборки - собери ещё раз, не сворачивая"
+        }
         if !toPhotos { return keepInApp(out, move: true) }
         var ok = false
         let s2 = DispatchSemaphore(value: 0)
@@ -1254,6 +1523,9 @@ struct ShootEditor: View {
     /// Видео 3 в 1: вертикально, сверху как снято, ниже средний и длинный след
     @State private var stack3 = false
     @State private var askExport = false
+    @State private var exportOpts = ExportOpts()
+    /// Съёмка, начатая вскоре после этой (до 12 часов), - кандидат на склейку
+    @State private var nextShoot: Shoot?
     /// Что собирать на самом деле: с «3 в 1» любое видео превращается в вертикальное из трёх полос
     private var eff: Look { stack3 && look.isVideo ? .reel : look }
     @State private var trail: Trail = .medium
@@ -1273,6 +1545,18 @@ struct ShootEditor: View {
         if deflicker && look.isVideo { return false }
         guard let u = ShootStore.liveURL(shoot.dir, eff, trail) else { return false }
         return FileManager.default.fileExists(atPath: u.path)
+    }
+
+    /// Сколько прошло от конца этой съёмки до начала следующей
+    private func gapText(_ nx: Shoot) -> String {
+        let fm = FileManager.default
+        var sec = nx.date.timeIntervalSince(shoot.date)
+        if let last = ShootStore.frameURLs(shoot.dir).last,
+           let t = (try? fm.attributesOfItem(atPath: last.path))?[.modificationDate] as? Date {
+            sec = nx.date.timeIntervalSince(t)
+        }
+        let m = max(0, Int((sec / 60).rounded()))
+        return m < 60 ? "\(m) мин" : "\(m / 60) ч \(m % 60) мин"
     }
 
     /// Ползунок -1...1 с подписью; двойное касание по подписи - вернуть как было
@@ -1435,16 +1719,12 @@ struct ShootEditor: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
-                    .confirmationDialog("Куда экспортировать?", isPresented: $askExport, titleVisibility: .visible) {
-                        Button("В галерею (Фото)") {
-                            r.run(shoot, eff, trail, denoise: denoise, grade: grade, deflicker: deflicker, toPhotos: true)
+                    .sheet(isPresented: $askExport) {
+                        ExportSheet(isVideo: eff.isVideo, opts: $exportOpts) {
+                            askExport = false
+                            r.run(shoot, eff, trail, denoise: denoise, grade: grade, deflicker: deflicker, opts: exportOpts)
                         }
-                        Button("В приложение (Файлы)") {
-                            r.run(shoot, eff, trail, denoise: denoise, grade: grade, deflicker: deflicker, toPhotos: false)
-                        }
-                        Button("Отмена", role: .cancel) {}
-                    } message: {
-                        Text("В приложении файл лежит в Файлы → На iPhone → NightLapse → Экспорт, его можно сразу отправить")
+                        .presentationDetents([.medium, .large])
                     }
                     if let f = r.lastFile {
                         ShareLink(item: f) {
@@ -1492,6 +1772,21 @@ struct ShootEditor: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
 
+                if let nx = nextShoot, !r.busy {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Склейка").font(.footnote).foregroundStyle(.secondary)
+                        Text("Через \(gapText(nx)) началась следующая съёмка. Если камера не двигалась, их можно склеить в одну: пропущенные кадры между ними дорисуются по движению звёзд")
+                            .font(.footnote).foregroundStyle(.secondary)
+                        Button {
+                            r.merge(shoot, nx) { ok in if ok { onDeleted() } }
+                        } label: {
+                            Label("Склеить со следующей съёмкой", systemImage: "link")
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
                 Button(role: .destructive) { confirmDelete = true } label: {
                     Label("Удалить исходники", systemImage: "trash")
                         .frame(maxWidth: .infinity)
@@ -1508,6 +1803,10 @@ struct ShootEditor: View {
         .onAppear {
             excluded = FramePlan.excluded(shoot.dir)
             r.makePreview(shoot, eff, trail, grade)
+            let me = shoot
+            nextShoot = ShootStore.list()
+                .filter { $0.date > me.date && $0.date.timeIntervalSince(me.date) < 12 * 3600 && !$0.id.contains("склейка") }
+                .min { $0.date < $1.date }
         }
         .sheet(isPresented: $showFrames, onDismiss: {
             FramePlan.save(shoot.dir, excluded)
@@ -2068,6 +2367,111 @@ struct FramePicker: View {
                 let t = await Task.detached { ShootStore.thumb(u, maxPixel: 1000) }.value
                 img = t.map { UIImage(cgImage: $0) }
             }
+        }
+    }
+}
+
+
+// MARK: - Окно экспорта
+
+/// Экспорт: готовый набор под площадку или свои настройки, и куда сохранить
+struct ExportSheet: View {
+    let isVideo: Bool
+    @Binding var opts: ExportOpts
+    let onExport: () -> Void
+    @State private var preset: ExportOpts.Preset? = .original
+    private let pal = Pal(night: false)
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    section("Для чего") {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 8) {
+                                ForEach(ExportOpts.Preset.allCases) { p in
+                                    let on = preset == p
+                                    Button {
+                                        preset = p
+                                        let dest = opts.toPhotos
+                                        opts = ExportOpts.preset(p)
+                                        opts.toPhotos = dest
+                                    } label: {
+                                        Label(p.title, systemImage: p.icon)
+                                            .font(.subheadline.weight(.semibold))
+                                            .padding(.horizontal, 14)
+                                            .frame(height: 40)
+                                            .foregroundStyle(on ? Color.black : Color.primary)
+                                            .background(on ? pal.accent : Color.secondary.opacity(0.15), in: Capsule())
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    section("Размер") {
+                        Picker("Размер", selection: custom(\.res)) {
+                            ForEach(ExportOpts.Res.allCases) { Text($0.title).tag($0) }
+                        }
+                        .pickerStyle(.segmented)
+                    }
+                    if isVideo {
+                        section("Кадров в секунду") {
+                            Picker("Кадров в секунду", selection: custom(\.fps)) {
+                                Text("Как снято").tag(0)
+                                Text("24").tag(24)
+                                Text("25").tag(25)
+                                Text("30").tag(30)
+                                Text("60").tag(60)
+                            }
+                            .pickerStyle(.segmented)
+                        }
+                        section("Качество") {
+                            Picker("Качество", selection: custom(\.quality)) {
+                                ForEach(ExportOpts.Quality.allCases) { Text($0.title).tag($0) }
+                            }
+                            .pickerStyle(.segmented)
+                            Text("Выше качество - больше файл. Для мессенджеров хватит обычного")
+                                .font(.footnote).foregroundStyle(.secondary)
+                        }
+                    }
+                    section("Куда") {
+                        Picker("Куда", selection: $opts.toPhotos) {
+                            Text("В галерею").tag(true)
+                            Text("В приложение").tag(false)
+                        }
+                        .pickerStyle(.segmented)
+                        Text(opts.toPhotos ? "Файл появится в Фото"
+                             : "Файл ляжет в Файлы → На iPhone → NightLapse → Экспорт, его можно сразу отправить кнопкой «Поделиться»")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
+                    Button(action: onExport) {
+                        Text("Экспорт")
+                            .font(.headline)
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 52)
+                            .foregroundStyle(Color.black)
+                            .background(pal.accent, in: RoundedRectangle(cornerRadius: 14))
+                    }
+                }
+                .padding(16)
+            }
+            .navigationTitle("Экспорт")
+            .navigationBarTitleDisplayMode(.inline)
+        }
+    }
+
+    /// Ручная правка снимает выбор готового набора
+    private func custom<T>(_ kp: WritableKeyPath<ExportOpts, T>) -> Binding<T> {
+        Binding(get: { opts[keyPath: kp] }, set: { v in
+            opts[keyPath: kp] = v
+            preset = nil
+        })
+    }
+
+    private func section<C: View>(_ title: String, @ViewBuilder _ content: () -> C) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title).font(.footnote.weight(.semibold)).foregroundStyle(.secondary)
+            content()
         }
     }
 }
