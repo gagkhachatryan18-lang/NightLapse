@@ -80,9 +80,7 @@ final class PoleFinder: NSObject, ObservableObject, CLLocationManagerDelegate {
         let dot = max(-1, min(1, px * cx + py * cy + pzz * cz))
         let off = acos(dot) * 180 / .pi
         arrow = CGVector(dx: daz, dy: dalt)
-        let was = centered
         centered = off < 4
-        if centered && !was { Haptic.success() }   // нашёл - телефон коротко отзовётся
         if centered {
             text = "Полюс в центре: следы будут кругами"
         } else {
@@ -118,7 +116,6 @@ struct PolePill: View {
 
     var body: some View {
         Button {
-            Haptic.tap()
             p.toggle()
         } label: {
             HStack(spacing: 6) {
