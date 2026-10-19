@@ -1696,6 +1696,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     // MARK: Обработка кадров (queue)
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        // Картинка для часов - и в простое, и во время съёмки
+        if let wpb = CMSampleBufferGetImageBuffer(sampleBuffer) { WatchLink.shared.offer(wpb, portrait: vertical) }
         guard mode != .off, !suspended, let pb = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         // Первые 3 секунды после нажатия телефон ещё дрожит от касания - эти кадры пропускаем
         if CACurrentMediaTime() < holdUntil { return }
@@ -2387,6 +2389,7 @@ struct ContentView: View {
         }
         .onAppear {
             e.configure()
+            WatchLink.shared.attach(e)
             if let p = UserDefaults.standard.string(forKey: "pendingScene"), let sc = LapseScene(rawValue: p) {
                 UserDefaults.standard.removeObject(forKey: "pendingScene")
                 e.applyScene(sc)
@@ -2652,11 +2655,12 @@ struct ContentView: View {
     private var statusLine: String {
         var s = e.status
         if e.pauses > 0 && (e.phase == .recording || e.phase == .paused) { s += " · пауз: \(e.pauses)" }
-        if e.cooling && (e.phase == .recording || e.phase == .paused) { s += " · пауза +\(Int(e.coolExtra)) с от нагрева" }
+        let cool = e.cooling && (e.phase == .recording || e.phase == .paused)
+        if cool { s += " · нагрев: пауза +\(Int(e.coolExtra)) с" }
         if e.phase == .recording && e.effExposure > 0 && e.effExposure < e.exposureSeconds - 0.01 {
             s += " · выдержка \(expText(e.effExposure))"
         }
-        if e.hot { s += " · телефон перегрет" }
+        if e.hot && !cool { s += " · телефон перегрет" }
         return s
     }
 
@@ -2901,12 +2905,18 @@ struct ContentView: View {
         }
     }
 
+    private func zoomText(_ z: Double) -> String {
+        abs(z - z.rounded()) < 0.01 ? "\(Int(z.rounded()))x" : String(format: "%.1fx", z)
+    }
+
     private var intervalNote: String {
         let ex = expText(e.exposureSeconds)
         switch e.sceneKind {
         case .stars:
             return e.pauseSeconds > 1.5
-                ? "Выдержка \(ex), остальное - пауза. Следы между кадрами редактор дорисует"
+                ? (e.zoom > 1.01
+                    ? "На \(zoomText(e.zoom)) выдержка до \(ex), иначе звёзды смажутся. Длиннее - на 1x или 0.5x"
+                    : "Выдержка \(ex), остальное - пауза. Следы между кадрами редактор дорисует")
                 : "Выдержка \(ex), почти без пауз - следы сплошные"
         case .clouds:
             return "Выдержка до \(ex), днём сама короче"
