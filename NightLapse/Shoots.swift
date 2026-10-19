@@ -752,20 +752,49 @@ final class Renderer: ObservableObject {
         let nm = nightMap(shoot.dir)
         let gap = GapFill(shoot.dir)
         let ex = FramePlan.excluded(shoot.dir)
+        let w = first.width, h = first.height
+        // Земля без следов и без точек шума: на земле берём среднее по кадрам, следы только на небе
+        let nightIdx = (0..<urls.count).filter { !ex.contains($0 + 1) && (nm.isEmpty || (nm[$0 + 1] ?? true)) }
+        let sample = stride(from: 0, to: nightIdx.count, by: max(1, nightIdx.count / 12)).map { urls[nightIdx[$0]] }
+        let mask = SkyMask.build(sample, w: w, h: h)
+        let every = max(1, nightIdx.count / 60)
+        var gsum = [UInt16](repeating: 0, count: mask == nil ? 0 : w * h * 3)
+        var gcnt = 0
         var used = 0
-        let done = eachFrame(urls, first.width, first.height) { raw, i in
+        let done = eachFrame(urls, w, h) { raw, i in
             if ex.contains(i + 1) { return }
             // Номер кадра в журнале = номер файла frame_00001 → 1
             // Без журнала (старые съёмки) пересвеченный кадр рассвета узнаётся по яркости
             guard nm.isEmpty ? raw.meanLuma() < 170 : (nm[i + 1] ?? true) else { return }
             var cur = raw
             cur.apply(grade)
+            if mask != nil && used % every == 0 && gcnt < 250 {
+                gsum.withUnsafeMutableBufferPointer { s in
+                    cur.px.withUnsafeBufferPointer { p in
+                        for k in 0..<(w * h) {
+                            s[k * 3] &+= UInt16(p[k * 4]); s[k * 3 + 1] &+= UInt16(p[k * 4 + 1]); s[k * 3 + 2] &+= UInt16(p[k * 4 + 2])
+                        }
+                    }
+                }
+                gcnt += 1
+            }
             gap.apply(&cur)
             acc.trail(with: cur, lut: lut)
             used += 1
         }
         if !done { return "Остановлено" }
         if used == 0 { return "Все кадры сняты днём или в сумерках. Фото со следами получается только в темноте" }
+        if let mk = mask, gcnt > 0 {
+            var ground = Frame(w: w, h: h)
+            ground.ok = true
+            for k in 0..<(w * h) {
+                ground.px[k * 4] = UInt8(Int(gsum[k * 3]) / gcnt)
+                ground.px[k * 4 + 1] = UInt8(Int(gsum[k * 3 + 1]) / gcnt)
+                ground.px[k * 4 + 2] = UInt8(Int(gsum[k * 3 + 2]) / gcnt)
+                ground.px[k * 4 + 3] = 255
+            }
+            acc = mk.blend(sky: acc, ground: ground)
+        }
         guard let img = acc.geometry(grade).cgImage(), let jpg = ShootStore.jpeg(img) else { return "Не удалось собрать фото" }
         // Копия рядом с исходниками, на случай если в Фото нет доступа
         try? jpg.write(to: shoot.dir.appendingPathComponent("startrail.jpg"))
@@ -823,7 +852,7 @@ final class Renderer: ObservableObject {
 
         // Суммы ×4 в UInt16: 40 кадров × 1020 помещаются
         let n = w * h
-        var sky = [UInt16](repeating: 0, count: n * 3)
+        var sky_ = [UInt16](repeating: 0, count: n * 3)
         var cnt = [UInt8](repeating: 0, count: n)
         var flat = [UInt16](repeating: 0, count: n * 3)
         let pick = night.map { urls[$0] }
@@ -832,7 +861,7 @@ final class Renderer: ObservableObject {
             var cur = raw
             cur.apply(grade)
             let t = Float(night[k] - ref)
-            sky.withUnsafeMutableBufferPointer { sb in
+            sky_.withUnsafeMutableBufferPointer { sb in
             cnt.withUnsafeMutableBufferPointer { cb in
             flat.withUnsafeMutableBufferPointer { fb in
             cur.px.withUnsafeBufferPointer { p in
@@ -886,37 +915,22 @@ final class Renderer: ObservableObject {
             }
         }
         for b in 0..<bg.count { bg[b] = bc[b] > 0 ? bg[b] / bc[b] / Float(used * 4) : 0 }
-        let sorted = bg.sorted()
-        let level = max(sorted[sorted.count * 7 / 10], 4)   // уровень неба
-        var mask = bg.map { min(max(($0 - 0.45 * level) / (0.25 * level), 0), 1) }
-        // Сгладить границу 3×3
-        let m0 = mask
-        for by in 0..<bh {
-            for bx in 0..<bw {
-                var s: Float = 0, c: Float = 0
-                for yy in max(0, by - 1)...min(bh - 1, by + 1) {
-                    for xx in max(0, bx - 1)...min(bw - 1, bx + 1) { s += m0[yy * bw + xx]; c += 1 }
-                }
-                mask[by * bw + bx] = s / c
-            }
-        }
+        // Горизонт по столбцам снизу вверх: так затемнённые углы неба не путаются с землёй
+        let sky = SkyMask.fromBlocks(bg, bw: bw, bh: bh, blk: blk, w: w, h: h)
+        let hasMask = sky != nil
+        let mk = sky?.m ?? []
         var out = Frame(w: w, h: h)
         out.ok = true
         out.px.withUnsafeMutableBufferPointer { d in
             DispatchQueue.concurrentPerform(iterations: 16) { part in
                 for y in (part * h / 16)..<((part + 1) * h / 16) {
-                    let fy = min(max(Float(y) / Float(blk) - 0.5, 0), Float(bh - 1))
-                    let by0 = Int(fy), by1 = min(by0 + 1, bh - 1), wy = fy - Float(by0)
                     for x in 0..<w {
                         let o = y * w + x
-                        let fx = min(max(Float(x) / Float(blk) - 0.5, 0), Float(bw - 1))
-                        let bx0 = Int(fx), bx1 = min(bx0 + 1, bw - 1), wx = fx - Float(bx0)
-                        let t = (mask[by0 * bw + bx0] * (1 - wx) + mask[by0 * bw + bx1] * wx) * (1 - wy)
-                            + (mask[by1 * bw + bx0] * (1 - wx) + mask[by1 * bw + bx1] * wx) * wy
+                        let t = hasMask ? Float(mk[o]) / 255 : 1
                         let c = Float(cnt[o])
                         for ch in 0..<3 {
                             let g = Float(flat[o * 3 + ch]) / Float(used * 4)
-                            let sv = c > 0 ? Float(sky[o * 3 + ch]) / (c * 4) : g
+                            let sv = c > 0 ? Float(sky_[o * 3 + ch]) / (c * 4) : g
                             d[o * 4 + ch] = UInt8(min(255, max(0, (sv * t + g * (1 - t)).rounded())))
                         }
                         d[o * 4 + 3] = 255
@@ -983,6 +997,13 @@ final class Renderer: ObservableObject {
         let gap = GapFill(shoot.dir)
         let ex = FramePlan.excluded(shoot.dir)
         let flick = deflicker ? FramePlan.deflicker(shoot.dir, ex) : [:]
+        // Следы только на небе, земля - текущий кадр: без точек шума и без «размазанных» деревьев
+        var mask: SkyMask?
+        if look != .timelapse {
+            let nightIdx = (0..<urls.count).filter { !ex.contains($0 + 1) && (nm.isEmpty || (nm[$0 + 1] ?? true)) }
+            let sample = stride(from: 0, to: nightIdx.count, by: max(1, nightIdx.count / 12)).map { urls[nightIdx[$0]] }
+            mask = SkyMask.build(sample, w: w, h: h)
+        }
         let done = eachFrame(urls, w, h) { raw, i in
             if ex.contains(i + 1) { return }
             var cur = raw
@@ -1000,13 +1021,16 @@ final class Renderer: ObservableObject {
                 }
             }
             let src: Frame
+            let mk = night ? mask : nil
             if reel {
                 reelFrame.drawPanel(cur, y0: 0, w: 1080, h: 636)
-                reelFrame.drawPanel(accA, y0: 642, w: 1080, h: 636)
-                reelFrame.drawPanel(accB, y0: 1284, w: 1080, h: 636)
+                reelFrame.drawPanel(mk?.blend(sky: accA, ground: cur) ?? accA, y0: 642, w: 1080, h: 636)
+                reelFrame.drawPanel(mk?.blend(sky: accB, ground: cur) ?? accB, y0: 1284, w: 1080, h: 636)
                 src = reelFrame
+            } else if look == .timelapse {
+                src = cur.geometry(grade)
             } else {
-                src = (look == .timelapse ? cur : accA).geometry(grade)
+                src = (mk?.blend(sky: accA, ground: cur) ?? accA).geometry(grade)
             }
             var pbo: CVPixelBuffer?
             if let pool = ad.pixelBufferPool {
@@ -1674,6 +1698,110 @@ struct ReportRow: View {
     }
 }
 
+// MARK: - Где небо, а где земля
+
+/// Маска неба: 255 - небо, 0 - земля. Горизонт ищем по столбцам снизу вверх: земля ночью темнее неба.
+/// Так угол кадра, затемнённый широким объективом, не путается с землёй - он выше горизонта.
+/// Если земля светлая (луна, снег, город), всё считается небом - как было раньше
+struct SkyMask {
+    let w: Int, h: Int
+    var m: [UInt8]
+
+    /// По средней яркости зелёного блоками blk×blk (bw×bh блоков)
+    static func fromBlocks(_ bm: [Float], bw: Int, bh: Int, blk: Int, w: Int, h: Int) -> SkyMask? {
+        guard bw > 2, bh > 4 else { return nil }
+        var hz = [Float](repeating: 0, count: bw)   // граница неба в пикселях по каждому столбцу блоков
+        for x in 0..<bw {
+            let col = (0..<bh).map { bm[$0 * bw + x] }
+            let lv = col.sorted()[bh * 9 / 10]
+            let thr = 0.5 * lv
+            var y = bh - 1
+            // Снизу вверх, пока не встретим два блока неба подряд
+            while y > 0 && !(col[y] >= thr && col[y - 1] >= thr) { y -= 1 }
+            hz[x] = lv < 3 ? Float(h) : Float(y + 1) * Float(blk)   // совсем тёмный столбец - не трогаем
+        }
+        // Сгладить: медиана по 5 столбцам убирает одиночные просветы между деревьями
+        let raw = hz
+        for x in 0..<bw {
+            let win = (max(0, x - 2)...min(bw - 1, x + 2)).map { raw[$0] }.sorted()
+            hz[x] = win[win.count / 2]
+        }
+        let groundPx = hz.reduce(0) { $0 + max(0, Float(h) - $1) } / Float(bw)
+        guard groundPx > Float(h) * 0.02 else { return nil }   // земли почти нет - маска не нужна
+        let edges = hz
+        var out = SkyMask(w: w, h: h, m: [UInt8](repeating: 255, count: w * h))
+        let ramp = Float(blk)
+        out.m.withUnsafeMutableBufferPointer { d in
+            DispatchQueue.concurrentPerform(iterations: 8) { part in
+                for x in stride(from: part, to: w, by: 8) {
+                    let fx = min(max(Float(x) / Float(blk) - 0.5, 0), Float(bw - 1))
+                    let x0 = Int(fx), x1 = min(x0 + 1, bw - 1), wx = fx - Float(x0)
+                    let edge = edges[x0] * (1 - wx) + edges[x1] * wx
+                    let y0 = max(0, Int(edge - ramp)), y1 = min(h, Int(edge + ramp) + 1)
+                    if y0 < h {
+                        for y in y0..<y1 {
+                            let t = min(max((edge - Float(y)) / (2 * ramp) + 0.5, 0), 1)
+                            d[y * w + x] = UInt8(t * 255)
+                        }
+                    }
+                    if y1 < h { for y in y1..<h { d[y * w + x] = 0 } }
+                }
+            }
+        }
+        return out
+    }
+
+    /// По нескольким кадрам съёмки
+    static func build(_ urls: [URL], w: Int, h: Int) -> SkyMask? {
+        let blk = 8
+        let bw = w / blk, bh = h / blk
+        guard bw > 2, bh > 4, !urls.isEmpty else { return nil }
+        var sum = [Float](repeating: 0, count: bw * bh)
+        var n = 0
+        var f = Frame(w: w, h: h)
+        for u in urls {
+            guard let c = ShootStore.full(u), c.width == w, c.height == h else { continue }
+            f.draw(c)
+            f.px.withUnsafeBufferPointer { p in
+                for by in 0..<bh {
+                    for bx in 0..<bw {
+                        var s: Float = 0
+                        for yy in stride(from: by * blk, to: by * blk + blk, by: 2) {
+                            for xx in stride(from: bx * blk, to: bx * blk + blk, by: 2) { s += Float(p[(yy * w + xx) * 4 + 1]) }
+                        }
+                        sum[by * bw + bx] += s / Float(blk * blk / 4)
+                    }
+                }
+            }
+            n += 1
+        }
+        guard n > 0 else { return nil }
+        return fromBlocks(sum.map { $0 / Float(n) }, bw: bw, bh: bh, blk: blk, w: w, h: h)
+    }
+
+    /// Небо из sky, земля из ground
+    func blend(sky: Frame, ground: Frame) -> Frame {
+        guard sky.w == w, sky.h == h, ground.w == w, ground.h == h else { return sky }
+        var out = sky
+        let w = self.w, h = self.h
+        ground.px.withUnsafeBufferPointer { g in
+            m.withUnsafeBufferPointer { mk in
+                out.px.withUnsafeMutableBufferPointer { d in
+                    DispatchQueue.concurrentPerform(iterations: 8) { part in
+                        for i in (part * w * h / 8)..<((part + 1) * w * h / 8) {
+                            let a = Int(mk[i])
+                            if a == 255 { continue }
+                            let o = i * 4
+                            for c in 0..<3 { d[o + c] = UInt8((Int(d[o + c]) * a + Int(g[o + c]) * (255 - a) + 127) / 255) }
+                        }
+                    }
+                }
+            }
+        }
+        return out
+    }
+}
+
 // MARK: - Дорисовка следов между кадрами
 
 /// Если между кадрами была пауза (выдержка 7 с, интервал 30 с), звезда на фото со следами
@@ -1812,7 +1940,12 @@ final class GapFill {
                         let o = (y * w + x) * 4
                         let bi = ((y / blk) * bw + x / blk) * 3
                         let e0 = Int(p[o]) - Int(bg[bi]), e1 = Int(p[o + 1]) - Int(bg[bi + 1]), e2 = Int(p[o + 2]) - Int(bg[bi + 2])
-                        guard e1 > 14 else { continue }
+                        guard e1 > 10, x >= 5, y >= 5, x < w - 5, y < h - 5 else { continue }
+                        // Тянем только точки: заметно ярче соседей в 5 пикселях со всех сторон.
+                        // Край неба у деревьев ярче среднего по блоку, но не ярче неба рядом - его не трогаем
+                        let gc = Int(p[o + 1])
+                        let nb = max(max(Int(p[o + 1 - 20]), Int(p[o + 1 + 20])), max(Int(p[o + 1 - w * 20]), Int(p[o + 1 + w * 20])))
+                        guard gc > nb + 10 else { continue }
                         let t = min(gy - 1, y * gy / h) * gx + min(gx - 1, x * gx / w)
                         let v = sh[t]
                         let k = max(1, Int(max(abs(v.x), abs(v.y)).rounded(.up)))
