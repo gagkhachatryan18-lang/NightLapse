@@ -317,7 +317,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         case .stars: cap = starLimit
         case .clouds: cap = 2
         }
-        let ex = min(intervalSeconds, cap)
+        let ex = expManual ? min(exposureSeconds, intervalSeconds) : min(intervalSeconds, cap)
         exposureSeconds = ex
         pauseSeconds = max(0, intervalSeconds - ex)
         lighten = sc.lighten
@@ -503,6 +503,29 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             v -= 1
         }
         return cnt > 0 ? sum / Double(cnt) : 0
+    }
+
+    /// Выдержка выставлена руками в шторке: интервал её больше не меняет, только не даёт стать длиннее себя
+    @Published var expManual = false
+
+    /// Шаг выдержки в шторке: от 1/8 с до интервала, остальное - пауза
+    func exposureStep(_ up: Bool) {
+        expManual = true
+        let steps = Self.exposureSteps.filter { $0 >= 0.125 - 0.0001 && $0 <= intervalSeconds + 0.0001 }
+        if up {
+            if let n = steps.first(where: { $0 > exposureSeconds + 0.0001 }) { exposureSeconds = n }
+        } else if let n = steps.last(where: { $0 < exposureSeconds - 0.0001 }) {
+            exposureSeconds = n
+        }
+        pauseSeconds = max(0, intervalSeconds - exposureSeconds)
+        applyCamera()
+    }
+
+    /// Выдержка снова сама: по интервалу и режиму
+    func exposureAuto() {
+        expManual = false
+        syncExposure()
+        applyCamera()
     }
 
     func exposureUp() {
@@ -831,6 +854,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     func applyScene(_ sc: LapseScene) {
         guard phase == .idle else { return }
         scene = sc.rawValue
+        expManual = false
         intervalSeconds = sc.interval
         evComp = sc.ev
         isoAuto = true
@@ -2361,7 +2385,7 @@ struct ContentView: View {
     @AppStorage("guideSeen") private var guideSeen = false
     @State private var shootToOpen: URL?
 
-    enum Param { case brightness, interval, duration, focus }
+    enum Param { case brightness, exposure, interval, duration, focus }
 
     private var idle: Bool { e.phase == .idle }
     private var shooting: Bool {
@@ -2494,7 +2518,7 @@ struct ContentView: View {
             }
         } label: {
             HStack(spacing: 7) {
-                Text(summaryText).monospacedDigit()
+                summaryText.monospacedDigit()
                 Image(systemName: panel ? "xmark" : "ellipsis")
             }
             .font(.system(size: 13, weight: .semibold))
@@ -2512,9 +2536,11 @@ struct ContentView: View {
         .accessibilityLabel("Настройки съёмки")
     }
 
-    private var summaryText: String {
-        "\(expText(e.intervalSeconds)) · \(String(format: "%+.1f", e.evComp)) · "
-            + (e.autoStopMin == 0 ? "∞" : durText(Double(e.autoStopMin) * 60))
+    /// Интервал, выдержка, длительность - значками, как в шторке
+    private var summaryText: Text {
+        Text(Image(systemName: "timer")) + Text(" \(expText(e.intervalSeconds))   ")
+            + Text(Image(systemName: "stopwatch")) + Text(" \(expText(e.exposureSeconds))   ")
+            + Text(Image(systemName: "hourglass")) + Text(e.autoStopMin == 0 ? " ∞" : " " + durText(Double(e.autoStopMin) * 60))
     }
 
     private func roundIcon(_ name: String, _ action: @escaping () -> Void) -> some View {
@@ -2782,7 +2808,10 @@ struct ContentView: View {
                 if let w = warning(for: p) { warnText(w) }
             } else {
                 LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 3), spacing: 14) {
-                    paramCircle(.brightness, "sun.max", String(format: "%+.1f", e.evComp), warn: evWarn != nil)
+                    // Выдержка вместо яркости: яркость - пальцем по кадру вверх-вниз
+                    paramCircle(.exposure, "stopwatch",
+                                e.expManual ? expText(e.exposureSeconds) : "авто \(expText(e.exposureSeconds))",
+                                warn: exposureWarn != nil)
                     paramCircle(.interval, "timer", expText(e.intervalSeconds), warn: intervalWarn != nil)
                     paramCircle(.duration, "hourglass",
                                 e.autoStopMin == 0 ? "Пока не остановлю" : durText(Double(e.autoStopMin) * 60),
@@ -2814,6 +2843,7 @@ struct ContentView: View {
     private func paramTitle(_ p: Param) -> String {
         switch p {
         case .brightness: return "Яркость"
+        case .exposure: return "Выдержка"
         case .interval: return "Интервал"
         case .duration: return "Длительность"
         case .focus: return "Фокус вручную"
@@ -2823,6 +2853,7 @@ struct ContentView: View {
     private func warning(for p: Param) -> String? {
         switch p {
         case .brightness: return evWarn
+        case .exposure: return exposureWarn
         case .interval: return intervalWarn
         case .duration: return durationWarn
         case .focus: return nil
@@ -2932,7 +2963,13 @@ struct ContentView: View {
     }
 
 
-    private var firstWarning: String? { evWarn ?? intervalWarn ?? durationWarn }
+    private var firstWarning: String? { exposureWarn ?? evWarn ?? intervalWarn ?? durationWarn }
+
+    /// Ночью длиннее предела звёзды тянутся чёрточками
+    private var exposureWarn: String? {
+        guard e.expManual, e.sceneKind == .stars, e.exposureSeconds > e.starLimit + 0.01 else { return nil }
+        return "Выдержка длиннее \(Int(e.starLimit)) с: звёзды на каждом кадре смажутся в чёрточки"
+    }
 
     /// Подпись кнопки резкости: одно-два слова
     private var focusLabel: String {
@@ -2968,6 +3005,24 @@ struct ContentView: View {
     @ViewBuilder private func paramEditor(_ p: Param) -> some View {
         VStack(spacing: 6) {
             switch p {
+            case .exposure:
+                HStack(spacing: 16) {
+                    stepButton("minus") { e.exposureStep(false) }
+                    Text("Выдержка \(expText(e.exposureSeconds))")
+                        .font(.subheadline.weight(.semibold))
+                        .monospacedDigit()
+                        .frame(minWidth: 170)
+                    stepButton("plus") { e.exposureStep(true) }
+                }
+                Text("Пауза между кадрами \(expText(e.pauseSeconds)). Дольше - кадр ярче и меньше шума. Яркость - пальцем по кадру вверх-вниз")
+                    .font(.footnote)
+                    .foregroundStyle(t.dim)
+                    .multilineTextAlignment(.center)
+                if e.expManual {
+                    Button("Вернуть авто") { e.exposureAuto() }
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(t.accent)
+                }
             case .brightness:
                 HStack {
                     Image(systemName: "sun.min")
