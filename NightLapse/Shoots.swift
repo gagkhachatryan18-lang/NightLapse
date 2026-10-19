@@ -1595,6 +1595,8 @@ struct ShootsView: View {
     @State private var shoots: [Shoot] = []
     @State private var path: [Shoot] = []
     @State private var loaded = false
+    /// Съёмка, которая только что закончилась: для неё сначала простой экран «Ночь готова»
+    @State private var quickID: String?
 
     private static let fmt: DateFormatter = {
         let f = DateFormatter()
@@ -1647,7 +1649,7 @@ struct ShootsView: View {
             .navigationTitle("Съёмки")
             .navigationBarTitleDisplayMode(.inline)
             .navigationDestination(for: Shoot.self) { s in
-                ShootEditor(shoot: s) { reload() }
+                ShootEditor(shoot: s, quick: s.id == quickID) { reload() }
             }
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
@@ -1658,6 +1660,7 @@ struct ShootsView: View {
         .onAppear {
             reload()
             if let o = open, let s = shoots.first(where: { $0.dir.lastPathComponent == o.lastPathComponent }) {
+                quickID = s.id
                 path = [s]
             }
         }
@@ -1699,6 +1702,65 @@ struct ShootThumb: View {
 struct ShootEditor: View {
     let shoot: Shoot
     var onDeleted: () -> Void = {}
+    /// Простой экран «Ночь готова»: видео и одна кнопка «Экспорт». «Настроить» открывает редактор
+    @State private var simple: Bool
+    @State private var tab: EditTab = .adjust
+    @State private var tool: Tool = .exposure
+
+    init(shoot: Shoot, quick: Bool = false, onDeleted: @escaping () -> Void = {}) {
+        self.shoot = shoot
+        self.onDeleted = onDeleted
+        _simple = State(initialValue: quick)
+    }
+
+    enum EditTab: String, CaseIterable, Identifiable {
+        case look, adjust, crop
+        var id: String { rawValue }
+        var title: String { ["Вид", "Коррекция", "Обрезать"][Self.allCases.firstIndex(of: self)!] }
+        var icon: String { ["film", "dial.medium", "crop.rotate"][Self.allCases.firstIndex(of: self)!] }
+    }
+
+    /// Инструменты коррекции, как в редакторе Фото: круг, под ним шкала
+    enum Tool: String, CaseIterable, Identifiable {
+        case exposure, shadows, highlights, contrast, sat, temp, tint, vignette
+        var id: String { rawValue }
+        var title: String {
+            switch self {
+            case .exposure: return "Яркость"
+            case .shadows: return "Тени"
+            case .highlights: return "Света"
+            case .contrast: return "Контраст"
+            case .sat: return "Насыщенность"
+            case .temp: return "Тепло"
+            case .tint: return "Оттенок"
+            case .vignette: return "Виньетка"
+            }
+        }
+        var icon: String {
+            switch self {
+            case .exposure: return "sun.max"
+            case .shadows: return "circle.lefthalf.filled"
+            case .highlights: return "circle.righthalf.filled"
+            case .contrast: return "circle.lefthalf.striped.horizontal"
+            case .sat: return "drop"
+            case .temp: return "thermometer.medium"
+            case .tint: return "eyedropper"
+            case .vignette: return "circle.dashed"
+            }
+        }
+        var key: WritableKeyPath<Grade, Float> {
+            switch self {
+            case .exposure: return \.exposure
+            case .shadows: return \.shadows
+            case .highlights: return \.highlights
+            case .contrast: return \.contrast
+            case .sat: return \.sat
+            case .temp: return \.temp
+            case .tint: return \.tint
+            case .vignette: return \.vignette
+            }
+        }
+    }
     @Environment(\.dismiss) private var dismiss
     @StateObject private var r = Renderer()
     @State private var look: Look = .starlapse
@@ -1757,94 +1819,197 @@ struct ShootEditor: View {
         return m < 60 ? "\(m) мин" : "\(m / 60) ч \(m % 60) мин"
     }
 
-    /// Ползунок -1...1 с подписью; двойное касание по подписи - вернуть как было
-    private func gradeRow(_ title: String, _ v: Binding<Float>) -> some View {
-        HStack {
-            Text(title).font(.footnote).frame(width: 84, alignment: .leading)
-                .onTapGesture(count: 2) { v.wrappedValue = 0 }
-            Slider(value: v, in: -1...1)
-            Text(String(format: "%+.0f", v.wrappedValue * 100))
-                .font(.footnote.monospacedDigit())
-                .foregroundStyle(abs(v.wrappedValue) < 0.01 ? Color.secondary : Color.primary)
-                .frame(width: 46, alignment: .trailing)
+    // MARK: Части экрана
+
+    /// Просмотр: кадр или черновик видео с кнопкой ▶ и перемоткой
+    private var previewBox: some View {
+        ZStack {
+            Color(white: 0.08)
+            if (playing || clipIdx > 0), let img = clipImage {
+                Image(uiImage: img).resizable().scaledToFit()
+            } else if let p = r.preview {
+                Image(uiImage: p).resizable().scaledToFit()
+            }
+            if r.previewBusy && !playing { ProgressView() }
+            if look.isVideo {
+                VStack {
+                    Spacer()
+                    HStack(spacing: 10) {
+                        Button {
+                            if r.clip.isEmpty { r.makeClip(shoot, eff, trail) }
+                            playing.toggle()
+                        } label: {
+                            Group {
+                                if r.clipBusy && playing { ProgressView().tint(.white) }
+                                else { Image(systemName: playing ? "pause.fill" : "play.fill") }
+                            }
+                            .font(.system(size: 18, weight: .semibold))
+                            .foregroundStyle(Color.white)
+                            .frame(width: 44, height: 44)
+                            .background(Color.black.opacity(0.55), in: Circle())
+                        }
+                        if !r.clip.isEmpty {
+                            Slider(value: Binding(get: { Double(clipIdx) }, set: { clipIdx = Int($0) }),
+                                   in: 0...Double(max(r.clip.count - 1, 1)))
+                        }
+                    }
+                    .padding(10)
+                }
+            }
+        }
+        .aspectRatio(eff == .reel ? 0.75 : 16 / 9, contentMode: .fit)
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .onReceive(ticker) { _ in
+            guard playing, !r.clip.isEmpty else { return }
+            clipIdx = (clipIdx + 1) % r.clip.count
         }
     }
 
-    var body: some View {
-        ScrollView {
-            VStack(spacing: 14) {
-                ZStack {
-                    Color(white: 0.08)
-                    if (playing || clipIdx > 0), let img = clipImage {
-                        Image(uiImage: img).resizable().scaledToFit()
-                    } else if let p = r.preview {
-                        Image(uiImage: p).resizable().scaledToFit()
+    /// Ход экспорта, результат, «Поделиться», готовый отчёт
+    @ViewBuilder private var statusArea: some View {
+        if r.busy {
+            VStack(spacing: 8) {
+                ProgressView(value: r.progress)
+                Text("\(r.message) \(Int(r.progress * 100))%. Не сворачивай приложение")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                Button("Остановить") { r.cancel() }
+                    .buttonStyle(.bordered)
+            }
+            .padding(.horizontal)
+        } else {
+            VStack(spacing: 8) {
+                if !r.message.isEmpty {
+                    Text(r.message).font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                }
+                HStack(spacing: 10) {
+                    if let f = r.lastFile {
+                        ShareLink(item: f) { Label("Поделиться", systemImage: "square.and.arrow.up") }
+                            .buttonStyle(.bordered)
                     }
-                    if r.previewBusy && !playing { ProgressView() }
-                    if look.isVideo {
-                        VStack {
-                            Spacer()
-                            HStack(spacing: 10) {
-                                Button {
-                                    if r.clip.isEmpty { r.makeClip(shoot, eff, trail) }
-                                    playing.toggle()
-                                } label: {
-                                    Group {
-                                        if r.clipBusy && playing { ProgressView().tint(.white) }
-                                        else { Image(systemName: playing ? "pause.fill" : "play.fill") }
-                                    }
-                                    .font(.system(size: 18, weight: .semibold))
-                                    .foregroundStyle(Color.white)
-                                    .frame(width: 44, height: 44)
-                                    .background(Color.black.opacity(0.55), in: Circle())
-                                }
-                                if !r.clip.isEmpty {
-                                    Slider(value: Binding(get: { Double(clipIdx) }, set: { clipIdx = Int($0) }),
-                                           in: 0...Double(max(r.clip.count - 1, 1)))
-                                        .tint(Pal(night: false).accent)
-                                }
-                            }
-                            .padding(10)
-                        }
+                    if let u = reportURL {
+                        ShareLink(item: u) { Label("Отправить отчёт", systemImage: "doc.text") }
+                            .buttonStyle(.bordered)
                     }
                 }
-                .aspectRatio(eff == .reel ? 0.75 : 16 / 9, contentMode: .fit)
-                .clipShape(RoundedRectangle(cornerRadius: 12))
-                .onReceive(ticker) { _ in
-                    guard playing, !r.clip.isEmpty else { return }
-                    clipIdx = (clipIdx + 1) % r.clip.count
-                }
+            }
+            .padding(.horizontal)
+        }
+    }
 
-                // Что собрать: видео отдельно, фото отдельно - пять вариантов в одну строку не помещаются
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Видео").font(.footnote).foregroundStyle(.secondary)
-                    Picker("Видео", selection: $look) {
-                        ForEach([Look.starlapse, .timelapse]) { Text($0.title).tag($0) }
-                    }
-                    .pickerStyle(.segmented)
-                    Text("Фото").font(.footnote).foregroundStyle(.secondary)
-                    Picker("Фото", selection: $look) {
-                        ForEach([Look.startrail, .deep]) { Text($0.title).tag($0) }
-                    }
-                    .pickerStyle(.segmented)
+    /// Сколько длилась съёмка: от первого до последнего кадра
+    private var durationText: String {
+        let urls = ShootStore.frameURLs(shoot.dir)
+        func t(_ u: URL?) -> Date? {
+            guard let u else { return nil }
+            return (try? FileManager.default.attributesOfItem(atPath: u.path))?[.modificationDate] as? Date
+        }
+        guard let a = t(urls.first), let b = t(urls.last) else { return "" }
+        let m = Int(b.timeIntervalSince(a) / 60)
+        return m < 60 ? "\(m) мин" : "\(m / 60) ч \(m % 60) мин"
+    }
+
+    /// Утром после «Стоп»: одно видео и одна кнопка
+    private var readyView: some View {
+        ScrollView {
+            VStack(spacing: 16) {
+                previewBox
+                VStack(spacing: 4) {
+                    Text("Ночь готова").font(.title2.bold())
+                    Text("\(durationText) · \(shoot.frames) кадров").font(.subheadline).foregroundStyle(.secondary)
+                }
+                Picker("Вид", selection: $look) {
+                    ForEach([Look.starlapse, .timelapse]) { Text($0.title).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .disabled(r.busy)
+                Button { askExport = true } label: {
+                    Text("Экспорт").font(.headline).frame(maxWidth: .infinity).frame(height: 52)
+                        .foregroundStyle(Color.black)
+                        .background(Pal(night: false).accent, in: RoundedRectangle(cornerRadius: 14))
                 }
                 .disabled(r.busy)
-
-                if look == .starlapse && !stack3 {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("Длина следа").font(.footnote).foregroundStyle(.secondary)
-                        Picker("Длина следа", selection: $trail) {
-                            ForEach(Trail.allCases) { Text($0.title).tag($0) }
-                        }
-                        .pickerStyle(.segmented)
-                        .disabled(r.busy)
-                    }
+                Button("Настроить") {
+                    playing = false
+                    withAnimation(.easeInOut(duration: 0.25)) { simple = false }
                 }
+                .font(.body.weight(.semibold))
+                .disabled(r.busy)
+                statusArea
+            }
+            .padding()
+        }
+        .onAppear {
+            // Видео сразу крутится
+            if r.clip.isEmpty { r.makeClip(shoot, eff, trail) }
+            playing = true
+        }
+    }
 
+    /// Редактор как в Фото: сверху просмотр, снизу инструменты выбранной вкладки и сами вкладки
+    private var editorView: some View {
+        VStack(spacing: 12) {
+            previewBox.padding(.horizontal)
+            statusArea
+            Spacer(minLength: 0)
+            Group {
+                switch tab {
+                case .look: lookTab
+                case .adjust: adjustTab
+                case .crop: cropTab
+                }
+            }
+            .disabled(r.busy)
+            .transition(.opacity)
+            tabBar
+        }
+        .padding(.top, 8)
+    }
 
+    private var tabBar: some View {
+        HStack(spacing: 4) {
+            ForEach(EditTab.allCases) { t in
+                let on = tab == t
                 Button {
-                    showFrames = true
+                    withAnimation(.easeInOut(duration: 0.2)) { tab = t }
                 } label: {
+                    VStack(spacing: 3) {
+                        Image(systemName: t.icon).font(.system(size: 18, weight: on ? .semibold : .regular))
+                        Text(t.title).font(.system(size: 11, weight: .medium))
+                    }
+                    .foregroundStyle(on ? Pal(night: false).accent : Color.secondary)
+                    .frame(maxWidth: .infinity, minHeight: 48)
+                }
+            }
+        }
+        .padding(6)
+        .background(Color(white: 0.14), in: Capsule())
+        .padding(.horizontal, 40)
+        .padding(.bottom, 6)
+    }
+
+    /// Вкладка «Вид»: что собирать, длина следа, кадры, склейка
+    private var lookTab: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Видео").font(.footnote).foregroundStyle(.secondary)
+                Picker("Видео", selection: $look) {
+                    ForEach([Look.starlapse, .timelapse]) { Text($0.title).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                Text("Фото").font(.footnote).foregroundStyle(.secondary)
+                Picker("Фото", selection: $look) {
+                    ForEach([Look.startrail, .deep]) { Text($0.title).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                if look == .starlapse {
+                    Text("Длина следа").font(.footnote).foregroundStyle(.secondary)
+                    Picker("Длина следа", selection: $trail) {
+                        ForEach(Trail.allCases) { Text($0.title).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                }
+                Button { showFrames = true } label: {
                     HStack {
                         Label("Кадры", systemImage: "film.stack")
                         Spacer()
@@ -1853,181 +2018,125 @@ struct ShootEditor: View {
                     }
                     .font(.footnote)
                 }
-                .disabled(r.busy)
-
-                VStack(spacing: 6) {
-                    HStack {
-                        Text("Цвет").font(.footnote).foregroundStyle(.secondary)
-                        Spacer()
-                        if !grade.isNeutral {
-                            Button("Сбросить всё") { grade = Grade() }.font(.footnote)
-                        }
-                    }
-                    HStack {
-                        Image(systemName: "snowflake").foregroundStyle(.blue)
-                        Slider(value: $grade.temp, in: -1...1)
-                        Image(systemName: "sun.max.fill").foregroundStyle(.orange)
-                    }
-                    HStack {
-                        Circle().fill(Color.green).frame(width: 14, height: 14)
-                        Slider(value: $grade.tint, in: -1...1)
-                        Circle().fill(Color.pink).frame(width: 14, height: 14)
-                    }
-                    HStack {
-                        Image(systemName: "circle.lefthalf.filled").foregroundStyle(.gray)
-                        Slider(value: $grade.sat, in: -1...1)
-                        Image(systemName: "paintpalette.fill").foregroundStyle(.purple)
-                    }
-                    HStack {
-                        Image(systemName: "circle.dotted").foregroundStyle(.gray)
-                        Slider(value: $grade.contrast, in: -1...1)
-                        Image(systemName: "circle.righthalf.filled").foregroundStyle(.white)
-                    }
-
-                    Text("Свет").font(.footnote).foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.top, 6)
-                    gradeRow("Яркость", $grade.exposure)
-                    gradeRow("Тени", $grade.shadows)
-                    gradeRow("Света", $grade.highlights)
-                    gradeRow("Виньетка", $grade.vignette)
-
-                    if eff != .reel {
-                        Text("Кадр").font(.footnote).foregroundStyle(.secondary)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.top, 6)
-                        HStack {
-                            Text("Горизонт").font(.footnote).frame(width: 84, alignment: .leading)
-                            Slider(value: $grade.angle, in: -10...10, step: 0.1)
-                            Text(String(format: "%+.1f°", grade.angle))
-                                .font(.footnote.monospacedDigit())
-                                .frame(width: 46, alignment: .trailing)
-                                .onTapGesture { grade.angle = 0 }
-                        }
-                        Picker("Формат", selection: $grade.crop) {
-                            ForEach(Grade.Crop.allCases) { Text($0.title).tag($0) }
-                        }
-                        .pickerStyle(.segmented)
-                    }
+                Text(look.hint).font(.footnote).foregroundStyle(.secondary)
+                if let pv = prevShoot {
+                    mergeCard("Эта съёмка продолжила оборванную. Их можно склеить в одну: пропущенные кадры дорисуются по движению звёзд",
+                              "Склеить с началом") { r.merge(pv, shoot) { ok in if ok { onDeleted() } } }
                 }
-                .disabled(r.busy)
-
-                Text(look.hint)
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-
-                if r.busy {
-                    VStack(spacing: 8) {
-                        ProgressView(value: r.progress)
-                        Text("\(r.message) \(Int(r.progress * 100))%. Не сворачивай приложение")
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                        Button("Остановить") { r.cancel() }
-                            .buttonStyle(.bordered)
-                    }
-                } else {
-                    Button {
-                        askExport = true
-                    } label: {
-                        Label("Экспорт", systemImage: "square.and.arrow.up")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.large)
-                    .sheet(isPresented: $askExport) {
-                        ExportSheet(isVideo: eff.isVideo, frames: shoot.frames, fps: shoot.fps, src: srcSize, opts: $exportOpts) {
-                            askExport = false
-                            r.run(shoot, eff, trail, denoise: denoise, grade: grade, deflicker: deflicker, opts: exportOpts)
-                        }
-                        .presentationDetents([.medium, .large])
-                    }
-                    if let f = r.lastFile {
-                        ShareLink(item: f) {
-                            Label("Поделиться", systemImage: "square.and.arrow.up")
-                        }
-                        .buttonStyle(.bordered)
-                    }
-                    if !r.message.isEmpty {
-                        Text(r.message).font(.footnote).foregroundStyle(.secondary)
-                    }
+                if let nx = nextShoot {
+                    mergeCard("Через \(gapText(nx)) началась следующая съёмка. Если камера не двигалась, их можно склеить в одну",
+                              "Склеить со следующей съёмкой") { r.merge(shoot, nx) { ok in if ok { onDeleted() } } }
                 }
+            }
+            .padding(.horizontal)
+        }
+        .frame(maxHeight: 300)
+    }
 
-                // Отчёт по этой съёмке: журнал, настройки и пара кадров. Его можно прислать в чат с Claude
-                Group {
-                    if let u = reportURL {
-                        ShareLink(item: u) {
-                            Label("Отправить отчёт", systemImage: "square.and.arrow.up").frame(maxWidth: .infinity)
-                        }
-                    } else {
-                        Button {
-                            reportBusy = true
-                            Diag.makeReport { u in
-                                reportURL = u
-                                reportBusy = false
-                            }
-                        } label: {
-                            HStack {
-                                Label("Собрать отчёт для улучшения", systemImage: "doc.text.magnifyingglass")
-                                if reportBusy { ProgressView() }
-                            }
-                            .frame(maxWidth: .infinity)
-                        }
-                        .disabled(reportBusy)
-                    }
-                }
+    private func mergeCard(_ text: String, _ title: String, _ action: @escaping () -> Void) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(text).font(.footnote).foregroundStyle(.secondary)
+            Button(action: action) { Label(title, systemImage: "link") }
                 .buttonStyle(.bordered)
+        }
+    }
 
-                Divider().padding(.vertical, 4)
-
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Исходники: \(shoot.frames) кадров, \(sizeText(shoot.bytes))").font(.footnote.weight(.semibold))
-                    Text("Лежат в Файлы → На iPhone → NightLapse → \(shoot.dir.lastPathComponent). Отсюда их можно скопировать на компьютер. Редактор их только читает")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+    /// Вкладка «Коррекция»: название и значение, круги инструментов, шкала
+    private var adjustTab: some View {
+        let v = grade[keyPath: tool.key]
+        return VStack(spacing: 12) {
+            HStack(spacing: 8) {
+                Text(tool.title.uppercased()).font(.footnote.weight(.semibold)).foregroundStyle(.secondary)
+                Text(String(format: "%+.0f", v * 100)).font(.footnote.monospacedDigit()).foregroundStyle(.secondary)
+                if !grade.isNeutral {
+                    Button("Сбросить всё") { grade = Grade() }.font(.footnote)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-                if let pv = prevShoot, !r.busy {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("Склейка").font(.footnote).foregroundStyle(.secondary)
-                        Text("Эта съёмка продолжила оборванную. Их можно склеить в одну: пропущенные кадры дорисуются по движению звёзд")
-                            .font(.footnote).foregroundStyle(.secondary)
-                        Button {
-                            r.merge(pv, shoot) { ok in if ok { onDeleted() } }
-                        } label: {
-                            Label("Склеить с началом", systemImage: "link")
-                        }
-                        .buttonStyle(.bordered)
+            }
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 12) {
+                    ForEach(Tool.allCases) { t in
+                        ToolCircle(icon: t.icon, value: grade[keyPath: t.key], on: tool == t)
+                            .onTapGesture { withAnimation(.easeOut(duration: 0.15)) { tool = t } }
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
+                .padding(.horizontal)
+            }
+            Ruler(value: Binding(get: { grade[keyPath: tool.key] }, set: { grade[keyPath: tool.key] = $0 }), range: -1...1)
+                .frame(height: 36)
+                .padding(.horizontal)
+        }
+    }
 
-                if let nx = nextShoot, !r.busy {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("Склейка").font(.footnote).foregroundStyle(.secondary)
-                        Text("Через \(gapText(nx)) началась следующая съёмка. Если камера не двигалась, их можно склеить в одну: пропущенные кадры между ними дорисуются по движению звёзд")
-                            .font(.footnote).foregroundStyle(.secondary)
-                        Button {
-                            r.merge(shoot, nx) { ok in if ok { onDeleted() } }
-                        } label: {
-                            Label("Склеить со следующей съёмкой", systemImage: "link")
+    /// Вкладка «Обрезать»: горизонт шкалой и формат
+    private var cropTab: some View {
+        VStack(spacing: 12) {
+            Text("ГОРИЗОНТ \(String(format: "%+.1f°", grade.angle))")
+                .font(.footnote.weight(.semibold).monospacedDigit()).foregroundStyle(.secondary)
+            Ruler(value: $grade.angle, range: -10...10)
+                .frame(height: 36)
+                .padding(.horizontal)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(Grade.Crop.allCases) { c in
+                        let on = grade.crop == c
+                        Button { grade.crop = c } label: {
+                            Text(c.title)
+                                .font(.subheadline.weight(.semibold))
+                                .padding(.horizontal, 14)
+                                .frame(height: 36)
+                                .foregroundStyle(on ? Color.black : Color.primary)
+                                .background(on ? Pal(night: false).accent : Color(white: 0.18), in: Capsule())
                         }
-                        .buttonStyle(.bordered)
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
+                .padding(.horizontal)
+            }
+        }
+    }
 
+    /// «…»: отчёт и удаление исходников
+    private var moreMenu: some View {
+        Menu {
+            Button {
+                reportBusy = true
+                Diag.makeReport { u in
+                    reportURL = u
+                    reportBusy = false
+                }
+            } label: { Label("Собрать отчёт для улучшения", systemImage: "doc.text.magnifyingglass") }
+            Section("Исходники: \(shoot.frames) кадров, \(sizeText(shoot.bytes)). Файлы → NightLapse") {
                 Button(role: .destructive) { confirmDelete = true } label: {
                     Label("Удалить исходники", systemImage: "trash")
-                        .frame(maxWidth: .infinity)
                 }
-                .buttonStyle(.bordered)
-                .disabled(r.busy)
             }
-            .padding()
+        } label: {
+            Image(systemName: reportBusy ? "hourglass" : "ellipsis.circle")
         }
-        .navigationTitle("Съёмка")
+        .disabled(r.busy)
+    }
+
+    var body: some View {
+        Group {
+            if simple { readyView } else { editorView }
+        }
+        .toolbar {
+            if !simple {
+                ToolbarItem(placement: .topBarTrailing) { moreMenu }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Экспорт") { askExport = true }
+                        .fontWeight(.semibold)
+                        .disabled(r.busy)
+                }
+            }
+        }
+        .sheet(isPresented: $askExport) {
+            ExportSheet(isVideo: eff.isVideo, frames: shoot.frames, fps: shoot.fps, src: srcSize, opts: $exportOpts) {
+                askExport = false
+                r.run(shoot, eff, trail, denoise: denoise, grade: grade, deflicker: deflicker, opts: exportOpts)
+            }
+            .presentationDetents([.medium, .large])
+        }
+        .navigationTitle(simple ? "" : "Коррекция")
         .navigationBarTitleDisplayMode(.inline)
         .navigationBarBackButtonHidden(r.busy)
         .interactiveDismissDisabled(r.busy)
@@ -2624,6 +2733,74 @@ struct FramePicker: View {
     }
 }
 
+
+// MARK: - Круг инструмента и шкала, как в редакторе Фото
+
+/// Круг с значком; дуга показывает, насколько инструмент сдвинут от нуля
+struct ToolCircle: View {
+    let icon: String
+    let value: Float
+    let on: Bool
+
+    var body: some View {
+        ZStack {
+            Circle().stroke(Color.white.opacity(on ? 0.5 : 0.18), lineWidth: 1.5)
+            if abs(value) > 0.005 {
+                Circle()
+                    .trim(from: 0, to: CGFloat(min(abs(value), 1)))
+                    .stroke(Pal(night: false).accent, style: StrokeStyle(lineWidth: 2.5, lineCap: .round))
+                    .rotationEffect(.degrees(-90))
+                    .scaleEffect(x: value < 0 ? -1 : 1, y: 1)
+            }
+            Image(systemName: icon)
+                .font(.system(size: 18, weight: on ? .semibold : .regular))
+                .foregroundStyle(on ? Color.white : Color.white.opacity(0.7))
+        }
+        .frame(width: 52, height: 52)
+        .background(Color.white.opacity(on ? 0.1 : 0), in: Circle())
+        .contentShape(Circle())
+    }
+}
+
+/// Шкала с рисками: тянешь пальцем вбок - значение меняется. Двойное касание - ноль
+struct Ruler: View {
+    @Binding var value: Float
+    let range: ClosedRange<Float>
+    @State private var start: Float?
+
+    var body: some View {
+        GeometryReader { g in
+            let w = g.size.width
+            let span = range.upperBound - range.lowerBound
+            // Вся шкала - две ширины экрана, середина - текущее значение
+            let pxPer = Float(w) * 2 / span
+            let offset = CGFloat((value - (range.lowerBound + range.upperBound) / 2) * pxPer)
+            ZStack {
+                Canvas { ctx, size in
+                    let n = 60
+                    for i in 0...n {
+                        let x = size.width / 2 - offset + (CGFloat(i) / CGFloat(n) - 0.5) * size.width * 2
+                        guard x >= 0, x <= size.width else { continue }
+                        let major = i % 10 == 0
+                        let hgt: CGFloat = major ? 18 : 10
+                        let rect = CGRect(x: x - 0.5, y: (size.height - hgt) / 2, width: 1, height: hgt)
+                        ctx.fill(Path(rect), with: .color(Color.white.opacity(major ? 0.6 : 0.3)))
+                    }
+                }
+                Rectangle().fill(Pal(night: false).accent).frame(width: 2, height: 30)
+            }
+            .contentShape(Rectangle())
+            .gesture(DragGesture(minimumDistance: 1)
+                .onChanged { d in
+                    if start == nil { start = value }
+                    let v = (start ?? value) - Float(d.translation.width) / pxPer
+                    value = min(max(v, range.lowerBound), range.upperBound)
+                }
+                .onEnded { _ in start = nil })
+            .onTapGesture(count: 2) { value = 0 }
+        }
+    }
+}
 
 // MARK: - Окно экспорта
 
