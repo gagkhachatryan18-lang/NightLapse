@@ -1706,6 +1706,8 @@ struct ShootEditor: View {
     @State private var simple: Bool
     @State private var tab: EditTab = .adjust
     @State private var tool: Tool = .exposure
+    /// «Авто» включено: ползунки выставлены автоматически
+    @State private var autoOn = false
 
     init(shoot: Shoot, quick: Bool = false, onDeleted: @escaping () -> Void = {}) {
         self.shoot = shoot
@@ -2054,6 +2056,9 @@ struct ShootEditor: View {
             }
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 12) {
+                    // Авто, как волшебная палочка в Фото: подбирает яркость и цвет, ползунки потом можно подправить
+                    ToolCircle(icon: "wand.and.stars", value: 0, on: autoOn)
+                        .onTapGesture { toggleAuto() }
                     ForEach(Tool.allCases) { t in
                         ToolCircle(icon: t.icon, value: grade[keyPath: t.key], on: tool == t)
                             .onTapGesture { withAnimation(.easeOut(duration: 0.15)) { tool = t } }
@@ -2064,6 +2069,32 @@ struct ShootEditor: View {
             Ruler(value: Binding(get: { grade[keyPath: tool.key] }, set: { grade[keyPath: tool.key] = $0 }), range: -1...1)
                 .frame(height: 36)
                 .padding(.horizontal)
+        }
+    }
+
+    private func toggleAuto() {
+        if autoOn {
+            var g = Grade()
+            g.vignette = grade.vignette
+            g.angle = grade.angle
+            g.crop = grade.crop
+            grade = g
+            autoOn = false
+            return
+        }
+        let urls = ShootStore.frameURLs(shoot.dir)
+        guard !urls.isEmpty, let c = ShootStore.thumb(urls[urls.count / 2], maxPixel: 400) else { return }
+        var f = Frame(w: c.width, h: c.height)
+        f.draw(c)
+        let a = Grade.auto(f)
+        withAnimation(.easeOut(duration: 0.25)) {
+            grade.exposure = a.exposure
+            grade.temp = a.temp
+            grade.tint = a.tint
+            grade.shadows = a.shadows
+            grade.contrast = a.contrast
+            grade.sat = a.sat
+            autoOn = true
         }
     }
 
@@ -2733,6 +2764,37 @@ struct FramePicker: View {
     }
 }
 
+
+extension Grade {
+    /// Автоподбор по кадру: яркость к нормальной для ночи или дня, нейтральный цвет фона, чуть теней и контраста
+    static func auto(_ f: Frame) -> Grade {
+        var hb = [Int](repeating: 0, count: 256), hg = hb, hr = hb
+        f.px.withUnsafeBufferPointer { p in
+            var i = 0
+            while i + 2 < p.count {
+                hb[Int(p[i])] += 1; hg[Int(p[i + 1])] += 1; hr[Int(p[i + 2])] += 1
+                i += 8
+            }
+        }
+        func med(_ h: [Int]) -> Float {
+            let half = h.reduce(0, +) / 2
+            var acc = 0
+            for v in 0..<256 { acc += h[v]; if acc >= half { return Float(max(v, 1)) } }
+            return 128
+        }
+        let mb = med(hb), mg = med(hg), mr = med(hr)
+        let luma = 0.11 * mb + 0.59 * mg + 0.3 * mr
+        let target: Float = luma < 80 ? 45 : 115
+        var g = Grade()
+        g.exposure = min(max(log2(target / luma) / 1.5, -1), 1)
+        g.temp = min(max((mb - mr) / (0.3 * (mb + mr)), -1), 1)
+        g.tint = min(max((1 - (mb + mr) / 2 / mg) / 0.18, -1), 1)
+        g.shadows = 0.15
+        g.contrast = 0.1
+        g.sat = 0.1
+        return g
+    }
+}
 
 // MARK: - Круг инструмента и шкала, как в редакторе Фото
 
