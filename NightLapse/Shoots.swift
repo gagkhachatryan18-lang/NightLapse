@@ -368,8 +368,9 @@ final class Renderer: ObservableObject {
         q.async {
             let r: String
             // Готовый Starlapse из съёмки - без шумодава, поэтому с «Убрать шум» собираем заново
+            // Если между кадрами были паузы, готовые следы из съёмки пунктирные - собираем заново с дорисовкой
             if let ready = ShootStore.liveURL(shoot.dir, look, trail), FileManager.default.fileExists(atPath: ready.path),
-               !(denoise && look.isVideo) {
+               !(denoise && look.isVideo), !GapFill.needed(shoot.dir) {
                 r = self.saveReady(ready, isVideo: look.isVideo)
             } else if look == .startrail {
                 r = self.renderPhoto(shoot)
@@ -442,11 +443,14 @@ final class Renderer: ObservableObject {
         var acc = Frame(w: first.width, h: first.height)
         let lut = decayLUT(1)
         let nm = nightMap(shoot.dir)
+        let gap = GapFill(shoot.dir)
         var used = 0
-        let done = eachFrame(urls, first.width, first.height) { cur, i in
+        let done = eachFrame(urls, first.width, first.height) { raw, i in
             // Номер кадра в журнале = номер файла frame_00001 → 1
             // Без журнала (старые съёмки) пересвеченный кадр рассвета узнаётся по яркости
-            guard nm.isEmpty ? cur.meanLuma() < 170 : (nm[i + 1] ?? true) else { return }
+            guard nm.isEmpty ? raw.meanLuma() < 170 : (nm[i + 1] ?? true) else { return }
+            var cur = raw
+            gap.apply(&cur)
             acc.trail(with: cur, lut: lut)
             used += 1
         }
@@ -507,14 +511,18 @@ final class Renderer: ObservableObject {
         var reelFrame = Frame(w: ow, h: oh)
         var idx: Int64 = 0
         let nm = nightMap(shoot.dir)
+        let gap = GapFill(shoot.dir)
         let done = eachFrame(urls, w, h) { raw, i in
             var cur = raw
             if denoise { dn.apply(&cur) }
             let night = nm.isEmpty ? cur.meanLuma() < 170 : (nm[i + 1] ?? true)
             if look != .timelapse {
-                if night { accA.trail(with: cur, lut: lutA) } else { accA = cur }
+                // Для следов - кадр с дорисованным путём звёзд, в таймлапсе-полосе рилса - как снят
+                var tr = cur
+                if night { gap.apply(&tr) }
+                if night { accA.trail(with: tr, lut: lutA) } else { accA = cur }
                 if reel {
-                    if night { accB.trail(with: cur, lut: lutB) } else { accB = cur }
+                    if night { accB.trail(with: tr, lut: lutB) } else { accB = cur }
                 }
             }
             let src: Frame
@@ -1017,6 +1025,154 @@ struct ReportRow: View {
                     }
                 }
                 .disabled(busy)
+            }
+        }
+    }
+}
+
+// MARK: - Дорисовка следов между кадрами
+
+/// Если между кадрами была пауза (выдержка 7 с, интервал 30 с), звезда на фото со следами
+/// рисует пунктир. Здесь путь звезды между соседними кадрами дорисовывается: по первым кадрам
+/// находим, куда сдвигается небо в каждой части кадра, и протягиваем каждую звезду назад
+/// к её прошлому месту. Деревья и горы не трогаем - тянутся только яркие точки над фоном
+final class GapFill {
+    private(set) var on: Bool
+    private let gx = 6, gy = 4
+    private var shift: [SIMD2<Float>]?
+    private var prevPts: [[(x: Int, y: Int, v: Int)]]?
+    private var tries = 0
+
+    /// Нужна ли дорисовка: пауза больше четверти интервала
+    static func needed(_ dir: URL) -> Bool {
+        let info = ShootStore.readInfo(dir)
+        let pause = (info["pause"] as? Double) ?? 0
+        let interval = (info["interval"] as? Double) ?? 0
+        return interval > 0 && pause / interval > 0.25
+    }
+
+    init(_ dir: URL) {
+        on = GapFill.needed(dir)
+    }
+
+    /// Вызывать для каждого ночного кадра по порядку, до наложения следа
+    func apply(_ f: inout Frame) {
+        guard on, f.ok else { return }
+        let bg = blockMeans(f)
+        if shift == nil {
+            let pts = stars(f, bg)
+            if let p = prevPts { estimate(p, pts) }
+            prevPts = pts
+            tries += 1
+            if shift == nil && tries > 6 { on = false }
+            if shift == nil { return }
+        }
+        fill(&f, bg)
+    }
+
+    // Средний фон блоками 16x16 по каждому каналу
+    private let blk = 16
+    private func blockMeans(_ f: Frame) -> [Float] {
+        let bw = (f.w + blk - 1) / blk, bh = (f.h + blk - 1) / blk
+        var sum = [Float](repeating: 0, count: bw * bh * 3)
+        var cnt = [Float](repeating: 0, count: bw * bh)
+        f.px.withUnsafeBufferPointer { p in
+            var y = 0
+            while y < f.h {
+                let by = y / blk
+                var x = 0
+                while x < f.w {
+                    let o = (y * f.w + x) * 4
+                    let b = by * bw + x / blk
+                    sum[b * 3] += Float(p[o]); sum[b * 3 + 1] += Float(p[o + 1]); sum[b * 3 + 2] += Float(p[o + 2])
+                    cnt[b] += 1
+                    x += 2
+                }
+                y += 2
+            }
+        }
+        for b in 0..<(bw * bh) where cnt[b] > 0 {
+            sum[b * 3] /= cnt[b]; sum[b * 3 + 1] /= cnt[b]; sum[b * 3 + 2] /= cnt[b]
+        }
+        return sum
+    }
+
+    // Звёзды: местные максимумы зелёного, заметно ярче фона. По каждой части кадра
+    private func stars(_ f: Frame, _ bg: [Float]) -> [[(x: Int, y: Int, v: Int)]] {
+        var out = [[(x: Int, y: Int, v: Int)]](repeating: [], count: gx * gy)
+        let bw = (f.w + blk - 1) / blk
+        let w = f.w, h = f.h
+        f.px.withUnsafeBufferPointer { p in
+            for y in 2..<(h - 2) {
+                for x in 2..<(w - 2) {
+                    let o = (y * w + x) * 4 + 1
+                    let g = Int(p[o])
+                    let b = Int(bg[((y / blk) * bw + x / blk) * 3 + 1])
+                    guard g > b + 25 else { continue }
+                    if g < Int(p[o - 4]) || g < Int(p[o + 4]) || g < Int(p[o - w * 4]) || g < Int(p[o + w * 4]) { continue }
+                    if g == Int(p[o - 4]) || g == Int(p[o - w * 4]) { continue }
+                    let t = min(gy - 1, y * gy / h) * gx + min(gx - 1, x * gx / w)
+                    out[t].append((x: x, y: y, v: g - b))
+                }
+            }
+        }
+        return out.map { list in Array(list.sorted { $0.v > $1.v }.prefix(80)) }
+    }
+
+    // Сдвиг неба между двумя кадрами в каждой части: перебор сдвигов, где совпадает больше всего звёзд
+    private func estimate(_ a: [[(x: Int, y: Int, v: Int)]], _ b: [[(x: Int, y: Int, v: Int)]]) {
+        let r = 48, cell = 3
+        var res = [SIMD2<Float>?](repeating: nil, count: gx * gy)
+        for t in 0..<(gx * gy) {
+            let pa = Array(a[t].prefix(60)), pb = b[t]
+            guard pa.count >= 6, pb.count >= 6 else { continue }
+            var set = Set<Int>()
+            for q in pb { set.insert((q.x / cell) &* 100_003 &+ q.y / cell) }
+            var best = 0, bd = SIMD2<Float>(0, 0)
+            for dy in -r...r {
+                for dx in -r...r {
+                    if abs(dx) < 2 && abs(dy) < 2 { continue }   // неподвижное (горячие пиксели, фонари) не считаем
+                    var s = 0
+                    for q in pa where set.contains(((q.x + dx) / cell) &* 100_003 &+ (q.y + dy) / cell) { s += 1 }
+                    if s > best { best = s; bd = SIMD2(Float(dx), Float(dy)) }
+                }
+            }
+            if best >= max(6, pa.count / 4) { res[t] = bd }
+        }
+        let ok = res.compactMap { $0 }
+        guard ok.count >= 2 else { return }
+        let mx = ok.map { $0.x }.sorted()[ok.count / 2], my = ok.map { $0.y }.sorted()[ok.count / 2]
+        shift = res.map { $0 ?? SIMD2(mx, my) }
+    }
+
+    // Каждую яркую точку протягиваем назад по сдвигу неба: путь между прошлым и этим кадром
+    private func fill(_ f: inout Frame, _ bg: [Float]) {
+        guard let sh = shift else { return }
+        let w = f.w, h = f.h
+        let bw = (w + blk - 1) / blk
+        let src = f.px
+        f.px.withUnsafeMutableBufferPointer { d in
+            src.withUnsafeBufferPointer { p in
+                for y in 0..<h {
+                    for x in 0..<w {
+                        let o = (y * w + x) * 4
+                        let bi = ((y / blk) * bw + x / blk) * 3
+                        let e0 = Int(p[o]) - Int(bg[bi]), e1 = Int(p[o + 1]) - Int(bg[bi + 1]), e2 = Int(p[o + 2]) - Int(bg[bi + 2])
+                        guard e1 > 14 else { continue }
+                        let t = min(gy - 1, y * gy / h) * gx + min(gx - 1, x * gx / w)
+                        let v = sh[t]
+                        let k = max(1, Int(max(abs(v.x), abs(v.y)).rounded(.up)))
+                        for s in 1...k {
+                            let f0 = Float(s) / Float(k)
+                            let tx = x - Int((v.x * f0).rounded()), ty = y - Int((v.y * f0).rounded())
+                            guard tx >= 0, ty >= 0, tx < w, ty < h else { continue }
+                            let q = (ty * w + tx) * 4
+                            d[q] = max(d[q], UInt8(min(255, Int(p[q]) + max(0, e0))))
+                            d[q + 1] = max(d[q + 1], UInt8(min(255, Int(p[q + 1]) + e1)))
+                            d[q + 2] = max(d[q + 2], UInt8(min(255, Int(p[q + 2]) + max(0, e2))))
+                        }
+                    }
+                }
             }
         }
     }
