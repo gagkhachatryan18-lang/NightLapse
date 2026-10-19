@@ -120,41 +120,35 @@ func applyCrop(_ crop: CGFloat, to dev: AVCaptureDevice) {
 
 enum Phase { case idle, test, waiting, recording, paused, saving }
 
-/// Режимы съёмки, как режимы в Камере iPhone: всё остальное выставляется само
+/// Режимы съёмки, как режимы в Камере iPhone: всё остальное выставляется само.
+/// Найтлапс - ночь и звёзды: кадры почти подряд, следы, Starlapse и фото - потом в редакторе.
+/// Таймлапс - обычный, в основном днём. rawValue оставлены старые, чтобы не терялись настройки
 enum LapseScene: String, CaseIterable, Identifiable {
-    case stars, trails, city, clouds
+    case stars, clouds
     var id: String { rawValue }
     var title: String {
         switch self {
-        case .stars: return "Звёзды"
-        case .trails: return "Треки"
-        case .city: return "Город"
-        case .clouds: return "Облака"
+        case .stars: return "Найтлапс"
+        case .clouds: return "Таймлапс"
         }
     }
     var hint: String {
         switch self {
-        case .stars: return "Звёзды точками: выдержка сама подбирается под объектив"
-        case .trails: return "Звёзды и огни рисуют длинные линии"
-        case .city: return "Шлейфы фар и огни города"
-        case .clouds: return "Закат, облака, день. Выдержка сама укоротится, если светло"
+        case .stars: return "Ночь и звёзды. Следы, Starlapse и фото со следами - в редакторе"
+        case .clouds: return "День, закат, облака. Выдержка сама подстроится под свет"
         }
     }
     /// Снимок каждые N секунд по умолчанию
     var interval: Double {
         switch self {
-        case .stars: return 10
-        case .trails: return 30
-        case .city: return 5
+        case .stars: return 8
         case .clouds: return 5
         }
     }
-    var lighten: Bool { self == .trails || self == .city }
+    var lighten: Bool { false }
     var ev: Double {
         switch self {
         case .stars: return -1
-        case .trails: return -1
-        case .city: return -1
         case .clouds: return -0.5
         }
     }
@@ -314,7 +308,6 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         switch sc {
         case .stars: cap = starLimit
         case .clouds: cap = 2
-        case .trails, .city: cap = intervalSeconds
         }
         let ex = min(intervalSeconds, cap)
         exposureSeconds = ex
@@ -564,7 +557,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         wbTemp = Float(d.dbl("wb", 4500))
         focus = Float(d.dbl("focus", 1))
         gain = Float(d.dbl("gain", 1))
-        lighten = d.flag("lighten", false)
+        lighten = false  // режимов «Треки» и «Город» больше нет: следы делает редактор
         fps = d.num("fps", 25)
         vertical = d.flag("vertical", false)
         saveVideo = d.flag("saveVideo", true)
@@ -1515,7 +1508,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         } else {
             // С цифровым усилением сначала убираем «пол» шума по каждому цвету: иначе усиление
             // поднимает его вместе с картинкой и ночное небо выходит серо-фиолетовым.
-            // В «Треках» и «Городе» берётся самая яркая точка из подкадров - ночью шум от этого
+            // Если включено «оставлять самое яркое» из подкадров - ночью шум от этого
             // поднимает фон, поэтому фон тоже опускаем
             if g > 1.01 || (cfg.lighten && n > 1 && night) { subtractBlack(div: div) }
             if g > 1.01 && night { neutralizeSky(div: div) }
@@ -2312,13 +2305,11 @@ struct ContentView: View {
         let ex = expText(e.exposureSeconds)
         switch e.sceneKind {
         case .stars:
-            return e.pauseSeconds > 0
-                ? "Выдержка \(ex) - дольше звёзды размажутся. Остальное время - пауза"
-                : "Выдержка \(ex)"
+            return e.pauseSeconds > 1.5
+                ? "Кадр \(ex), остальное - пауза. Следы между кадрами редактор дорисует"
+                : "Кадр \(ex), почти без пауз - следы сплошные"
         case .clouds:
             return "Выдержка до \(ex), днём сама короче"
-        case .trails, .city:
-            return "Выдержка на весь интервал, линии без разрывов"
         }
     }
 
@@ -2480,7 +2471,7 @@ struct GuideView: View {
 
     private let pages: [Page] = [
         Page(icon: "hand.draw", title: "Листай режимы",
-             text: "Проведи пальцем по кадру влево или вправо - режим сменится, как в Камере: Кадр дня, Звёзды, Треки, Город, Облака"),
+             text: "Проведи пальцем по кадру влево или вправо - режим сменится, как в Камере: Кадр дня, Найтлапс, Таймлапс"),
         Page(icon: "viewfinder", title: "Фокус и яркость",
              text: "Коснись кадра - фокус и яркость в этой точке. Веди пальцем вверх или вниз - ярче или темнее. ∞ сверху - ночью сам наводит резкость по звёздам, около 30 секунд"),
         Page(icon: "timer", title: "Как часто и сколько",
