@@ -1614,7 +1614,7 @@ struct ShootsView: View {
                             .font(.system(size: 44, weight: .light))
                             .foregroundStyle(Pal(night: false).accent)
                         Text("Пока нет съёмок").font(.headline)
-                        Text("Поставь телефон на штатив, нажми красную кнопку, а утром - «Стоп». Съёмка появится здесь, и откроется редактор")
+                        Text("Поставь телефон на штатив, нажми красную кнопку, а когда хватит - «Стоп». Съёмка появится здесь, и откроется редактор")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                             .multilineTextAlignment(.center)
@@ -1714,7 +1714,12 @@ struct ShootEditor: View {
         self.shoot = shoot
         self.onDeleted = onDeleted
         _simple = State(initialValue: quick)
+        // Днём звёзд нет: сразу обычное видео
+        if shoot.scene == "clouds" { _look = State(initialValue: .timelapse) }
     }
+
+    /// Дневной таймлапс: без звёздных вариантов
+    private var day: Bool { shoot.scene == "clouds" }
 
     enum EditTab: String, CaseIterable, Identifiable {
         case look, adjust, crop
@@ -1860,7 +1865,6 @@ struct ShootEditor: View {
                 }
             }
         }
-        .aspectRatio(eff == .reel ? 0.75 : 16 / 9, contentMode: .fit)
         .clipShape(RoundedRectangle(cornerRadius: 12))
         .onReceive(ticker) { _ in
             guard playing, !r.clip.isEmpty else { return }
@@ -1916,16 +1920,18 @@ struct ShootEditor: View {
     private var readyView: some View {
         ScrollView {
             VStack(spacing: 16) {
-                previewBox
+                previewBox.aspectRatio(eff == .reel ? 0.75 : 16 / 9, contentMode: .fit)
                 VStack(spacing: 4) {
-                    Text("Ночь готова").font(.title2.bold())
+                    Text(day ? "Таймлапс готов" : "Ночь готова").font(.title2.bold())
                     Text("\(durationText) · \(shoot.frames) кадров").font(.subheadline).foregroundStyle(.secondary)
                 }
-                Picker("Вид", selection: $look) {
-                    ForEach([Look.starlapse, .timelapse]) { Text($0.title).tag($0) }
+                if !day {
+                    Picker("Вид", selection: $look) {
+                        ForEach([Look.starlapse, .timelapse]) { Text($0.title).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    .disabled(r.busy)
                 }
-                .pickerStyle(.segmented)
-                .disabled(r.busy)
                 Button { askExport = true } label: {
                     Text("Экспорт").font(.headline).frame(maxWidth: .infinity).frame(height: 52)
                         .foregroundStyle(Color.black)
@@ -1952,9 +1958,11 @@ struct ShootEditor: View {
     /// Редактор как в Фото: сверху просмотр, снизу инструменты выбранной вкладки и сами вкладки
     private var editorView: some View {
         VStack(spacing: 12) {
-            previewBox.padding(.horizontal)
+            // Кадр занимает всё свободное место, как в Фото: инструменты прижаты вниз
+            previewBox
+                .frame(maxWidth: .infinity, minHeight: 200, maxHeight: .infinity)
+                .padding(.horizontal)
             statusArea
-            Spacer(minLength: 0)
             Group {
                 switch tab {
                 case .look: lookTab
@@ -1962,6 +1970,7 @@ struct ShootEditor: View {
                 case .crop: cropTab
                 }
             }
+            .fixedSize(horizontal: false, vertical: true)
             .disabled(r.busy)
             .transition(.opacity)
             tabBar
@@ -1995,16 +2004,18 @@ struct ShootEditor: View {
     private var lookTab: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
-                Text("Видео").font(.footnote).foregroundStyle(.secondary)
-                Picker("Видео", selection: $look) {
-                    ForEach([Look.starlapse, .timelapse]) { Text($0.title).tag($0) }
+                if !day {
+                    Text("Видео").font(.footnote).foregroundStyle(.secondary)
+                    Picker("Видео", selection: $look) {
+                        ForEach([Look.starlapse, .timelapse]) { Text($0.title).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    Text("Фото").font(.footnote).foregroundStyle(.secondary)
+                    Picker("Фото", selection: $look) {
+                        ForEach([Look.startrail, .deep]) { Text($0.title).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
                 }
-                .pickerStyle(.segmented)
-                Text("Фото").font(.footnote).foregroundStyle(.secondary)
-                Picker("Фото", selection: $look) {
-                    ForEach([Look.startrail, .deep]) { Text($0.title).tag($0) }
-                }
-                .pickerStyle(.segmented)
                 if look == .starlapse {
                     Text("Длина следа").font(.footnote).foregroundStyle(.secondary)
                     Picker("Длина следа", selection: $trail) {
@@ -2021,9 +2032,9 @@ struct ShootEditor: View {
                     }
                     .font(.footnote)
                 }
-                Text(look.hint).font(.footnote).foregroundStyle(.secondary)
+                Text(day ? "Обычное видео из всех кадров" : look.hint).font(.footnote).foregroundStyle(.secondary)
                 if let pv = prevShoot {
-                    mergeCard("Эта съёмка продолжила оборванную. Их можно склеить в одну: пропущенные кадры дорисуются по движению звёзд",
+                    mergeCard("Эта съёмка продолжила оборванную. Их можно склеить в одну: пропущенные кадры дорисуются по соседним",
                               "Склеить с началом") { r.merge(pv, shoot) { ok in if ok { onDeleted() } } }
                 }
                 if let nx = nextShoot {
@@ -2224,6 +2235,7 @@ struct ShootEditor: View {
             Text("\(shoot.frames) кадров будут удалены навсегда. Видео и фото, уже сохранённые в галерее телефона, останутся")
         }
         .traceScreen("Редактор")
+        .modifier(EditorTrace(tab: tab.title, tool: tool.rawValue, look: look.title, trail: trail.title))
     }
 }
 
@@ -2993,6 +3005,7 @@ struct ExportSheet: View {
             .navigationBarTitleDisplayMode(.inline)
         }
         .traceScreen("Экспорт")
+        .onChange(of: opts) { Trace.state("Настройки экспорта: \(opts.res.title), \(opts.fps) к/с, \(opts.quality.title)") }
     }
 
     /// Битрейт и примерный размер файла
