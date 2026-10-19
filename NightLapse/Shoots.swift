@@ -389,6 +389,78 @@ extension Frame {
     }
 }
 
+extension Frame {
+    /// Таблицы на каждый канал (порядок в памяти: синий, зелёный, красный)
+    mutating func applyLUTs(_ t: [[UInt8]]) {
+        guard t.count == 3 else { return }
+        px.withUnsafeMutableBufferPointer { p in
+            var i = 0
+            while i + 2 < p.count {
+                p[i] = t[0][Int(p[i])]; p[i + 1] = t[1][Int(p[i + 1])]; p[i + 2] = t[2][Int(p[i + 2])]
+                i += 4
+            }
+        }
+    }
+
+    /// Авто-цвет по одному кадру: чёрный без засветки и нейтральный (не цветной) фон неба
+    static func autoColorLUTs(_ f: Frame) -> [[UInt8]] {
+        var hist = [[Int]](repeating: [Int](repeating: 0, count: 256), count: 3)
+        f.px.withUnsafeBufferPointer { p in
+            var i = 0
+            while i + 2 < p.count {
+                hist[0][Int(p[i])] += 1; hist[1][Int(p[i + 1])] += 1; hist[2][Int(p[i + 2])] += 1
+                i += 16
+            }
+        }
+        func pct(_ h: [Int], _ q: Double) -> Float {
+            let total = h.reduce(0, +)
+            var acc = 0
+            for v in 0..<256 {
+                acc += h[v]
+                if Double(acc) >= Double(total) * q { return Float(v) }
+            }
+            return 255
+        }
+        let lo = (0..<3).map { pct(hist[$0], 0.005) }
+        let med = (0..<3).map { pct(hist[$0], 0.5) }
+        let m = med.reduce(0, +) / 3
+        let l = lo.reduce(0, +) / 3
+        return (0..<3).map { c in
+            let k = (m - l) / max(med[c] - lo[c], 1)
+            return (0..<256).map { v in UInt8(min(255, max(0, ((Float(v) - lo[c]) * min(max(k, 0.5), 2) + l * 0.4).rounded()))) }
+        }
+    }
+
+    /// Подпись в правом нижнем углу
+    mutating func stamp(_ text: String) {
+        guard !text.isEmpty else { return }
+        let w = self.w, h = self.h
+        px.withUnsafeMutableBytes { buf in
+            guard let cs = CGColorSpace(name: CGColorSpace.sRGB),
+                  let ctx = CGContext(data: buf.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4, space: cs,
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
+            else { return }
+            ctx.translateBy(x: 0, y: CGFloat(h))
+            ctx.scaleBy(x: 1, y: -1)
+            UIGraphicsPushContext(ctx)
+            let size = CGFloat(min(w, h)) * 0.035
+            let shadow = NSShadow()
+            shadow.shadowColor = UIColor.black.withAlphaComponent(0.6)
+            shadow.shadowBlurRadius = size * 0.15
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: UIFont.monospacedDigitSystemFont(ofSize: size, weight: .medium),
+                .foregroundColor: UIColor.white.withAlphaComponent(0.85),
+                .shadow: shadow
+            ]
+            let str = text as NSString
+            let sz = str.size(withAttributes: attrs)
+            let pad = size * 0.8
+            str.draw(at: CGPoint(x: CGFloat(w) - sz.width - pad, y: CGFloat(h) - sz.height - pad), withAttributes: attrs)
+            UIGraphicsPopContext()
+        }
+    }
+}
+
 // MARK: - Настройки экспорта
 
 /// Как экспортировать: куда, размер, частота кадров, качество. Готовые наборы под площадки
@@ -435,6 +507,17 @@ struct ExportOpts: Equatable {
     var quality: Quality = .high
     /// H.264 - для соцсетей, которые не любят HEVC
     var h264 = false
+    /// Подпись в углу: 0 - нет, 1 - дата и время кадра, 2 - свой текст
+    var mark = 0
+    var markText = ""
+    /// Авто-цвет: нейтральный фон неба и чистый чёрный, без засветки
+    var autoColor = false
+
+    /// Битрейт видео, Мбит/с, для кадра w×h
+    func mbps(_ w: Int, _ h: Int) -> Int {
+        let (ow, oh) = fit(w, h)
+        return max(1, min(ow * oh * quality.bpp, 160_000_000) / 1_000_000)
+    }
 
     static func preset(_ p: Preset) -> ExportOpts {
         var o = ExportOpts()
@@ -861,7 +944,7 @@ final class Renderer: ObservableObject {
             if let ready = ShootStore.liveURL(shoot.dir, look, trail), FileManager.default.fileExists(atPath: ready.path),
                !(denoise && look.isVideo), !GapFill.needed(shoot.dir), grade.isNeutral,
                !(deflicker && look.isVideo), FramePlan.excluded(shoot.dir).isEmpty,
-               self.opts.res == .full, self.opts.fps == 0, !self.opts.h264 {
+               self.opts.res == .full, self.opts.fps == 0, !self.opts.h264, self.opts.mark == 0, !self.opts.autoColor {
                 r = self.saveReady(ready, isVideo: look.isVideo)
             } else if look == .startrail {
                 r = self.renderPhoto(shoot, grade)
@@ -1056,6 +1139,35 @@ final class Renderer: ObservableObject {
                 : "Склейка готова: \(total) кадров. Она в списке съёмок")
     }
 
+    private static let markFmt: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "ru_RU")
+        f.dateFormat = "dd.MM.yyyy HH:mm"
+        return f
+    }()
+
+    /// Текст подписи для кадра: дата и время снимка или свой текст
+    private func markText(_ u: URL?) -> String {
+        switch opts.mark {
+        case 1:
+            guard let u, let d = (try? FileManager.default.attributesOfItem(atPath: u.path))?[.modificationDate] as? Date else { return "" }
+            return Self.markFmt.string(from: d)
+        case 2: return opts.markText
+        default: return ""
+        }
+    }
+
+    /// Таблицы авто-цвета по кадру из середины ночи (nil - выключено)
+    private func autoLUTs(_ urls: [URL], _ nm: [Int: Bool]) -> [[UInt8]]? {
+        guard opts.autoColor, !urls.isEmpty else { return nil }
+        let night = (0..<urls.count).filter { nm.isEmpty || (nm[$0 + 1] ?? true) }
+        let i = night.isEmpty ? urls.count / 2 : night[night.count / 2]
+        guard let c = ShootStore.thumb(urls[i], maxPixel: 800) else { return nil }
+        var f = Frame(w: c.width, h: c.height)
+        f.draw(c)
+        return Frame.autoColorLUTs(f)
+    }
+
     private func report(_ i: Int, _ n: Int) {
         let p = Double(i) / Double(max(n, 1))
         DispatchQueue.main.async { self.progress = p }
@@ -1078,12 +1190,14 @@ final class Renderer: ObservableObject {
         var gsum = [UInt16](repeating: 0, count: mask == nil ? 0 : w * h * 3)
         var gcnt = 0
         var used = 0
+        let auto = autoLUTs(urls, nm)
         let done = eachFrame(urls, w, h) { raw, i in
             if ex.contains(i + 1) { return }
             // Номер кадра в журнале = номер файла frame_00001 → 1
             // Без журнала (старые съёмки) пересвеченный кадр рассвета узнаётся по яркости
             guard nm.isEmpty ? raw.meanLuma() < 170 : (nm[i + 1] ?? true) else { return }
             var cur = raw
+            if let a = auto { cur.applyLUTs(a) }
             cur.apply(grade)
             if mask != nil && used % every == 0 && gcnt < 250 {
                 gsum.withUnsafeMutableBufferPointer { s in
@@ -1114,7 +1228,9 @@ final class Renderer: ObservableObject {
         }
         let accOut = acc.geometry(grade)
         let pf = opts.fit(accOut.w, accOut.h)
-        guard let img = accOut.scaled(pf.0, pf.1).cgImage(), let jpg = ShootStore.jpeg(img) else { return "Не удалось собрать фото" }
+        var photo = accOut.scaled(pf.0, pf.1)
+        if opts.mark != 0 { photo.stamp(markText(nightIdx.isEmpty ? urls.first : urls[nightIdx[nightIdx.count / 2]])) }
+        guard let img = photo.cgImage(), let jpg = ShootStore.jpeg(img) else { return "Не удалось собрать фото" }
         // Копия рядом с исходниками, на случай если в Фото нет доступа
         try? jpg.write(to: shoot.dir.appendingPathComponent("startrail.jpg"))
         if !toPhotos { return keepInApp(shoot.dir.appendingPathComponent("startrail.jpg"), move: false) }
@@ -1176,8 +1292,10 @@ final class Renderer: ObservableObject {
         var flat = [UInt16](repeating: 0, count: n * 3)
         let pick = night.map { urls[$0] }
         var used = 0
+        let auto = autoLUTs(urls, nm)
         let done = eachFrame(pick, w, h) { raw, k in
             var cur = raw
+            if let a = auto { cur.applyLUTs(a) }
             cur.apply(grade)
             let t = Float(night[k] - ref)
             sky_.withUnsafeMutableBufferPointer { sb in
@@ -1259,7 +1377,9 @@ final class Renderer: ObservableObject {
         }
         let deepOut = out.geometry(grade)
         let df = opts.fit(deepOut.w, deepOut.h)
-        guard let img = deepOut.scaled(df.0, df.1).cgImage(), let jpg = ShootStore.jpeg(img) else { return "Не удалось собрать фото" }
+        var photo = deepOut.scaled(df.0, df.1)
+        if opts.mark != 0 { photo.stamp(markText(urls[ref])) }
+        guard let img = photo.cgImage(), let jpg = ShootStore.jpeg(img) else { return "Не удалось собрать фото" }
         try? jpg.write(to: shoot.dir.appendingPathComponent("stars_deep.jpg"))
         if !toPhotos { return keepInApp(shoot.dir.appendingPathComponent("stars_deep.jpg"), move: false) }
         let sem = DispatchSemaphore(value: 0)
@@ -1326,11 +1446,13 @@ final class Renderer: ObservableObject {
             let sample = stride(from: 0, to: nightIdx.count, by: max(1, nightIdx.count / 12)).map { urls[nightIdx[$0]] }
             mask = SkyMask.build(sample, w: w, h: h)
         }
+        let auto = autoLUTs(urls, nm)
         let done = eachFrame(urls, w, h) { raw, i in
             if writer.status == .failed { return }   // запись уже сломалась - не тратим время
             if ex.contains(i + 1) { return }
             var cur = raw
             if let k = flick[i + 1] { cur.scale(k) }
+            if let a = auto { cur.applyLUTs(a) }
             cur.apply(grade)
             if denoise { dn.apply(&cur) }
             let night = nm.isEmpty ? cur.meanLuma() < 170 : (nm[i + 1] ?? true)
@@ -1362,7 +1484,9 @@ final class Renderer: ObservableObject {
                 CVPixelBufferCreate(nil, ow, oh, kCVPixelFormatType_32BGRA, nil, &pbo)
             }
             guard let pb = pbo else { return }
-            (src.w == ow && src.h == oh ? src : src.scaled(ow, oh)).copy(to: pb)
+            var outF = src.w == ow && src.h == oh ? src : src.scaled(ow, oh)
+            if opts.mark != 0 && !reel { outF.stamp(markText(urls[i])) }
+            outF.copy(to: pb)
             var tries = 0
             while !input.isReadyForMoreMediaData && tries < 500 {
                 usleep(10_000)
@@ -1586,8 +1710,12 @@ struct ShootEditor: View {
     @State private var clipIdx = 0
     private let ticker = Timer.publish(every: 1.0 / 15, on: .main, in: .common).autoconnect()
     @State private var exportOpts = ExportOpts()
+    /// Размер исходных кадров - для подсказки, сколько займёт файл
+    @State private var srcSize = (3840, 2160)
     /// Съёмка, начатая вскоре после этой (до 12 часов), - кандидат на склейку
     @State private var nextShoot: Shoot?
+    /// Если эта съёмка сама продолжила оборванную - та, оборванная
+    @State private var prevShoot: Shoot?
     /// Что собирать на самом деле: с «3 в 1» любое видео превращается в вертикальное из трёх полос
     private var eff: Look { stack3 && look.isVideo ? .reel : look }
     @State private var trail: Trail = .medium
@@ -1713,12 +1841,6 @@ struct ShootEditor: View {
                     }
                 }
 
-                if look.isVideo {
-                    Toggle("Убрать шум", isOn: $denoise)
-                        .disabled(r.busy)
-                    Toggle("Выровнять яркость (без мерцания)", isOn: $deflicker)
-                        .disabled(r.busy)
-                }
 
                 Button {
                     showFrames = true
@@ -1814,7 +1936,7 @@ struct ShootEditor: View {
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
                     .sheet(isPresented: $askExport) {
-                        ExportSheet(isVideo: eff.isVideo, opts: $exportOpts) {
+                        ExportSheet(isVideo: eff.isVideo, frames: shoot.frames, fps: shoot.fps, src: srcSize, opts: $exportOpts) {
                             askExport = false
                             r.run(shoot, eff, trail, denoise: denoise, grade: grade, deflicker: deflicker, opts: exportOpts)
                         }
@@ -1866,6 +1988,21 @@ struct ShootEditor: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
 
+                if let pv = prevShoot, !r.busy {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Склейка").font(.footnote).foregroundStyle(.secondary)
+                        Text("Эта съёмка продолжила оборванную. Их можно склеить в одну: пропущенные кадры дорисуются по движению звёзд")
+                            .font(.footnote).foregroundStyle(.secondary)
+                        Button {
+                            r.merge(pv, shoot) { ok in if ok { onDeleted() } }
+                        } label: {
+                            Label("Склеить с началом", systemImage: "link")
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
                 if let nx = nextShoot, !r.busy {
                     VStack(alignment: .leading, spacing: 6) {
                         Text("Склейка").font(.footnote).foregroundStyle(.secondary)
@@ -1897,7 +2034,15 @@ struct ShootEditor: View {
         .onAppear {
             excluded = FramePlan.excluded(shoot.dir)
             r.makePreview(shoot, eff, trail, grade)
+            if let u = ShootStore.frameURLs(shoot.dir).first, let src = CGImageSourceCreateWithURL(u as CFURL, nil),
+               let pr = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+               let pw = pr[kCGImagePropertyPixelWidth] as? Int, let ph = pr[kCGImagePropertyPixelHeight] as? Int {
+                srcSize = (pw, ph)
+            }
             let me = shoot
+            if let c = ShootStore.readInfo(shoot.dir)["continues"] as? String, !c.isEmpty {
+                prevShoot = ShootStore.list().first { $0.id == c }
+            }
             nextShoot = ShootStore.list()
                 .filter { $0.date > me.date && $0.date.timeIntervalSince(me.date) < 12 * 3600 && !$0.id.contains("склейка") }
                 .min { $0.date < $1.date }
@@ -2485,7 +2630,12 @@ struct FramePicker: View {
 /// Экспорт: готовый набор под площадку или свои настройки, и куда сохранить
 struct ExportSheet: View {
     let isVideo: Bool
+    var frames = 0
+    var fps = 30
+    var src = (3840, 2160)
     @Binding var opts: ExportOpts
+    @AppStorage("denoise") private var denoise = true
+    @AppStorage("deflicker") private var deflicker = true
     let onExport: () -> Void
     @State private var preset: ExportOpts.Preset? = .original
     private let pal = Pal(night: false)
@@ -2538,6 +2688,26 @@ struct ExportSheet: View {
                                 ForEach(ExportOpts.Quality.allCases) { Text($0.title).tag($0) }
                             }
                             .pickerStyle(.segmented)
+                            Text(sizeLine).font(.footnote).foregroundStyle(.secondary).monospacedDigit()
+                        }
+                        section("Чистота") {
+                            Toggle("Убрать шум", isOn: $denoise)
+                            Toggle("Без мерцания", isOn: $deflicker)
+                        }
+                    }
+                    section("Цвет") {
+                        Toggle("Авто-цвет", isOn: $opts.autoColor)
+                    }
+                    section("Подпись в углу") {
+                        Picker("Подпись", selection: $opts.mark) {
+                            Text("Нет").tag(0)
+                            Text("Дата и время").tag(1)
+                            Text("Свой текст").tag(2)
+                        }
+                        .pickerStyle(.segmented)
+                        if opts.mark == 2 {
+                            TextField("Например, @имя или место", text: $opts.markText)
+                                .textFieldStyle(.roundedBorder)
                         }
                     }
                     section("Куда") {
@@ -2561,6 +2731,17 @@ struct ExportSheet: View {
             .navigationTitle("Экспорт")
             .navigationBarTitleDisplayMode(.inline)
         }
+    }
+
+    /// Битрейт и примерный размер файла
+    private var sizeLine: String {
+        let mb = opts.mbps(src.0, src.1)
+        let rate = Double(opts.fps > 0 ? opts.fps : max(fps, 1))
+        let sec = Double(frames) / rate
+        let size = Double(mb) * sec / 8
+        let (ow, oh) = opts.fit(src.0, src.1)
+        let sizeText = size >= 1000 ? String(format: "%.1f ГБ", size / 1000) : String(format: "%.0f МБ", max(size, 1))
+        return "\(ow)×\(oh) · \(mb) Мбит/с · видео \(String(format: "%.0f", sec)) с · около \(sizeText)"
     }
 
     /// Ручная правка снимает выбор готового набора
