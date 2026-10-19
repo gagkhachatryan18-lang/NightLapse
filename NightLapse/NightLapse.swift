@@ -18,6 +18,8 @@ struct NightLapseApp: App {
         AppMode(rawValue: UserDefaults.standard.string(forKey: "appMode") ?? "") ?? .night
     }()
 
+    init() { Trace.start() }
+
     var body: some Scene {
         WindowGroup {
             Group {
@@ -2439,6 +2441,7 @@ struct ContentView: View {
             nightSheet(SettingsSheet(e: e))
                 .presentationDetents([.medium, .large])
         }
+        .traceScreen("Камера")
     }
 
     /// Шторки ночью тоже в красном: всё окрашивается красным, фон - чёрный
@@ -3273,7 +3276,7 @@ struct SettingsSheet: View {
                 } header: {
                     Text("Отчёт для улучшения")
                 } footer: {
-                    Text("Приложение ведёт журнал: настройки, яркость, ISO, нагрев, ошибки по каждому кадру. Само ничего не отправляет. Собери отчёт и пришли файл в чат с Claude")
+                    Text("Приложение само записывает нажатия, экраны, подвисания, вылеты, настройки и данные по каждому кадру. Самопроверка показывает проблемы за сутки. Ничего не отправляется. Собери отчёт и пришли файл в чат с Claude")
                 }
 
                 Section {
@@ -3302,6 +3305,7 @@ struct SettingsSheet: View {
                 }
             }
         }
+        .traceScreen("Настройки")
     }
 }
 
