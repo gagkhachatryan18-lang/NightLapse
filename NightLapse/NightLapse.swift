@@ -2305,11 +2305,6 @@ struct ContentView: View {
             .disabled(!idle)
             .accessibilityLabel(focusLabel)
             .confirmationDialog("Фокус", isPresented: $showFocusMenu, titleVisibility: .visible) {
-                if e.isDark {
-                    Button("По звёздам") { e.starFocus() }
-                } else {
-                    Button("Вдаль") { e.focusInfinity() }
-                }
                 Button("Вручную") {
                     withAnimation(.easeOut(duration: 0.15)) { openParam = .focus }
                 }
@@ -2607,7 +2602,7 @@ struct ContentView: View {
     /// Подпись кнопки резкости: одно-два слова
     private var focusLabel: String {
         if e.starFocused { return "Фокус ✓" }
-        if e.needsStarFocus { return "Фокус: сам" }
+        if e.needsStarFocus { return "Фокус: авто" }
         if e.focusAuto { return "Фокус: авто" }
         return e.focus >= 0.99 ? "Фокус: вдаль" : "Фокус: вручную"
     }
