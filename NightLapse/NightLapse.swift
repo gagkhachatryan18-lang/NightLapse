@@ -346,6 +346,9 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         applyCamera(forceFocus: true)
     }
 
+    /// Таймер после нажатия «Тест», «Старт» и ∞: 3 с для крепкого штатива, 10 с для лёгкого
+    @Published var startHold: Int = 3 { didSet { UserDefaults.standard.set(startHold, forKey: "startHold") } }
+
     /// Резкость по звёздам найдена для текущего объектива (запоминается между запусками)
     @Published var starFocused = false { didSet { UserDefaults.standard.set(starFocused, forKey: "starFocused") } }
     @Published var isDark = false
@@ -365,6 +368,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         guard phase == .idle else { return }
         phase = .test
         status = "Не трогай телефон, ищу резкость по звёздам..."
+        let hold = startHold
         subTotal = 23
         subDone = 0
         UIApplication.shared.isIdleTimerDisabled = true
@@ -384,7 +388,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
                 dev.unlockForConfiguration()
             }
             self.setLens(self.focusPlan[0])
-            self.holdUntil = CACurrentMediaTime() + 3
+            self.holdUntil = CACurrentMediaTime() + Double(hold)
             self.mode = .focus
         }
     }
@@ -579,6 +583,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         autoShutter = true
         wbAuto = d.flag("wbAuto", false)
         starFocused = d.flag("starFocused", false)
+        startHold = d.num("startHold", 3)
         focusAuto = false
         evComp = d.dbl("ev", -1)
         scene = LapseScene(rawValue: d.string(forKey: "scene") ?? "")?.rawValue ?? LapseScene.stars.rawValue
@@ -686,6 +691,23 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     private var rotObs: [NSKeyValueObservation] = []
     private weak var previewLayer: AVCaptureVideoPreviewLayer?
 
+    /// queue: увеличение выбранного объектива без лупы
+    private var baseCrop: CGFloat = 1
+
+    /// Лупа для ручного фокуса: середина кадра крупно в 4 раза, чтобы видеть, точки звёзды или кружки
+    func setLoupe(_ on: Bool) {
+        queue.async {
+            guard let dev = self.device else { return }
+            applyCrop(on ? self.baseCrop * 4 : self.baseCrop, to: dev)
+        }
+    }
+
+    /// main. Экран погашен - картинку камеры на экран не выводим: меньше работы, меньше расход батареи.
+    /// Съёмка от этого не зависит, кадры идут отдельно
+    func setPreview(_ on: Bool) {
+        previewLayer?.connection?.isEnabled = on
+    }
+
     func attachPreview(_ layer: AVCaptureVideoPreviewLayer) {
         previewLayer = layer
         rebuildCoordinator()
@@ -771,7 +793,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         phase = .test
         subTotal = c.subNeeded
         subDone = 0
-        status = "Не трогай телефон 3 с..."
+        status = "Не трогай телефон \(startHold) с..."
+        let hold = startHold
         UIApplication.shared.isIdleTimerDisabled = true
         let s = currentSettings()
         let ff = focusAuto
@@ -787,7 +810,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             self.calibSkip = 0
             self.setAutoGain(1)
             self.setFrameTarget(c.exposure)
-            self.holdUntil = CACurrentMediaTime() + 3
+            self.holdUntil = CACurrentMediaTime() + Double(hold)
             self.mode = .test
             self.beginCaptureExposure(s, forceFocus: ff)
         }
@@ -823,7 +846,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         recStart = now
         autoStopAt = autoStopMin > 0 ? now.addingTimeInterval(Double(autoStopMin) * 60) : nil
         phase = .recording
-        status = "Не трогай телефон 3 с..."
+        status = "Не трогай телефон \(startHold) с..."
+        let hold = startHold
         LiveStatus.shared.start(mode: sceneKind.title, battery: battery)
         UIApplication.shared.isIdleTimerDisabled = true
         let s = currentSettings()
@@ -850,7 +874,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             self.liveCur = nil
             self.liveIndex = 0
             self.recStartQ = Date()
-            self.holdUntil = CACurrentMediaTime() + 3
+            self.holdUntil = CACurrentMediaTime() + Double(hold)
             self.mode = .record
             self.beginCaptureExposure(s, forceFocus: ff)
         }
@@ -1112,6 +1136,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         }
 
         applyCrop(zoom.crop, to: dev)
+        baseCrop = zoom.crop
         let fmt = dev.activeFormat
         let sub = CMTimeGetSeconds(fmt.maxExposureDuration)
         let subMin = CMTimeGetSeconds(fmt.minExposureDuration)
@@ -1956,6 +1981,8 @@ struct ContentView: View {
     var onSwitch: () -> Void = {}
     @StateObject private var e = LapseEngine()
     @State private var dark = false
+    /// Экономия батареи: через 30 с после старта экран сам гаснет
+    @AppStorage("autoDark") private var autoDark = true
     @State private var showTest = false
     @State private var showSettings = false
     @State private var focusMark: CGPoint?
@@ -1965,7 +1992,7 @@ struct ContentView: View {
     @AppStorage("guideSeen") private var guideSeen = false
     @State private var shootToOpen: URL?
 
-    enum Param { case brightness, interval, duration }
+    enum Param { case brightness, interval, duration, focus }
 
     private var idle: Bool { e.phase == .idle }
     private var shooting: Bool {
@@ -2012,7 +2039,24 @@ struct ContentView: View {
         }
         .onChange(of: e.wbAuto) { e.applyCamera() }
         .onChange(of: e.evComp) { e.applyCamera() }
-        .onChange(of: e.phase) { if e.phase != .idle { openParam = nil } }
+        .onChange(of: e.phase) {
+            if e.phase != .idle { openParam = nil }
+            if e.phase == .recording && autoDark {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 30) {
+                    if e.phase == .recording { dark = true }
+                }
+            }
+        }
+        .onChange(of: dark) { e.setPreview(!dark) }
+        .onChange(of: openParam) { e.setLoupe(openParam == .focus) }
+        .onChange(of: e.focus) {
+            // Ручной фокус: линза сразу едет в новое положение, найденное руками тоже считается найденным
+            if openParam == .focus {
+                e.focusAuto = false
+                e.starFocused = true
+                e.applyCamera()
+            }
+        }
         .onChange(of: e.lastShoot) {
             if let d = e.lastShoot {
                 shootToOpen = d
@@ -2045,8 +2089,13 @@ struct ContentView: View {
                         : (e.sceneKind == .stars && e.isDark ? Color.red : (e.focus >= 0.99 ? Color.yellow : Color.white)))
                     .background(Color.white.opacity(0.12), in: Circle())
             }
+            .simultaneousGesture(LongPressGesture(minimumDuration: 0.5).onEnded { _ in
+                // Долгое нажатие на ∞ - ручной фокус с лупой
+                guard idle else { return }
+                withAnimation(.easeOut(duration: 0.15)) { openParam = .focus }
+            })
             .disabled(!idle)
-            .accessibilityLabel("Фокус на бесконечность")
+            .accessibilityLabel("Фокус на бесконечность. Долгое нажатие - ручной фокус")
             roundIcon("moon.fill") { dark = true }
             roundIcon("gearshape.fill") { showSettings = true }
                 .disabled(!idle)
@@ -2280,8 +2329,12 @@ struct ContentView: View {
         if e.freeGB > 0 && gb > e.freeGB * 0.9 {
             return "Памяти может не хватить: нужно около \(Int(gb.rounded())) ГБ"
         }
-        if e.battery >= 0 && e.battery < 40 && hours > 2 {
+        let charging = UIDevice.current.batteryState == .charging || UIDevice.current.batteryState == .full
+        if e.battery >= 0 && e.battery < 40 && hours > 2 && !charging {
             return "Батарея \(e.battery)%: на долгую съёмку подключи питание"
+        }
+        if e.battery >= 0 && e.battery < 80 && hours >= 4 && !charging && !ProcessInfo.processInfo.isLowPowerModeEnabled {
+            return "На всю ночь подключи пауэрбанк или включи Энергосбережение в Пункте управления"
         }
         return nil
     }
@@ -2336,6 +2389,17 @@ struct ContentView: View {
                     .font(.caption2)
                     .foregroundStyle(Color.white.opacity(0.6))
                     .multilineTextAlignment(.center)
+            case .focus:
+                HStack(spacing: 10) {
+                    stepButton("minus") { nudgeFocus(-0.005) }
+                    Slider(value: $e.focus, in: 0.4...1)
+                        .tint(.yellow)
+                    stepButton("plus") { nudgeFocus(0.005) }
+                }
+                Text("Фокус \(String(format: "%.3f", e.focus)). Лупа: середина кадра в 4 раза крупнее - добейся, чтобы звёзды стали самыми мелкими точками")
+                    .font(.caption2)
+                    .foregroundStyle(Color.white.opacity(0.6))
+                    .multilineTextAlignment(.center)
             case .duration:
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 6) {
@@ -2357,6 +2421,10 @@ struct ContentView: View {
         }
         .padding(.horizontal, 16)
         .transition(.opacity)
+    }
+
+    private func nudgeFocus(_ d: Float) {
+        e.focus = min(max(e.focus + d, 0.4), 1)
     }
 
     private func stepButton(_ icon: String, _ action: @escaping () -> Void) -> some View {
@@ -2541,7 +2609,7 @@ struct GuideView: View {
         Page(icon: "hand.draw", title: "Листай режимы",
              text: "Проведи пальцем по кадру влево или вправо - режим сменится, как в Камере: Кадр дня, Найтлапс, Таймлапс"),
         Page(icon: "viewfinder", title: "Фокус и яркость",
-             text: "Коснись кадра - фокус и яркость в этой точке. Веди пальцем вверх или вниз - ярче или темнее. ∞ сверху - ночью сам наводит резкость по звёздам, около 30 секунд"),
+             text: "Коснись кадра - фокус и яркость в этой точке. Веди пальцем вверх или вниз - ярче или темнее. ∞ сверху - ночью сам наводит резкость по звёздам, около 30 секунд. Долгое нажатие на ∞ - ручной фокус с лупой"),
         Page(icon: "timer", title: "Как часто и сколько",
              text: "Внизу три кнопки: ☀︎ яркость, ⏱ как часто снимать, ⌛ сколько снимать. Выдержку приложение подбирает само под режим и свет"),
         Page(icon: "record.circle", title: "Старт и результат",
@@ -2649,6 +2717,7 @@ struct SettingsSheet: View {
     @ObservedObject var e: LapseEngine
     @Environment(\.dismiss) private var dismiss
     @AppStorage("guideSeen") private var guideSeen = false
+    @AppStorage("autoDark") private var autoDark = true
 
     var body: some View {
         NavigationStack {
@@ -2700,6 +2769,11 @@ struct SettingsSheet: View {
                         Text("1 ч").tag(60)
                     }
                     Toggle("Длиннее пауза при перегреве", isOn: $e.coolBreaks)
+                    Toggle("Гасить экран через 30 с после старта", isOn: $autoDark)
+                    Picker("Таймер перед кадрами", selection: $e.startHold) {
+                        Text("3 с - крепкий штатив").tag(3)
+                        Text("10 с - лёгкий штатив, ветер").tag(10)
+                    }
                 } header: {
                     Text("Съёмка")
                 } footer: {
