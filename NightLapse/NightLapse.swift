@@ -242,7 +242,13 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     @Published var vertical: Bool { didSet { ud.set(vertical, forKey: "vertical") } }
     @Published var saveVideo: Bool { didSet { ud.set(saveVideo, forKey: "saveVideo") } }
     @Published var saveFrames: Bool { didSet { ud.set(saveFrames, forKey: "saveFrames") } }
-    @Published var zoom: Double { didSet { ud.set(zoom, forKey: "zoom") } }
+    @Published var zoom: Double {
+        didSet {
+            ud.set(zoom, forKey: "zoom")
+            // У другого объектива своя резкость - ∞ по звёздам надо найти заново
+            if oldValue != zoom { starFocused = false }
+        }
+    }
     @Published var uhd: Bool { didSet { ud.set(uhd, forKey: "uhd") } }
     @Published var startDelayMin: Int { didSet { ud.set(startDelayMin, forKey: "delay") } }
     @Published var autoStopMin: Int { didSet { ud.set(autoStopMin, forKey: "autostop") } }
@@ -340,7 +346,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         applyCamera(forceFocus: true)
     }
 
-    @Published var starFocused = false
+    /// Резкость по звёздам найдена для текущего объектива (запоминается между запусками)
+    @Published var starFocused = false { didSet { UserDefaults.standard.set(starFocused, forKey: "starFocused") } }
     @Published var isDark = false
 
     // queue: поиск резкости по звёздам
@@ -571,6 +578,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         isoAuto = true
         autoShutter = true
         wbAuto = d.flag("wbAuto", false)
+        starFocused = d.flag("starFocused", false)
         focusAuto = false
         evComp = d.dbl("ev", -1)
         scene = LapseScene(rawValue: d.string(forKey: "scene") ?? "")?.rawValue ?? LapseScene.stars.rawValue
@@ -816,6 +824,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         autoStopAt = autoStopMin > 0 ? now.addingTimeInterval(Double(autoStopMin) * 60) : nil
         phase = .recording
         status = "Не трогай телефон 3 с..."
+        LiveStatus.shared.start(mode: sceneKind.title, battery: battery)
         UIApplication.shared.isIdleTimerDisabled = true
         let s = currentSettings()
         let ff = focusAuto
@@ -921,6 +930,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         Diag.event(why)
         phase = .paused
         status = why
+        LiveStatus.shared.update(state: "paused", note: why)
         pauses += 1
         subDone = 0
         queue.async {
@@ -934,6 +944,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     private func tryResume() {
         guard phase == .paused, !inBackground, !session.isInterrupted else { return }
         Diag.event("Съёмка продолжена")
+        LiveStatus.shared.update(state: "rec", note: "")
         phase = .recording
         status = isoAuto ? "Продолжаю: подбор ISO..." : "Съёмка продолжена"
         subDone = 0
@@ -954,6 +965,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     private func finished(_ msg: String) {
         phase = .idle
         status = msg
+        LiveStatus.shared.end(note: msg)
         recStart = nil
         autoStopAt = nil
         startAt = nil
@@ -1681,6 +1693,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         DispatchQueue.main.async {
             self.framesDone = c
             if let t = thumb { self.lastImage = t }
+            LiveStatus.shared.update(frames: c, battery: self.battery, hot: self.hot, state: "rec", note: "")
         }
     }
 
@@ -2028,7 +2041,8 @@ struct ContentView: View {
                 Text("∞")
                     .font(.system(size: 20, weight: .semibold))
                     .frame(width: 36, height: 36)
-                    .foregroundStyle(e.focus >= 0.99 || e.starFocused ? Color.yellow : Color.white)
+                    .foregroundStyle(e.starFocused ? Color.yellow
+                        : (e.sceneKind == .stars && e.isDark ? Color.red : (e.focus >= 0.99 ? Color.yellow : Color.white)))
                     .background(Color.white.opacity(0.12), in: Circle())
             }
             .disabled(!idle)
@@ -2202,6 +2216,12 @@ struct ContentView: View {
             if idle {
                 if let p = openParam { paramEditor(p) }
                 paramRow
+                if let w = firstWarning {
+                    Text(w)
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(Color.red)
+                        .multilineTextAlignment(.center)
+                }
                 Text(planLine)
                     .font(.caption2)
                     .foregroundStyle(Color.white.opacity(0.6))
@@ -2219,13 +2239,61 @@ struct ContentView: View {
 
     private var paramRow: some View {
         HStack(spacing: 8) {
-            paramChip(.brightness, "sun.max.fill", String(format: "%+.1f", e.evComp))
-            paramChip(.interval, "timer", expText(e.intervalSeconds))
-            paramChip(.duration, "hourglass", e.autoStopMin == 0 ? "∞" : durText(Double(e.autoStopMin) * 60))
+            paramChip(.brightness, "sun.max.fill", String(format: "%+.1f", e.evComp), warn: evWarn != nil)
+            paramChip(.interval, "timer", expText(e.intervalSeconds), warn: intervalWarn != nil)
+            paramChip(.duration, "hourglass", e.autoStopMin == 0 ? "∞" : durText(Double(e.autoStopMin) * 60), warn: durationWarn != nil)
         }
     }
 
-    private func paramChip(_ p: Param, _ icon: String, _ value: String) -> some View {
+    // MARK: Подсказки: значение краснеет, если по опыту прошлых съёмок выйдет плохо. Снимать всё равно можно
+
+    /// Ночь: режим Найтлапс или темно по превью
+    private var nightish: Bool { e.sceneKind == .stars || e.isDark }
+
+    private var evWarn: String? {
+        if nightish {
+            if e.evComp < -2.05 { return "☀︎ слишком низко: ночью кадр выйдет почти чёрным. Лучше от -2 до +0.5" }
+            if e.evComp > 0.55 { return "☀︎ слишком высоко: ночью будет много шума. Лучше от -2 до +0.5" }
+        } else if e.evComp < -2.55 || e.evComp > 1.55 {
+            return "☀︎ далеко от нормы: днём лучше от -2.5 до +1.5"
+        }
+        return nil
+    }
+
+    private var intervalWarn: String? {
+        if e.sceneKind == .stars {
+            if e.intervalSeconds > 30.5 {
+                return "Редкие кадры: видео выйдет коротким и рывками, следы - с разрывами"
+            }
+            if e.intervalSeconds < e.starLimit - 0.5 {
+                return "Кадр короче \(Int(e.starLimit)) с: ночью будет больше шума"
+            }
+        } else if e.intervalSeconds > 60.5 {
+            return "Редкие кадры: облака будут прыгать, а не плыть"
+        }
+        return nil
+    }
+
+    private var durationWarn: String? {
+        let hours = e.autoStopMin == 0 ? 8.0 : Double(e.autoStopMin) / 60
+        let gb = hours * 3600 / max(e.intervalSeconds, 1) * 0.0025
+        if e.freeGB > 0 && gb > e.freeGB * 0.9 {
+            return "Памяти может не хватить: нужно около \(Int(gb.rounded())) ГБ"
+        }
+        if e.battery >= 0 && e.battery < 40 && hours > 2 {
+            return "Батарея \(e.battery)%: на долгую съёмку подключи питание"
+        }
+        return nil
+    }
+
+    private var focusWarn: String? {
+        guard e.sceneKind == .stars, e.isDark, !e.starFocused else { return nil }
+        return "Нажми ∞: фокус по звёздам ещё не найден"
+    }
+
+    private var firstWarning: String? { focusWarn ?? evWarn ?? intervalWarn ?? durationWarn }
+
+    private func paramChip(_ p: Param, _ icon: String, _ value: String, warn: Bool = false) -> some View {
         let on = openParam == p
         return Button {
             withAnimation(.easeOut(duration: 0.15)) { openParam = on ? nil : p }
@@ -2235,7 +2303,7 @@ struct ContentView: View {
                 Text(value).monospacedDigit()
             }
             .font(.footnote.weight(.semibold))
-            .foregroundStyle(on ? Color.black : Color.white)
+            .foregroundStyle(on ? Color.black : (warn ? Color.red : Color.white))
             .padding(.horizontal, 12)
             .padding(.vertical, 7)
             .background(on ? Color.yellow : Color.white.opacity(0.14), in: Capsule())
