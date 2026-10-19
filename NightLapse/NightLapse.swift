@@ -2355,6 +2355,8 @@ struct ContentView: View {
     @StateObject private var pole = PoleFinder()
     @State private var markTick = 0
     @State private var openParam: Param?
+    /// Шторка с настройками съёмки, как панель в Камере: по касанию на сводку сверху
+    @State private var panel = false
     @State private var showShoots = false
     @AppStorage("guideSeen") private var guideSeen = false
     @State private var shootToOpen: URL?
@@ -2412,7 +2414,7 @@ struct ContentView: View {
         .onChange(of: e.wbAuto) { e.applyCamera() }
         .onChange(of: e.evComp) { e.applyCamera() }
         .onChange(of: e.phase) {
-            if e.phase != .idle { openParam = nil }
+            if e.phase != .idle { openParam = nil; panel = false }
             if e.phase == .recording && autoDark {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 30) {
                     if e.phase == .recording { dark = true }
@@ -2462,41 +2464,57 @@ struct ContentView: View {
             Spacer(minLength: 0)
             if shooting { recTimer }
             Spacer(minLength: 0)
-            // Резкость простыми словами: ночью найдётся сама при «Тест» или «Старт», здесь - по желанию
-            Button { showFocusMenu = true } label: {
-                HStack(spacing: 5) {
-                    Image(systemName: "viewfinder")
-                    Text(focusLabel)
-                }
-                .font(.system(size: 13, weight: .semibold))
-                .padding(.horizontal, 11)
-                .frame(height: 34)
-                .foregroundStyle(e.starFocused ? t.accent : t.text)
-                .background(e.starFocused ? t.accent.opacity(0.18) : t.fill, in: Capsule())
-            }
-            .disabled(!idle)
-            .opacity(shooting ? 0 : 1)
-            .accessibilityLabel(focusLabel)
-            .confirmationDialog("Фокус", isPresented: $showFocusMenu, titleVisibility: .visible) {
-                Button("Вручную") {
-                    withAnimation(.easeOut(duration: 0.15)) { openParam = .focus }
-                }
-                Button("Авто") {
-                    // Ручная настройка закрывается, увеличение плавно уходит назад
-                    withAnimation(.easeOut(duration: 0.2)) { if openParam == .focus { openParam = nil } }
-                    e.resetFocusAuto()
-                }
-                Button("Отмена", role: .cancel) {}
-            }
-            roundIcon("moon") { dark = true }
-                .accessibilityLabel("Погасить экран")
-            if !shooting {
-                roundIcon("gearshape") { showSettings = true }
-                    .accessibilityLabel("Настройки")
-                    .disabled(!idle)
+            if shooting {
+                roundIcon("moon") { dark = true }
+                    .accessibilityLabel("Погасить экран")
+            } else {
+                summaryPill
             }
         }
         .padding(.top, 4)
+        .confirmationDialog("Фокус", isPresented: $showFocusMenu, titleVisibility: .visible) {
+            Button("Вручную") {
+                withAnimation(.easeOut(duration: 0.15)) { openParam = .focus }
+            }
+            Button("Авто") {
+                // Ручная настройка закрывается, увеличение плавно уходит назад
+                withAnimation(.easeOut(duration: 0.2)) { if openParam == .focus { openParam = nil } }
+                e.resetFocusAuto()
+            }
+            Button("Отмена", role: .cancel) {}
+        }
+    }
+
+    /// Сводка сверху: интервал, яркость, длительность. Касание - шторка с настройками. Точка - есть предупреждение
+    private var summaryPill: some View {
+        Button {
+            withAnimation(.spring(duration: 0.3)) {
+                panel.toggle()
+                if !panel { openParam = nil }
+            }
+        } label: {
+            HStack(spacing: 7) {
+                Text(summaryText).monospacedDigit()
+                Image(systemName: panel ? "xmark" : "ellipsis")
+            }
+            .font(.system(size: 13, weight: .semibold))
+            .padding(.horizontal, 12)
+            .frame(height: 34)
+            .foregroundStyle(panel ? t.accent : t.text)
+            .background(t.fill, in: Capsule())
+            .overlay(alignment: .topTrailing) {
+                if firstWarning != nil && !panel {
+                    Circle().fill(t.warn).frame(width: 9, height: 9).offset(x: 2, y: -2)
+                }
+            }
+        }
+        .disabled(!idle)
+        .accessibilityLabel("Настройки съёмки")
+    }
+
+    private var summaryText: String {
+        "\(expText(e.intervalSeconds)) · \(String(format: "%+.1f", e.evComp)) · "
+            + (e.autoStopMin == 0 ? "∞" : durText(Double(e.autoStopMin) * 60))
     }
 
     private func roundIcon(_ name: String, _ action: @escaping () -> Void) -> some View {
@@ -2546,6 +2564,11 @@ struct ContentView: View {
             CameraPreview(engine: e,
                           onTap: { dp, vp in
                               guard idle else { return }
+                              // Касание по кадру сначала закрывает шторку, как в Камере
+                              if panel {
+                                  withAnimation(.spring(duration: 0.3)) { panel = false; openParam = nil }
+                                  return
+                              }
                               e.focusAt(dp)
                               focusMark = vp
                               keepMark()
@@ -2579,7 +2602,7 @@ struct ContentView: View {
                 }
                 Spacer()
                 if idle {
-                    zoomRow
+                    if panel { controlPanel } else { zoomRow }
                 }
             }
             .padding(10)
@@ -2670,8 +2693,6 @@ struct ContentView: View {
     private var bottomControls: some View {
         VStack(spacing: 10) {
             if idle {
-                if let p = openParam { paramEditor(p) }
-                paramRow
                 if !focusHintSeen && e.needsStarFocus {
                     HStack(spacing: 8) {
                         Image(systemName: "viewfinder")
@@ -2686,16 +2707,6 @@ struct ContentView: View {
                     .background(t.accent.opacity(0.14), in: RoundedRectangle(cornerRadius: 10))
                     .padding(.horizontal, 16)
                 }
-                if let w = firstWarning {
-                    Text(w)
-                        .font(.footnote.weight(.semibold))
-                        .foregroundStyle(t.warn)
-                        .multilineTextAlignment(.center)
-                }
-                Text(planLine)
-                    .font(.footnote)
-                    .foregroundStyle(t.dim)
-                    .multilineTextAlignment(.center)
                 modeCarousel
             } else if e.phase == .recording || e.phase == .paused {
                 dashboard
@@ -2741,6 +2752,128 @@ struct ContentView: View {
                 .lineLimit(1).minimumScaleFactor(0.6)
         }
         .frame(maxWidth: .infinity)
+    }
+
+    // MARK: Шторка настроек
+
+    private var controlPanel: some View {
+        VStack(spacing: 12) {
+            if let p = openParam {
+                HStack {
+                    Button {
+                        withAnimation(.easeOut(duration: 0.2)) { openParam = nil }
+                    } label: {
+                        Image(systemName: "chevron.left")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(t.text)
+                            .frame(width: 40, height: 40)
+                            .background(t.fill, in: Circle())
+                    }
+                    .accessibilityLabel("Назад")
+                    Spacer()
+                    Text(paramTitle(p))
+                        .font(.footnote.weight(.semibold))
+                        .textCase(.uppercase)
+                        .foregroundStyle(t.dim)
+                    Spacer()
+                    Color.clear.frame(width: 40, height: 40)
+                }
+                paramEditor(p)
+                if let w = warning(for: p) { warnText(w) }
+            } else {
+                LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 3), spacing: 14) {
+                    paramCircle(.brightness, "sun.max", String(format: "%+.1f", e.evComp), warn: evWarn != nil)
+                    paramCircle(.interval, "timer", expText(e.intervalSeconds), warn: intervalWarn != nil)
+                    paramCircle(.duration, "hourglass",
+                                e.autoStopMin == 0 ? "Пока не остановлю" : durText(Double(e.autoStopMin) * 60),
+                                warn: durationWarn != nil)
+                    circleButton("viewfinder", "Фокус", focusShort, on: e.starFocused || openParam == .focus, warn: false) {
+                        showFocusMenu = true
+                    }
+                    circleButton("moon", "Погасить", "экран", on: false, warn: false) {
+                        panel = false
+                        dark = true
+                    }
+                    circleButton("gearshape", "Настройки", "", on: false, warn: false) {
+                        showSettings = true
+                    }
+                }
+                if let w = firstWarning { warnText(w) }
+                Text(planLine)
+                    .font(.caption)
+                    .foregroundStyle(t.dim)
+                    .multilineTextAlignment(.center)
+            }
+        }
+        .padding(14)
+        .background(RoundedRectangle(cornerRadius: 28).fill(t.night ? Color.black.opacity(0.88) : Color(white: 0.1).opacity(0.86)))
+        .overlay(RoundedRectangle(cornerRadius: 28).stroke(t.fill, lineWidth: 1))
+        .transition(.move(edge: .bottom).combined(with: .opacity))
+    }
+
+    private func paramTitle(_ p: Param) -> String {
+        switch p {
+        case .brightness: return "Яркость"
+        case .interval: return "Интервал"
+        case .duration: return "Длительность"
+        case .focus: return "Фокус вручную"
+        }
+    }
+
+    private func warning(for p: Param) -> String? {
+        switch p {
+        case .brightness: return evWarn
+        case .interval: return intervalWarn
+        case .duration: return durationWarn
+        case .focus: return nil
+        }
+    }
+
+    private func warnText(_ w: String) -> some View {
+        Text(w)
+            .font(.footnote.weight(.semibold))
+            .foregroundStyle(t.warn)
+            .multilineTextAlignment(.center)
+    }
+
+    private var focusShort: String {
+        if e.starFocused { return "наведён" }
+        if e.focusAuto || e.needsStarFocus { return "авто" }
+        return e.focus >= 0.99 ? "вдаль" : "вручную"
+    }
+
+    private func paramCircle(_ p: Param, _ icon: String, _ value: String, warn: Bool) -> some View {
+        circleButton(icon, paramTitle(p), value, on: false, warn: warn) {
+            withAnimation(.easeOut(duration: 0.2)) { openParam = p }
+        }
+    }
+
+    /// Круглая кнопка, как в шторке Камеры: значок, подпись, значение
+    private func circleButton(_ icon: String, _ title: String, _ value: String, on: Bool, warn: Bool,
+                              _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(spacing: 5) {
+                Image(systemName: icon)
+                    .font(.system(size: 20))
+                    .foregroundStyle(on ? t.accent : (warn ? t.warn : t.text))
+                    .frame(width: 56, height: 56)
+                    .background(t.fill, in: Circle())
+                    .overlay(Circle().stroke(warn ? t.warn.opacity(0.7) : Color.clear, lineWidth: 1.5))
+                Text(title)
+                    .font(.system(size: 11, weight: .semibold))
+                    .textCase(.uppercase)
+                    .foregroundStyle(t.text)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+                Text(value.isEmpty ? " " : value)
+                    .font(.system(size: 12).monospacedDigit())
+                    .foregroundStyle(warn ? t.warn : t.dim)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+            }
+            .frame(maxWidth: .infinity)
+        }
+        .accessibilityLabel(title)
     }
 
     private var paramRow: some View {
