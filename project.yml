@@ -52,3 +52,22 @@ targets:
         CFBundleVersion: "1"
         NSExtension:
           NSExtensionPointIdentifier: com.apple.widgetkit-extension
+  NightLapseWatch:
+    type: application
+    platform: watchOS
+    deploymentTarget: "10.0"
+    sources: [Watch]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.gagik.nightlapse.watchkitapp
+        SWIFT_VERSION: "5.0"
+        MARKETING_VERSION: "3.0"
+        CURRENT_PROJECT_VERSION: "1"
+    info:
+      path: Watch/Info.plist
+      properties:
+        CFBundleDisplayName: NightLapse
+        CFBundleShortVersionString: "3.0"
+        CFBundleVersion: "1"
+        WKApplication: true
+        WKCompanionAppBundleIdentifier: com.gagik.nightlapse
