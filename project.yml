@@ -26,6 +26,7 @@ targets:
         CFBundleVersion: "1"
         NSCameraUsageDescription: "Съёмка найтлапса и кадра дня"
         NSPhotoLibraryAddUsageDescription: "Сохранение видео и копий кадров в Фото"
+        NSLocationWhenInUseUsageDescription: "Широта нужна, чтобы показать, где Полярная звезда: на такой высоте над горизонтом она стоит"
         UILaunchScreen: {}
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
