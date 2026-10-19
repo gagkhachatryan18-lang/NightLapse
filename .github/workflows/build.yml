@@ -61,6 +61,10 @@ jobs:
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           grep -h "error:" build1.log 2>/dev/null | sort -u | head -40 >> "$GITHUB_STEP_SUMMARY" || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"
+          # Те же ошибки отметками (annotations): их видно через API, даже когда логи недоступны
+          grep -h "error:" build1.log 2>/dev/null | sort -u | head -40 | while IFS= read -r line; do
+            echo "::error::$line"
+          done || true
 
       - uses: actions/upload-artifact@v4
         if: always()
