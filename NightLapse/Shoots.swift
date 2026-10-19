@@ -267,12 +267,21 @@ struct Frame {
 struct Grade: Equatable {
     var temp: Float = 0
     var tint: Float = 0
-    var isNeutral: Bool { abs(temp) < 0.01 && abs(tint) < 0.01 }
+    /// Насыщенность и контраст: -1...1, 0 - как снято
+    var sat: Float = 0
+    var contrast: Float = 0
+    var isNeutral: Bool { abs(temp) < 0.01 && abs(tint) < 0.01 && abs(sat) < 0.01 && abs(contrast) < 0.01 }
 
-    /// Таблицы для синего, зелёного и красного
+    /// Таблицы для синего, зелёного и красного: цвет, потом контраст вокруг середины
     func luts() -> [[UInt8]] {
         let kb = 1 - 0.3 * temp, kr = 1 + 0.3 * temp, kg = 1 - 0.18 * tint
-        let mk: (Float) -> [UInt8] = { k in (0..<256).map { UInt8(min(255, max(0, (Float($0) * k).rounded()))) } }
+        let kc = 1 + 0.6 * contrast
+        let mk: (Float) -> [UInt8] = { k in
+            (0..<256).map { v in
+                let c = (Float(v) * k - 128) * kc + 128
+                return UInt8(min(255, max(0, c.rounded())))
+            }
+        }
         return [mk(kb), mk(kg), mk(kr)]
     }
 }
@@ -282,15 +291,101 @@ extension Frame {
         guard !g.isNeutral else { return }
         let t = g.luts()
         let n = px.count
+        let ks = Int((1 + g.sat) * 256)
+        let doSat = abs(g.sat) >= 0.01
         px.withUnsafeMutableBufferPointer { p in
             var i = 0
             while i + 2 < n {
-                p[i] = t[0][Int(p[i])]
-                p[i + 1] = t[1][Int(p[i + 1])]
-                p[i + 2] = t[2][Int(p[i + 2])]
+                var b = Int(t[0][Int(p[i])]), gg = Int(t[1][Int(p[i + 1])]), r = Int(t[2][Int(p[i + 2])])
+                if doSat {
+                    // Насыщенность: отдаляем цвет от серого той же яркости
+                    let y = (b * 29 + gg * 150 + r * 77) >> 8
+                    b = y + ((b - y) * ks) >> 8
+                    gg = y + ((gg - y) * ks) >> 8
+                    r = y + ((r - y) * ks) >> 8
+                }
+                p[i] = UInt8(min(255, max(0, b)))
+                p[i + 1] = UInt8(min(255, max(0, gg)))
+                p[i + 2] = UInt8(min(255, max(0, r)))
                 i += 4
             }
         }
+    }
+
+    /// Яркость в k раз (для выравнивания мерцания)
+    mutating func scale(_ k: Float) {
+        guard abs(k - 1) > 0.005 else { return }
+        let t = (0..<256).map { UInt8(min(255, max(0, (Float($0) * k).rounded()))) }
+        px.withUnsafeMutableBufferPointer { p in
+            var i = 0
+            while i + 2 < p.count {
+                p[i] = t[Int(p[i])]; p[i + 1] = t[Int(p[i + 1])]; p[i + 2] = t[Int(p[i + 2])]
+                i += 4
+            }
+        }
+    }
+}
+
+// MARK: - Какие кадры брать и как выровнять яркость
+
+/// Отбраковка и выравнивание по журналу съёмки (log.csv, яркость каждого кадра).
+/// Вспышка фонаря или фар - кадр заметно светлее соседей, перекрытый объектив - заметно темнее.
+/// Список исключённых кадров лежит в папке съёмки (excluded.json), его можно поправить руками в редакторе
+enum FramePlan {
+    static func lumas(_ dir: URL) -> [Int: Double] {
+        guard let text = try? String(contentsOf: dir.appendingPathComponent("log.csv"), encoding: .utf8) else { return [:] }
+        var m: [Int: Double] = [:]
+        for line in text.split(separator: "\n").dropFirst() {
+            let c = line.split(separator: ",")
+            guard c.count > 7, let f = Int(c[1]), let l = Double(c[7]) else { continue }
+            m[f] = l
+        }
+        return m
+    }
+
+    /// Кадры-выбросы по яркости: светлее соседей на 30% или темнее на 40%
+    static func autoExclude(_ dir: URL) -> Set<Int> {
+        let l = lumas(dir)
+        var out = Set<Int>()
+        for (f, v) in l {
+            let nb = (-3...3).filter { $0 != 0 }.compactMap { l[f + $0] }.sorted()
+            guard nb.count >= 3 else { continue }
+            let med = nb[nb.count / 2]
+            if v > med * 1.3 + 6 || v < med * 0.6 - 4 { out.insert(f) }
+        }
+        return out
+    }
+
+    private static func file(_ dir: URL) -> URL { dir.appendingPathComponent("excluded.json") }
+
+    /// Исключённые кадры. При первом открытии - найденные автоматически
+    static func excluded(_ dir: URL) -> Set<Int> {
+        if let d = try? Data(contentsOf: file(dir)),
+           let a = (try? JSONSerialization.jsonObject(with: d)) as? [Int] {
+            return Set(a)
+        }
+        let auto = autoExclude(dir)
+        save(dir, auto)
+        return auto
+    }
+
+    static func save(_ dir: URL, _ set: Set<Int>) {
+        if let d = try? JSONSerialization.data(withJSONObject: Array(set).sorted()) {
+            try? d.write(to: file(dir))
+        }
+    }
+
+    /// Во сколько раз поправить яркость каждого кадра, чтобы не мигало: к средней по 15 соседним кадрам
+    static func deflicker(_ dir: URL, _ ex: Set<Int>) -> [Int: Float] {
+        let l = lumas(dir).filter { !ex.contains($0.key) && $0.value > 1 }
+        var out: [Int: Float] = [:]
+        for (f, v) in l {
+            let nb = (-7...7).compactMap { l[f + $0] }
+            guard nb.count >= 5 else { continue }
+            let avg = nb.reduce(0, +) / Double(nb.count)
+            out[f] = Float(min(max(avg / v, 0.75), 1.33))
+        }
+        return out
     }
 }
 
@@ -338,7 +433,7 @@ final class Renderer: ObservableObject {
         previewToken += 1
         let token = previewToken
         previewBusy = true
-        let key = "\(shoot.id)|\(look.rawValue)|\(trail.rawValue)"
+        let key = "\(shoot.id)|\(look.rawValue)|\(trail.rawValue)|\(FramePlan.excluded(shoot.dir).count)"
         q.async {
             if key == self.baseKey, let b = self.base {
                 var img: CGImage? = b
@@ -361,15 +456,16 @@ final class Renderer: ObservableObject {
                 DispatchQueue.main.async { self.previewBusy = false }
                 return
             }
+            let ex = FramePlan.excluded(shoot.dir)
             let step = max(1, urls.count / 150)
-            let pick = stride(from: 0, to: urls.count, by: step).map { urls[$0] }
+            let pick = stride(from: 0, to: urls.count, by: step).filter { !ex.contains($0 + 1) }.map { urls[$0] }
             var img: CGImage?
             if look == .startrail, let ready = ShootStore.liveURL(shoot.dir, look, trail),
                FileManager.default.fileExists(atPath: ready.path) {
                 img = ShootStore.thumb(ready, maxPixel: 900)
             } else if look == .timelapse {
                 img = ShootStore.thumb(urls[urls.count / 2], maxPixel: 900)
-            } else if look == .reel, let first = ShootStore.thumb(pick[0], maxPixel: 900) {
+            } else if look == .reel, let p0 = pick.first, let first = ShootStore.thumb(p0, maxPixel: 900) {
                 var mid = Frame(w: first.width, h: first.height)
                 var accA = Frame(w: first.width, h: first.height)
                 var accB = Frame(w: first.width, h: first.height)
@@ -389,7 +485,7 @@ final class Renderer: ObservableObject {
                 r.drawPanel(accA, y0: 321, w: 540, h: 318)
                 r.drawPanel(accB, y0: 642, w: 540, h: 318)
                 img = r.cgImage()
-            } else if let first = ShootStore.thumb(pick[0], maxPixel: 900) {
+            } else if let p0 = pick.first, let first = ShootStore.thumb(p0, maxPixel: 900) {
                 var acc = Frame(w: first.width, h: first.height)
                 var cur = Frame(w: first.width, h: first.height)
                 let lut = decayLUT(look == .startrail ? 1 : pow(trail.decay, Float(step)))
@@ -420,7 +516,7 @@ final class Renderer: ObservableObject {
         }
     }
 
-    func run(_ shoot: Shoot, _ look: Look, _ trail: Trail, denoise: Bool, grade: Grade = Grade()) {
+    func run(_ shoot: Shoot, _ look: Look, _ trail: Trail, denoise: Bool, grade: Grade = Grade(), deflicker: Bool = true) {
         guard !busy else { return }
         busy = true
         cancelled = false
@@ -433,12 +529,13 @@ final class Renderer: ObservableObject {
             // Готовый Starlapse из съёмки - без шумодава, поэтому с «Убрать шум» собираем заново
             // Если между кадрами были паузы, готовые следы из съёмки пунктирные - собираем заново с дорисовкой
             if let ready = ShootStore.liveURL(shoot.dir, look, trail), FileManager.default.fileExists(atPath: ready.path),
-               !(denoise && look.isVideo), !GapFill.needed(shoot.dir), grade.isNeutral {
+               !(denoise && look.isVideo), !GapFill.needed(shoot.dir), grade.isNeutral,
+               !(deflicker && look.isVideo), FramePlan.excluded(shoot.dir).isEmpty {
                 r = self.saveReady(ready, isVideo: look.isVideo)
             } else if look == .startrail {
                 r = self.renderPhoto(shoot, grade)
             } else {
-                r = self.renderMovie(shoot, look, trail, denoise: denoise, grade: grade)
+                r = self.renderMovie(shoot, look, trail, denoise: denoise, grade: grade, deflicker: deflicker)
             }
             Diag.event("Редактор: \(look.title) \(look == .starlapse ? trail.title : "")\(denoise && look.isVideo ? " без шума" : "") для \(shoot.id), \(shoot.frames) кадров, "
                 + "\(Int(Date().timeIntervalSince(t0))) с: \(r)")
@@ -507,8 +604,10 @@ final class Renderer: ObservableObject {
         let lut = decayLUT(1)
         let nm = nightMap(shoot.dir)
         let gap = GapFill(shoot.dir)
+        let ex = FramePlan.excluded(shoot.dir)
         var used = 0
         let done = eachFrame(urls, first.width, first.height) { raw, i in
+            if ex.contains(i + 1) { return }
             // Номер кадра в журнале = номер файла frame_00001 → 1
             // Без журнала (старые съёмки) пересвеченный кадр рассвета узнаётся по яркости
             guard nm.isEmpty ? raw.meanLuma() < 170 : (nm[i + 1] ?? true) else { return }
@@ -537,7 +636,7 @@ final class Renderer: ObservableObject {
 
     /// Видео из кадров: таймлапс, Starlapse или рилс «3 в 1» (таймлапс, средний след, длинный след друг под другом).
     /// denoise - убрать шум, сглаживая каждую точку по соседним кадрам
-    private func renderMovie(_ shoot: Shoot, _ look: Look, _ trail: Trail, denoise: Bool, grade: Grade) -> String {
+    private func renderMovie(_ shoot: Shoot, _ look: Look, _ trail: Trail, denoise: Bool, grade: Grade, deflicker: Bool) -> String {
         let urls = ShootStore.frameURLs(shoot.dir)
         guard let first = urls.first.flatMap({ ShootStore.full($0) }) else { return "Нет кадров" }
         let w = first.width, h = first.height
@@ -576,8 +675,12 @@ final class Renderer: ObservableObject {
         var idx: Int64 = 0
         let nm = nightMap(shoot.dir)
         let gap = GapFill(shoot.dir)
+        let ex = FramePlan.excluded(shoot.dir)
+        let flick = deflicker ? FramePlan.deflicker(shoot.dir, ex) : [:]
         let done = eachFrame(urls, w, h) { raw, i in
+            if ex.contains(i + 1) { return }
             var cur = raw
+            if let k = flick[i + 1] { cur.scale(k) }
             cur.apply(grade)
             if denoise { dn.apply(&cur) }
             let night = nm.isEmpty ? cur.meanLuma() < 170 : (nm[i + 1] ?? true)
@@ -806,13 +909,17 @@ struct ShootEditor: View {
     @AppStorage("denoise") private var denoise = true
     @State private var confirmDelete = false
     @State private var grade = Grade()
+    @AppStorage("deflicker") private var deflicker = true
+    @State private var excluded: Set<Int> = []
+    @State private var showFrames = false
     @State private var reportURL: URL?
     @State private var reportBusy = false
 
     /// Собрано во время съёмки - сохранится мгновенно
     private var isReady: Bool {
         if denoise && look.isVideo { return false }
-        if !grade.isNeutral || GapFill.needed(shoot.dir) { return false }
+        if !grade.isNeutral || GapFill.needed(shoot.dir) || !excluded.isEmpty { return false }
+        if deflicker && look.isVideo { return false }
         guard let u = ShootStore.liveURL(shoot.dir, look, trail) else { return false }
         return FileManager.default.fileExists(atPath: u.path)
     }
@@ -850,7 +957,22 @@ struct ShootEditor: View {
                 if look.isVideo {
                     Toggle("Убрать шум", isOn: $denoise)
                         .disabled(r.busy)
+                    Toggle("Выровнять яркость (без мерцания)", isOn: $deflicker)
+                        .disabled(r.busy)
                 }
+
+                Button {
+                    showFrames = true
+                } label: {
+                    HStack {
+                        Label("Кадры", systemImage: "film.stack")
+                        Spacer()
+                        Text(excluded.isEmpty ? "все \(shoot.frames) в деле" : "исключено \(excluded.count) из \(shoot.frames)")
+                            .foregroundStyle(excluded.isEmpty ? Color.secondary : Color.orange)
+                    }
+                    .font(.footnote)
+                }
+                .disabled(r.busy)
 
                 VStack(spacing: 6) {
                     HStack {
@@ -869,6 +991,16 @@ struct ShootEditor: View {
                         Circle().fill(Color.green).frame(width: 14, height: 14)
                         Slider(value: $grade.tint, in: -1...1)
                         Circle().fill(Color.pink).frame(width: 14, height: 14)
+                    }
+                    HStack {
+                        Image(systemName: "circle.lefthalf.filled").foregroundStyle(.gray)
+                        Slider(value: $grade.sat, in: -1...1)
+                        Image(systemName: "paintpalette.fill").foregroundStyle(.purple)
+                    }
+                    HStack {
+                        Image(systemName: "circle.dotted").foregroundStyle(.gray)
+                        Slider(value: $grade.contrast, in: -1...1)
+                        Image(systemName: "circle.righthalf.filled").foregroundStyle(.white)
                     }
                 }
                 .disabled(r.busy)
@@ -889,7 +1021,7 @@ struct ShootEditor: View {
                     }
                 } else {
                     Button {
-                        r.run(shoot, look, trail, denoise: denoise, grade: grade)
+                        r.run(shoot, look, trail, denoise: denoise, grade: grade, deflicker: deflicker)
                     } label: {
                         Label(isReady ? "Сохранить в Фото (уже готово)" : "Собрать и сохранить в Фото", systemImage: "square.and.arrow.down")
                             .frame(maxWidth: .infinity)
@@ -949,7 +1081,16 @@ struct ShootEditor: View {
         .navigationBarTitleDisplayMode(.inline)
         .navigationBarBackButtonHidden(r.busy)
         .interactiveDismissDisabled(r.busy)
-        .onAppear { r.makePreview(shoot, look, trail, grade) }
+        .onAppear {
+            excluded = FramePlan.excluded(shoot.dir)
+            r.makePreview(shoot, look, trail, grade)
+        }
+        .sheet(isPresented: $showFrames, onDismiss: {
+            FramePlan.save(shoot.dir, excluded)
+            r.makePreview(shoot, look, trail, grade)
+        }) {
+            FramePicker(shoot: shoot, excluded: $excluded)
+        }
         .onChange(of: look) { r.makePreview(shoot, look, trail, grade) }
         .onChange(of: trail) { r.makePreview(shoot, look, trail, grade) }
         .onChange(of: grade) { r.makePreview(shoot, look, trail, grade) }
@@ -1290,6 +1431,98 @@ final class GapFill {
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+
+// MARK: - Выбор кадров
+
+/// Пролистать кадры съёмки и убрать испорченные: вспышка фонаря, фары, толчок штатива.
+/// Кадры с диска не удаляются - редактор их просто пропускает
+struct FramePicker: View {
+    let shoot: Shoot
+    @Binding var excluded: Set<Int>
+    @Environment(\.dismiss) private var dismiss
+    @State private var idx: Double = 1
+    @State private var img: UIImage?
+    @State private var urls: [URL] = []
+
+    private var n: Int { Int(idx.rounded()) }
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 14) {
+                ZStack {
+                    Color(white: 0.08)
+                    if let i = img { Image(uiImage: i).resizable().scaledToFit() }
+                    if excluded.contains(n) {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 54))
+                            .foregroundStyle(Color.red.opacity(0.85))
+                    }
+                }
+                .aspectRatio(16 / 9, contentMode: .fit)
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+
+                if urls.count > 1 {
+                    Slider(value: $idx, in: 1...Double(urls.count), step: 1)
+                }
+                HStack {
+                    Button { idx = max(1, idx - 1) } label: { Image(systemName: "chevron.left") }
+                    Spacer()
+                    Text("Кадр \(n) из \(urls.count)").monospacedDigit()
+                    Spacer()
+                    Button { idx = min(Double(urls.count), idx + 1) } label: { Image(systemName: "chevron.right") }
+                }
+                .font(.headline)
+
+                Toggle("Использовать этот кадр", isOn: Binding(
+                    get: { !excluded.contains(n) },
+                    set: { on in if on { excluded.remove(n) } else { excluded.insert(n) } }
+                ))
+
+                // Быстрый переход к исключённым кадрам
+                if !excluded.isEmpty {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 6) {
+                            ForEach(Array(excluded).sorted(), id: \.self) { f in
+                                Button("\(f)") { idx = Double(f) }
+                                    .buttonStyle(.bordered)
+                                    .tint(f == n ? .yellow : .orange)
+                            }
+                        }
+                    }
+                }
+
+                Text("Вспышки и тёмные кадры приложение находит само и сразу исключает. Здесь можно вернуть их или убрать другие: смазанные, с фарами, с человеком в кадре")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                HStack {
+                    Button("Вернуть все") { excluded = [] }
+                    Spacer()
+                    Button("Найти заново") { excluded = FramePlan.autoExclude(shoot.dir) }
+                }
+                .font(.footnote)
+                Spacer()
+            }
+            .padding()
+            .navigationTitle("Кадры")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) { Button("Готово") { dismiss() } }
+            }
+            .onAppear {
+                urls = ShootStore.frameURLs(shoot.dir)
+                if let f = excluded.min() { idx = Double(f) }
+            }
+            .task(id: n) {
+                guard n >= 1, n <= urls.count else { return }
+                let u = urls[n - 1]
+                let t = await Task.detached { ShootStore.thumb(u, maxPixel: 1000) }.value
+                img = t.map { UIImage(cgImage: $0) }
             }
         }
     }
