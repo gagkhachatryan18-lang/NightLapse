@@ -641,6 +641,7 @@ struct RootView: View {
                 cam.shutdown()
                 motion.stop()
             }
+            .traceScreen("Кадр дня")
     }
 }
 
@@ -1451,6 +1452,7 @@ struct ArchiveView: View {
         }
         .onChange(of: remind) { schedule() }
         .onChange(of: remindMin) { schedule() }
+        .traceScreen("Архив Кадра дня")
     }
 
     private var exportCard: some View {
