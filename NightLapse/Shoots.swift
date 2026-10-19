@@ -97,7 +97,7 @@ enum ShootStore {
         switch look {
         case .starlapse: return dir.appendingPathComponent("starlapse_\(trail.rawValue).mov")
         case .startrail: return dir.appendingPathComponent("startrail.jpg")
-        case .timelapse, .reel: return nil
+        case .timelapse, .reel, .deep: return nil
         }
     }
 
@@ -119,13 +119,14 @@ enum ShootStore {
 // MARK: - Что делаем из кадров
 
 enum Look: String, CaseIterable, Identifiable {
-    case starlapse, timelapse, startrail, reel
+    case starlapse, timelapse, startrail, deep, reel
     var id: String { rawValue }
     var title: String {
         switch self {
         case .starlapse: return "Starlapse"
         case .timelapse: return "Таймлапс"
-        case .startrail: return "Фото"
+        case .startrail: return "Следы"
+        case .deep: return "Звёзды"
         case .reel: return "Рилс 3в1"
         }
     }
@@ -134,10 +135,11 @@ enum Look: String, CaseIterable, Identifiable {
         case .starlapse: return "Видео, где за звёздами тянутся хвосты"
         case .timelapse: return "Обычное видео, звёзды точками"
         case .startrail: return "Одна фотография: все кадры наложены, звёзды рисуют круги"
+        case .deep: return "Одна фотография: кадры выровнены по звёздам и сложены. Звёзды точками, шума почти нет, видно больше слабых звёзд"
         case .reel: return "Вертикальное видео 1080×1920 для Instagram: сверху таймлапс, посередине средний след, снизу длинный"
         }
     }
-    var isVideo: Bool { self != .startrail }
+    var isVideo: Bool { self != .startrail && self != .deep }
 }
 
 enum Trail: String, CaseIterable, Identifiable {
@@ -463,7 +465,7 @@ final class Renderer: ObservableObject {
             if look == .startrail, let ready = ShootStore.liveURL(shoot.dir, look, trail),
                FileManager.default.fileExists(atPath: ready.path) {
                 img = ShootStore.thumb(ready, maxPixel: 900)
-            } else if look == .timelapse {
+            } else if look == .timelapse || look == .deep {
                 img = ShootStore.thumb(urls[urls.count / 2], maxPixel: 900)
             } else if look == .reel, let p0 = pick.first, let first = ShootStore.thumb(p0, maxPixel: 900) {
                 var mid = Frame(w: first.width, h: first.height)
@@ -521,7 +523,7 @@ final class Renderer: ObservableObject {
         busy = true
         cancelled = false
         progress = 0
-        message = look == .startrail ? "Накладываю кадры..." : "Собираю видео..."
+        message = look == .deep ? "Выравниваю кадры по звёздам..." : (look == .startrail ? "Накладываю кадры..." : "Собираю видео...")
         UIApplication.shared.isIdleTimerDisabled = true
         let t0 = Date()
         q.async {
@@ -534,6 +536,8 @@ final class Renderer: ObservableObject {
                 r = self.saveReady(ready, isVideo: look.isVideo)
             } else if look == .startrail {
                 r = self.renderPhoto(shoot, grade)
+            } else if look == .deep {
+                r = self.renderDeep(shoot, grade)
             } else {
                 r = self.renderMovie(shoot, look, trail, denoise: denoise, grade: grade, deflicker: deflicker)
             }
@@ -632,6 +636,162 @@ final class Renderer: ObservableObject {
         }
         sem.wait()
         return ok ? "Фото со следами сохранено в Фото" : "Нет доступа к Фото. Фото лежит в папке съёмки"
+    }
+
+    /// Фото «Звёзды»: до 40 ночных кадров из середины съёмки выравниваются по звёздам и усредняются.
+    /// Шум падает в несколько раз, звёзды остаются точками. Земля не движется - её берём из простого среднего,
+    /// а небо из выровненного; граница - по яркости (ночью земля темнее неба)
+    private func renderDeep(_ shoot: Shoot, _ grade: Grade) -> String {
+        let urls = ShootStore.frameURLs(shoot.dir)
+        guard let first = urls.first.flatMap({ ShootStore.full($0) }) else { return "Нет кадров" }
+        let w = first.width, h = first.height
+        let nm = nightMap(shoot.dir)
+        let ex = FramePlan.excluded(shoot.dir)
+        var night = (0..<urls.count).filter { !ex.contains($0 + 1) && (nm.isEmpty || (nm[$0 + 1] ?? true)) }
+        guard night.count >= 5 else { return "Мало ночных кадров: для фото «Звёзды» нужно хотя бы 5" }
+        // Середина ночной части съёмки, подряд
+        let take = min(40, night.count)
+        let mid = night.count / 2
+        let lo = max(0, min(night.count - take, mid - take / 2))
+        night = Array(night[lo..<(lo + take)])
+        let ref = night[night.count / 2]
+
+        // Сдвиг неба на один кадр: меряем между кадрами, отстоящими примерно на полторы минуты,
+        // иначе сдвиг слишком мал, чтобы его заметить
+        let interval = max(1, (ShootStore.readInfo(shoot.dir)["interval"] as? Double) ?? 8)
+        var step: [SIMD2<Float>]?
+        var gap = max(1, Int((90 / interval).rounded()))
+        while step == nil && gap >= 1 {
+            let a = night.first!, bIdx = a + gap
+            if bIdx < urls.count, let ia = ShootStore.full(urls[a]), let ib = ShootStore.full(urls[bIdx]),
+               ia.width == w, ib.width == w {
+                var fa = Frame(w: w, h: h), fb = Frame(w: w, h: h)
+                fa.draw(ia)
+                fb.draw(ib)
+                if let d = GapFill.skyShift(fa, fb) { step = d.map { $0 / Float(gap) } }
+            }
+            if step == nil { gap /= 2 }
+        }
+        guard let sh = step else {
+            return "Не нашёл звёзд, чтобы выровнять кадры. Нужна ясная ночь со звёздами в кадре"
+        }
+        let gx = GapFill.gx, gy = GapFill.gy
+
+        // Суммы ×4 в UInt16: 40 кадров × 1020 помещаются
+        let n = w * h
+        var sky = [UInt16](repeating: 0, count: n * 3)
+        var cnt = [UInt8](repeating: 0, count: n)
+        var flat = [UInt16](repeating: 0, count: n * 3)
+        let pick = night.map { urls[$0] }
+        var used = 0
+        let done = eachFrame(pick, w, h) { raw, k in
+            var cur = raw
+            cur.apply(grade)
+            let t = Float(night[k] - ref)
+            sky.withUnsafeMutableBufferPointer { sb in
+            cnt.withUnsafeMutableBufferPointer { cb in
+            flat.withUnsafeMutableBufferPointer { fb in
+            cur.px.withUnsafeBufferPointer { p in
+                DispatchQueue.concurrentPerform(iterations: 16) { part in
+                    let y0 = part * h / 16, y1 = (part + 1) * h / 16
+                    for y in y0..<y1 {
+                        // Сдвиг по частям кадра плавно: между центрами частей - по линии
+                        let fy = min(max(Float(y) * Float(gy) / Float(h) - 0.5, 0), Float(gy - 1))
+                        let ty0 = Int(fy), ty1 = min(ty0 + 1, gy - 1), wy = fy - Float(ty0)
+                        for x in 0..<w {
+                            let o = y * w + x
+                            fb[o * 3] &+= UInt16(p[o * 4]) * 4
+                            fb[o * 3 + 1] &+= UInt16(p[o * 4 + 1]) * 4
+                            fb[o * 3 + 2] &+= UInt16(p[o * 4 + 2]) * 4
+                            let fx = min(max(Float(x) * Float(gx) / Float(w) - 0.5, 0), Float(gx - 1))
+                            let tx0 = Int(fx), tx1 = min(tx0 + 1, gx - 1), wx = fx - Float(tx0)
+                            let d0 = sh[ty0 * gx + tx0] * (1 - wx) + sh[ty0 * gx + tx1] * wx
+                            let d1 = sh[ty1 * gx + tx0] * (1 - wx) + sh[ty1 * gx + tx1] * wx
+                            let d = (d0 * (1 - wy) + d1 * wy) * t
+                            let sx = Float(x) + d.x, sy = Float(y) + d.y
+                            guard sx >= 0, sy >= 0, sx < Float(w - 1), sy < Float(h - 1) else { continue }
+                            let ix = Int(sx), iy = Int(sy)
+                            let ax = sx - Float(ix), ay = sy - Float(iy)
+                            let q = (iy * w + ix) * 4
+                            for c in 0..<3 {
+                                let v00 = Float(p[q + c]), v10 = Float(p[q + 4 + c])
+                                let v01 = Float(p[q + w * 4 + c]), v11 = Float(p[q + w * 4 + 4 + c])
+                                let v = (v00 * (1 - ax) + v10 * ax) * (1 - ay) + (v01 * (1 - ax) + v11 * ax) * ay
+                                sb[o * 3 + c] &+= UInt16(v * 4 + 0.5)
+                            }
+                            cb[o] &+= 1
+                        }
+                    }
+                }
+            }}}}
+            used += 1
+        }
+        if !done { return "Остановлено" }
+        guard used >= 3 else { return "Не удалось прочитать кадры" }
+
+        // Где земля: блоки 16×16 простого среднего заметно темнее неба
+        let blk = 16
+        let bw = (w + blk - 1) / blk, bh = (h + blk - 1) / blk
+        var bg = [Float](repeating: 0, count: bw * bh)
+        var bc = [Float](repeating: 0, count: bw * bh)
+        for y in stride(from: 0, to: h, by: 2) {
+            for x in stride(from: 0, to: w, by: 2) {
+                let b = (y / blk) * bw + x / blk
+                bg[b] += Float(flat[(y * w + x) * 3 + 1])
+                bc[b] += 1
+            }
+        }
+        for b in 0..<bg.count { bg[b] = bc[b] > 0 ? bg[b] / bc[b] / Float(used * 4) : 0 }
+        let sorted = bg.sorted()
+        let level = max(sorted[sorted.count * 7 / 10], 4)   // уровень неба
+        var mask = bg.map { min(max(($0 - 0.45 * level) / (0.25 * level), 0), 1) }
+        // Сгладить границу 3×3
+        let m0 = mask
+        for by in 0..<bh {
+            for bx in 0..<bw {
+                var s: Float = 0, c: Float = 0
+                for yy in max(0, by - 1)...min(bh - 1, by + 1) {
+                    for xx in max(0, bx - 1)...min(bw - 1, bx + 1) { s += m0[yy * bw + xx]; c += 1 }
+                }
+                mask[by * bw + bx] = s / c
+            }
+        }
+        var out = Frame(w: w, h: h)
+        out.ok = true
+        out.px.withUnsafeMutableBufferPointer { d in
+            DispatchQueue.concurrentPerform(iterations: 16) { part in
+                for y in (part * h / 16)..<((part + 1) * h / 16) {
+                    let fy = min(max(Float(y) / Float(blk) - 0.5, 0), Float(bh - 1))
+                    let by0 = Int(fy), by1 = min(by0 + 1, bh - 1), wy = fy - Float(by0)
+                    for x in 0..<w {
+                        let o = y * w + x
+                        let fx = min(max(Float(x) / Float(blk) - 0.5, 0), Float(bw - 1))
+                        let bx0 = Int(fx), bx1 = min(bx0 + 1, bw - 1), wx = fx - Float(bx0)
+                        let t = (mask[by0 * bw + bx0] * (1 - wx) + mask[by0 * bw + bx1] * wx) * (1 - wy)
+                            + (mask[by1 * bw + bx0] * (1 - wx) + mask[by1 * bw + bx1] * wx) * wy
+                        let c = Float(cnt[o])
+                        for ch in 0..<3 {
+                            let g = Float(flat[o * 3 + ch]) / Float(used * 4)
+                            let sv = c > 0 ? Float(sky[o * 3 + ch]) / (c * 4) : g
+                            d[o * 4 + ch] = UInt8(min(255, max(0, (sv * t + g * (1 - t)).rounded())))
+                        }
+                        d[o * 4 + 3] = 255
+                    }
+                }
+            }
+        }
+        guard let img = out.cgImage(), let jpg = ShootStore.jpeg(img) else { return "Не удалось собрать фото" }
+        try? jpg.write(to: shoot.dir.appendingPathComponent("stars_deep.jpg"))
+        let sem = DispatchSemaphore(value: 0)
+        var ok = false
+        PHPhotoLibrary.shared().performChanges({
+            PHAssetCreationRequest.forAsset().addResource(with: .photo, data: jpg, options: nil)
+        }) { s, _ in
+            ok = s
+            sem.signal()
+        }
+        sem.wait()
+        return ok ? "Фото «Звёзды» из \(used) кадров сохранено в Фото" : "Нет доступа к Фото. Фото лежит в папке съёмки"
     }
 
     /// Видео из кадров: таймлапс, Starlapse или рилс «3 в 1» (таймлапс, средний след, длинный след друг под другом).
@@ -1296,7 +1456,8 @@ struct ReportRow: View {
 /// к её прошлому месту. Деревья и горы не трогаем - тянутся только яркие точки над фоном
 final class GapFill {
     private(set) var on: Bool
-    private let gx = 6, gy = 4
+    static let gx = 6, gy = 4
+    private let gx = GapFill.gx, gy = GapFill.gy
     private var shift: [SIMD2<Float>]?
     private var prevPts: [[(x: Int, y: Int, v: Int)]]?
     private var tries = 0
@@ -1311,6 +1472,15 @@ final class GapFill {
 
     init(_ dir: URL) {
         on = GapFill.needed(dir)
+    }
+
+    private init() { on = true }
+
+    /// Сдвиг неба из кадра a в кадр b по частям кадра (gx×gy), или nil если звёзд не нашлось
+    static func skyShift(_ a: Frame, _ b: Frame) -> [SIMD2<Float>]? {
+        let g = GapFill()
+        g.estimate(g.stars(a, g.blockMeans(a)), g.stars(b, g.blockMeans(b)))
+        return g.shift
     }
 
     /// Вызывать для каждого ночного кадра по порядку, до наложения следа
