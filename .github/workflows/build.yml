@@ -39,6 +39,17 @@ jobs:
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
             build 2>&1 | tee build1.log
 
+      - name: Build Watch app
+        id: bw
+        continue-on-error: true
+        shell: bash
+        run: |
+          xcodebuild -project NightLapse.xcodeproj -target NightLapseWatch \
+            -configuration Release -sdk watchos SYMROOT="$PWD/buildw" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee buildw.log
+          ls buildw/Release-watchos || true
+
       - name: Package IPA
         if: always()
         shell: bash
@@ -50,6 +61,13 @@ jobs:
             mkdir Payload
             cp -R "$APP" Payload/
             zip -qr out/NightLapse.ipa Payload
+            # Отдельный файл с приложением для часов: если с часами не поставится, основной остаётся как был
+            W="buildw/Release-watchos/NightLapseWatch.app"
+            if [ -d "$W" ]; then
+              mkdir -p Payload/NightLapse.app/Watch
+              cp -R "$W" Payload/NightLapse.app/Watch/
+              zip -qr out/NightLapse_watch.ipa Payload
+            fi
           fi
           ls -la out
 
@@ -59,10 +77,10 @@ jobs:
         run: |
           echo '### Ошибки сборки (если есть)' >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          grep -h "error:" build1.log 2>/dev/null | sort -u | head -40 >> "$GITHUB_STEP_SUMMARY" || true
+          grep -h "error:" build1.log buildw.log 2>/dev/null | sort -u | head -40 >> "$GITHUB_STEP_SUMMARY" || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           # Те же ошибки отметками (annotations): их видно через API, даже когда логи недоступны
-          grep -h "error:" build1.log 2>/dev/null | sort -u | head -40 | while IFS= read -r line; do
+          grep -h "error:" build1.log buildw.log 2>/dev/null | sort -u | head -40 | while IFS= read -r line; do
             echo "::error::$line"
           done || true
 
