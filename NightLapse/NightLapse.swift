@@ -135,7 +135,7 @@ enum LapseScene: String, CaseIterable, Identifiable {
     var hint: String {
         switch self {
         case .stars: return "Ночное небо"
-        case .clouds: return "День, закат, облака"
+        case .clouds: return "Дневной таймлапс"
         }
     }
     /// Снимок каждые N секунд по умолчанию
@@ -2029,7 +2029,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
                 PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
             }) { ok, _ in
                 if ok { try? FileManager.default.removeItem(at: url) }
-                end(ok ? "Видео сохранено в Фото" : "Нет доступа к Фото. Видео лежит в Файлы → NightLapse")
+                end(ok ? "Видео сохранено в галерее телефона" : "Нет доступа к галерее телефона. Видео лежит в Файлы → NightLapse")
             }
         }
     }
@@ -2304,21 +2304,17 @@ struct ContentView: View {
             }
             .disabled(!idle)
             .accessibilityLabel(focusLabel)
-            .confirmationDialog("Фокус - от него зависит резкость", isPresented: $showFocusMenu, titleVisibility: .visible) {
+            .confirmationDialog("Фокус", isPresented: $showFocusMenu, titleVisibility: .visible) {
                 if e.isDark {
-                    Button("Навести по звёздам сейчас (около 30 с)") { e.starFocus() }
+                    Button("По звёздам") { e.starFocus() }
                 } else {
-                    Button("Далеко: пейзаж, горизонт") { e.focusInfinity() }
+                    Button("Вдаль") { e.focusInfinity() }
                 }
-                Button("Настроить вручную с лупой") {
+                Button("Вручную") {
                     withAnimation(.easeOut(duration: 0.15)) { openParam = .focus }
                 }
-                Button("Автофокус, как в Камере") { e.resetFocusAuto() }
+                Button("Авто") { e.resetFocusAuto() }
                 Button("Отмена", role: .cancel) {}
-            } message: {
-                Text(e.isDark
-                     ? "Ночью фокус наводится сам по звёздам при первом «Тест» или «Старт». Звёзды будут точками, а не кружками"
-                     : "Днём коснись кадра - фокус будет в этой точке")
             }
             roundIcon("moon") { dark = true }
                 .accessibilityLabel("Погасить экран")
@@ -2613,7 +2609,7 @@ struct ContentView: View {
         if e.starFocused { return "Фокус ✓" }
         if e.needsStarFocus { return "Фокус: сам" }
         if e.focusAuto { return "Фокус: авто" }
-        return e.focus >= 0.99 ? "Фокус: даль" : "Фокус: ручной"
+        return e.focus >= 0.99 ? "Фокус: вдаль" : "Фокус: вручную"
     }
 
     /// Кнопка параметра: сверху мелко что это, снизу значение. Высота 44 - попадёшь и в перчатках
@@ -3002,7 +2998,7 @@ struct SettingsSheet: View {
             Form {
                 Section {
                     Picker("Красный интерфейс", selection: $redUI) {
-                        Text("Сам, когда темно").tag(0)
+                        Text("Авто").tag(0)
                         Text("Всегда").tag(1)
                         Text("Никогда").tag(2)
                     }
@@ -3038,7 +3034,7 @@ struct SettingsSheet: View {
                 }
 
                 Section("Сохранение") {
-                    Toggle("Сразу экспортировать видео в Фото", isOn: $e.saveVideo)
+                    Toggle("Сразу экспортировать видео в галерею телефона", isOn: $e.saveVideo)
                     Picker("Кадров в секунду", selection: $e.fps) {
                         Text("24").tag(24)
                         Text("25").tag(25)
