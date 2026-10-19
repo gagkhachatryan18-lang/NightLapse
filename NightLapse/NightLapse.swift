@@ -877,6 +877,10 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         status = "Не трогай телефон \(startHold) с..."
         let hold = startHold
         LiveStatus.shared.start(mode: sceneKind.title, battery: battery)
+        batStart = nil
+        batteryLeftH = nil
+        batteryWarn = nil
+        batWarnLogged = false
         UIApplication.shared.isIdleTimerDisabled = true
         let s = currentSettings()
         let ff = focusAuto
@@ -1041,6 +1045,83 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
                     scene: scene, interval: intervalSeconds)
     }
 
+    // MARK: Заряд во время съёмки
+
+    /// Сколько ещё продержится батарея при нынешнем расходе (часы); nil - пока не ясно или идёт зарядка
+    @Published var batteryLeftH: Double?
+    /// Предупреждение о заряде во время съёмки
+    @Published var batteryWarn: String?
+    private var batStart: (Date, Int)?
+    private var batWarnLogged = false
+
+    private var charging: Bool {
+        let s = UIDevice.current.batteryState
+        return s == .charging || s == .full
+    }
+
+    /// Расход в процентах за час: по прошлым съёмкам, а до первой - 10%/ч
+    var batteryRate: Double {
+        let r = UserDefaults.standard.double(forKey: "batRate")
+        return r > 0.5 ? r : 10
+    }
+
+    /// Сколько часов продержится батарея до 5% при обычном расходе (для подсказки до старта)
+    var batteryHoursEstimate: Double { max(0, Double(battery - 5)) / batteryRate }
+
+    private func watchBattery(_ now: Date) {
+        guard battery >= 0 else { return }
+        if charging {
+            batStart = nil
+            batteryLeftH = nil
+            batteryWarn = nil
+            return
+        }
+        guard let st = batStart else {
+            batStart = (now, battery)
+            return
+        }
+        let hours = now.timeIntervalSince(st.0) / 3600
+        let used = Double(st.1 - battery)
+        // Расход видно через 10 минут и хотя бы 2% - раньше цифры прыгают
+        if hours >= 1.0 / 6 && used >= 2 {
+            let rate = used / hours
+            UserDefaults.standard.set(rate, forKey: "batRate")
+            batteryLeftH = max(0, Double(battery - 5)) / rate
+        }
+        var warn: String?
+        if let left = batteryLeftH {
+            if let end = autoStopAt {
+                let need = end.timeIntervalSince(now) / 3600
+                if left < need {
+                    warn = "Заряда хватит примерно на \(hoursText(left)), а до конца съёмки \(hoursText(need)). Подключи пауэрбанк"
+                }
+            } else if left < 1 {
+                warn = "Заряда осталось примерно на \(hoursText(left)). Подключи пауэрбанк"
+            }
+        }
+        if battery <= 4 {
+            // Пока телефон не выключился сам: останавливаем съёмку, чтобы видео и кадры сохранились целыми
+            Diag.event("Батарея \(battery)%: съёмка остановлена, чтобы сохранить видео")
+            stop()
+            return
+        }
+        if warn != batteryWarn {
+            batteryWarn = warn
+            if let w = warn, !batWarnLogged {
+                batWarnLogged = true
+                Diag.event("Заряд: " + w)
+            }
+            LiveStatus.shared.update(note: warn ?? "")
+        }
+    }
+
+    /// 1 ч 20 мин, 35 мин
+    func hoursText(_ h: Double) -> String {
+        let m = Int((h * 60).rounded())
+        if m < 60 { return "\(max(m, 1)) мин" }
+        return m % 60 == 0 ? "\(m / 60) ч" : "\(m / 60) ч \(m % 60) мин"
+    }
+
     private func tick() {
         let now = Date()
         if phase == .waiting, let s = startAt {
@@ -1061,6 +1142,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         let isHot = state == .serious || state == .critical
         if isHot != hot { hot = isHot }
         checkCooling(state, now)
+        if phase == .recording || phase == .paused { watchBattery(now) }
         if tickCount % 10 == 0 { updateFree() }
         if phase == .idle && tickCount % 2 == 0 {
             let cs = currentSettings()
@@ -1747,7 +1829,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         DispatchQueue.main.async {
             self.framesDone = c
             if let t = thumb { self.lastImage = t }
-            LiveStatus.shared.update(frames: c, battery: self.battery, hot: self.hot, state: "rec", note: "")
+            LiveStatus.shared.update(frames: c, battery: self.battery, hot: self.hot, state: "rec", note: self.batteryWarn ?? "")
         }
     }
 
@@ -2018,6 +2100,7 @@ struct ContentView: View {
     @State private var showTest = false
     @State private var showSettings = false
     @State private var focusMark: CGPoint?
+    @StateObject private var pole = PoleFinder()
     @State private var markTick = 0
     @State private var openParam: Param?
     @State private var showShoots = false
@@ -2218,6 +2301,9 @@ struct ContentView: View {
                         .padding(.vertical, 4)
                         .background(Color.black.opacity(0.55), in: Capsule())
                 }
+                if idle && e.sceneKind == .stars {
+                    PolePill(p: pole)
+                }
                 Spacer()
                 if shooting {
                     HStack {
@@ -2339,9 +2425,18 @@ struct ContentView: View {
                     .multilineTextAlignment(.center)
                 modeCarousel
             } else if e.phase == .recording || e.phase == .paused {
-                Text("Не двигай телефон. Луна сверху гасит экран")
-                    .font(.caption)
-                    .foregroundStyle(Color.white.opacity(0.6))
+                if let w = e.batteryWarn {
+                    Text(w)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(Color.red)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 16)
+                } else {
+                    Text(e.batteryLeftH.map { "Заряда хватит примерно на \(e.hoursText($0)). Не двигай телефон" }
+                         ?? "Не двигай телефон. Луна сверху гасит экран")
+                        .font(.caption)
+                        .foregroundStyle(Color.white.opacity(0.6))
+                }
             }
             shutterRow
         }
@@ -2392,11 +2487,13 @@ struct ContentView: View {
             return "Памяти может не хватить: нужно около \(Int(gb.rounded())) ГБ"
         }
         let charging = UIDevice.current.batteryState == .charging || UIDevice.current.batteryState == .full
-        if e.battery >= 0 && e.battery < 40 && hours > 2 && !charging {
-            return "Батарея \(e.battery)%: на долгую съёмку подключи питание"
-        }
-        if e.battery >= 0 && e.battery < 80 && hours >= 4 && !charging && !ProcessInfo.processInfo.isLowPowerModeEnabled {
-            return "На всю ночь подключи пауэрбанк или включи Энергосбережение в Пункте управления"
+        if e.battery >= 0 && !charging {
+            let left = e.batteryHoursEstimate
+            if left < hours {
+                return e.autoStopMin == 0
+                    ? "Заряда хватит примерно на \(e.hoursText(left)). На всю ночь подключи пауэрбанк"
+                    : "Заряда хватит примерно на \(e.hoursText(left)), а съёмка - \(durText(Double(e.autoStopMin) * 60)). Подключи пауэрбанк"
+            }
         }
         return nil
     }
@@ -2638,6 +2735,7 @@ struct ContentView: View {
                 VStack(spacing: 6) {
                     Text("\(e.framesDone) кадров · \(hms(e.elapsed))")
                     Text(e.status)
+                    if let w = e.batteryWarn { Text(w).foregroundStyle(Color.red.opacity(0.6)) }
                     Text("Коснись, чтобы вернуться")
                 }
                 .font(.footnote)
