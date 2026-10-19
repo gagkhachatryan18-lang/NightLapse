@@ -851,7 +851,11 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     func setLoupe(_ on: Bool) {
         queue.async {
             guard let dev = self.device else { return }
-            applyCrop(on ? self.baseCrop * 4 : self.baseCrop, to: dev)
+            // Плавно, как зум пальцами в Камере: туда и обратно
+            guard (try? dev.lockForConfiguration()) != nil else { return }
+            let z = min(max(on ? self.baseCrop * 4 : self.baseCrop, 1), dev.activeFormat.videoMaxZoomFactor)
+            dev.ramp(toVideoZoomFactor: z, withRate: 6)
+            dev.unlockForConfiguration()
         }
     }
 
@@ -2470,7 +2474,11 @@ struct ContentView: View {
                 Button("Вручную") {
                     withAnimation(.easeOut(duration: 0.15)) { openParam = .focus }
                 }
-                Button("Авто") { e.resetFocusAuto() }
+                Button("Авто") {
+                    // Ручная настройка закрывается, увеличение плавно уходит назад
+                    withAnimation(.easeOut(duration: 0.2)) { if openParam == .focus { openParam = nil } }
+                    e.resetFocusAuto()
+                }
                 Button("Отмена", role: .cancel) {}
             }
             roundIcon("moon") { dark = true }
