@@ -272,25 +272,81 @@ struct Grade: Equatable {
     /// Насыщенность и контраст: -1...1, 0 - как снято
     var sat: Float = 0
     var contrast: Float = 0
-    var isNeutral: Bool { abs(temp) < 0.01 && abs(tint) < 0.01 && abs(sat) < 0.01 && abs(contrast) < 0.01 }
+    /// Свет: экспозиция, тени, света, виньетка - всё -1...1
+    var exposure: Float = 0
+    var shadows: Float = 0
+    var highlights: Float = 0
+    var vignette: Float = 0
+    /// Кадр: наклон горизонта в градусах и формат
+    var angle: Float = 0
+    var crop: Crop = .original
 
-    /// Таблицы для синего, зелёного и красного: цвет, потом контраст вокруг середины
+    enum Crop: String, CaseIterable, Identifiable {
+        case original, wide, vertical, square, portrait
+        var id: String { rawValue }
+        var title: String {
+            switch self {
+            case .original: return "Как снято"
+            case .wide: return "16:9"
+            case .vertical: return "9:16"
+            case .square: return "1:1"
+            case .portrait: return "4:5"
+            }
+        }
+        /// Ширина к высоте, nil - как снято
+        var ratio: Float? {
+            switch self {
+            case .original: return nil
+            case .wide: return 16.0 / 9
+            case .vertical: return 9.0 / 16
+            case .square: return 1
+            case .portrait: return 4.0 / 5
+            }
+        }
+    }
+
+    var toneNeutral: Bool {
+        abs(temp) < 0.01 && abs(tint) < 0.01 && abs(sat) < 0.01 && abs(contrast) < 0.01
+            && abs(exposure) < 0.01 && abs(shadows) < 0.01 && abs(highlights) < 0.01 && abs(vignette) < 0.01
+    }
+    var geoNeutral: Bool { abs(angle) < 0.05 && crop == .original }
+    var isNeutral: Bool { toneNeutral && geoNeutral }
+
+    /// Таблицы для синего, зелёного и красного: цвет, экспозиция, тени и света, потом контраст вокруг середины
     func luts() -> [[UInt8]] {
         let kb = 1 - 0.3 * temp, kr = 1 + 0.3 * temp, kg = 1 - 0.18 * tint
         let kc = 1 + 0.6 * contrast
+        let ke = pow(2, 1.5 * exposure)
+        let sh = shadows, hl = highlights
         let mk: (Float) -> [UInt8] = { k in
             (0..<256).map { v in
-                let c = (Float(v) * k - 128) * kc + 128
+                var x = min(1, Float(v) * k * ke / 255)
+                // Тени поднимают тёмное, почти не трогая светлое; света - наоборот
+                x += sh * 0.7 * x * (1 - x) * (1 - x)
+                x += hl * 0.7 * x * x * (1 - x)
+                let c = (x * 255 - 128) * kc + 128
                 return UInt8(min(255, max(0, c.rounded())))
             }
         }
         return [mk(kb), mk(kg), mk(kr)]
     }
+
+    /// Размер после наклона и обрезки: самый большой прямоугольник нужного формата внутри повёрнутого кадра
+    func outSize(_ w: Int, _ h: Int) -> (Int, Int) {
+        guard !geoNeutral else { return (w, h) }
+        let r = crop.ratio ?? Float(w) / Float(h)
+        let a = abs(angle) * .pi / 180
+        let c = cos(a), sn = sin(a)
+        let s = min(Float(w) / (c * r + sn), Float(h) / (sn * r + c))
+        let ow = Int(s * r) & ~1, oh = Int(s) & ~1
+        return (max(ow, 16), max(oh, 16))
+    }
 }
 
 extension Frame {
     mutating func apply(_ g: Grade) {
-        guard !g.isNeutral else { return }
+        guard !g.toneNeutral else { return }
+        if abs(g.vignette) >= 0.01 { vignette(g.vignette) }
         let t = g.luts()
         let n = px.count
         let ks = Int((1 + g.sat) * 256)
@@ -312,6 +368,65 @@ extension Frame {
                 i += 4
             }
         }
+    }
+
+    /// Виньетка: v < 0 - темнее к углам, v > 0 - светлее
+    mutating func vignette(_ v: Float) {
+        let w = self.w, h = self.h
+        let cx = Float(w) / 2, cy = Float(h) / 2
+        let inv = 1 / (cx * cx + cy * cy)
+        px.withUnsafeMutableBufferPointer { p in
+            DispatchQueue.concurrentPerform(iterations: 8) { part in
+                for y in (part * h / 8)..<((part + 1) * h / 8) {
+                    let dy = Float(y) - cy
+                    for x in 0..<w {
+                        let dx = Float(x) - cx
+                        let r2 = (dx * dx + dy * dy) * inv
+                        let k = max(0, 1 + v * 0.8 * r2 * r2)
+                        let o = (y * w + x) * 4
+                        p[o] = UInt8(min(255, Float(p[o]) * k))
+                        p[o + 1] = UInt8(min(255, Float(p[o + 1]) * k))
+                        p[o + 2] = UInt8(min(255, Float(p[o + 2]) * k))
+                    }
+                }
+            }
+        }
+    }
+
+    /// Наклон горизонта и обрезка под формат (центр кадра остаётся центром)
+    func geometry(_ g: Grade) -> Frame {
+        guard !g.geoNeutral else { return self }
+        let w = self.w, h = self.h
+        let (ow, oh) = g.outSize(w, h)
+        var out = Frame(w: ow, h: oh)
+        out.ok = ok
+        let a = g.angle * .pi / 180
+        let c = cos(a), sn = sin(a)
+        let cx = Float(w) / 2, cy = Float(h) / 2, ocx = Float(ow) / 2, ocy = Float(oh) / 2
+        px.withUnsafeBufferPointer { p in
+            out.px.withUnsafeMutableBufferPointer { d in
+                DispatchQueue.concurrentPerform(iterations: 8) { part in
+                    for y in (part * oh / 8)..<((part + 1) * oh / 8) {
+                        let v = Float(y) + 0.5 - ocy
+                        for x in 0..<ow {
+                            let u = Float(x) + 0.5 - ocx
+                            let sx = min(max(cx + u * c - v * sn - 0.5, 0), Float(w - 2))
+                            let sy = min(max(cy + u * sn + v * c - 0.5, 0), Float(h - 2))
+                            let ix = Int(sx), iy = Int(sy)
+                            let ax = sx - Float(ix), ay = sy - Float(iy)
+                            let q = (iy * w + ix) * 4, o = (y * ow + x) * 4
+                            for ch in 0..<3 {
+                                let t = Float(p[q + ch]) * (1 - ax) + Float(p[q + 4 + ch]) * ax
+                                let b = Float(p[q + w * 4 + ch]) * (1 - ax) + Float(p[q + w * 4 + 4 + ch]) * ax
+                                d[o + ch] = UInt8(min(255, (t * (1 - ay) + b * ay).rounded()))
+                            }
+                            d[o + 3] = 255
+                        }
+                    }
+                }
+            }
+        }
+        return out
     }
 
     /// Яркость в k раз (для выравнивания мерцания)
@@ -443,7 +558,7 @@ final class Renderer: ObservableObject {
                     var f = Frame(w: b.width, h: b.height)
                     f.draw(b)
                     f.apply(grade)
-                    img = f.cgImage()
+                    img = (look == .reel ? f : f.geometry(grade)).cgImage()
                 }
                 let ui = img.map { UIImage(cgImage: $0) }
                 DispatchQueue.main.async {
@@ -507,7 +622,7 @@ final class Renderer: ObservableObject {
                 var f = Frame(w: c.width, h: c.height)
                 f.draw(c)
                 f.apply(grade)
-                img = f.cgImage()
+                img = (look == .reel ? f : f.geometry(grade)).cgImage()
             }
             let ui = img.map { UIImage(cgImage: $0) }
             DispatchQueue.main.async {
@@ -623,7 +738,7 @@ final class Renderer: ObservableObject {
         }
         if !done { return "Остановлено" }
         if used == 0 { return "Все кадры сняты днём или в сумерках. Фото со следами получается только в темноте" }
-        guard let img = acc.cgImage(), let jpg = ShootStore.jpeg(img) else { return "Не удалось собрать фото" }
+        guard let img = acc.geometry(grade).cgImage(), let jpg = ShootStore.jpeg(img) else { return "Не удалось собрать фото" }
         // Копия рядом с исходниками, на случай если в Фото нет доступа
         try? jpg.write(to: shoot.dir.appendingPathComponent("startrail.jpg"))
         let sem = DispatchSemaphore(value: 0)
@@ -780,7 +895,7 @@ final class Renderer: ObservableObject {
                 }
             }
         }
-        guard let img = out.cgImage(), let jpg = ShootStore.jpeg(img) else { return "Не удалось собрать фото" }
+        guard let img = out.geometry(grade).cgImage(), let jpg = ShootStore.jpeg(img) else { return "Не удалось собрать фото" }
         try? jpg.write(to: shoot.dir.appendingPathComponent("stars_deep.jpg"))
         let sem = DispatchSemaphore(value: 0)
         var ok = false
@@ -802,7 +917,8 @@ final class Renderer: ObservableObject {
         let w = first.width, h = first.height
         let reel = look == .reel
         // Рилс: 1080×1920, три полосы по 636 с чёрными промежутками 6
-        let ow = reel ? 1080 : w, oh = reel ? 1920 : h
+        let geo = reel ? (w, h) : grade.outSize(w, h)
+        let ow = reel ? 1080 : geo.0, oh = reel ? 1920 : geo.1
         let name = shoot.dir.lastPathComponent.replacingOccurrences(of: "_frames", with: "")
         let out = ShootStore.docs().appendingPathComponent(name + "_" + look.rawValue + ".mov")
         try? FileManager.default.removeItem(at: out)
@@ -860,7 +976,7 @@ final class Renderer: ObservableObject {
                 reelFrame.drawPanel(accB, y0: 1284, w: 1080, h: 636)
                 src = reelFrame
             } else {
-                src = look == .timelapse ? cur : accA
+                src = (look == .timelapse ? cur : accA).geometry(grade)
             }
             var pbo: CVPixelBuffer?
             if let pool = ad.pixelBufferPool {
@@ -1084,6 +1200,19 @@ struct ShootEditor: View {
         return FileManager.default.fileExists(atPath: u.path)
     }
 
+    /// Ползунок -1...1 с подписью; двойное касание по подписи - вернуть как было
+    private func gradeRow(_ title: String, _ v: Binding<Float>) -> some View {
+        HStack {
+            Text(title).font(.footnote).frame(width: 84, alignment: .leading)
+                .onTapGesture(count: 2) { v.wrappedValue = 0 }
+            Slider(value: v, in: -1...1)
+            Text(String(format: "%+.0f", v.wrappedValue * 100))
+                .font(.footnote.monospacedDigit())
+                .foregroundStyle(abs(v.wrappedValue) < 0.01 ? Color.secondary : Color.primary)
+                .frame(width: 46, alignment: .trailing)
+        }
+    }
+
     var body: some View {
         ScrollView {
             VStack(spacing: 14) {
@@ -1097,10 +1226,19 @@ struct ShootEditor: View {
                 .aspectRatio(look == .reel ? 0.75 : 16 / 9, contentMode: .fit)
                 .clipShape(RoundedRectangle(cornerRadius: 12))
 
-                Picker("Что сделать", selection: $look) {
-                    ForEach(Look.allCases) { Text($0.title).tag($0) }
+                // Что собрать: видео отдельно, фото отдельно - пять вариантов в одну строку не помещаются
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Видео").font(.footnote).foregroundStyle(.secondary)
+                    Picker("Видео", selection: $look) {
+                        ForEach([Look.starlapse, .timelapse, .reel]) { Text($0.title).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    Text("Фото").font(.footnote).foregroundStyle(.secondary)
+                    Picker("Фото", selection: $look) {
+                        ForEach([Look.startrail, .deep]) { Text($0.title).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
                 }
-                .pickerStyle(.segmented)
                 .disabled(r.busy)
 
                 if look == .starlapse {
@@ -1139,7 +1277,7 @@ struct ShootEditor: View {
                         Text("Цвет").font(.footnote).foregroundStyle(.secondary)
                         Spacer()
                         if !grade.isNeutral {
-                            Button("Сбросить") { grade = Grade() }.font(.footnote)
+                            Button("Сбросить всё") { grade = Grade() }.font(.footnote)
                         }
                     }
                     HStack {
@@ -1161,6 +1299,32 @@ struct ShootEditor: View {
                         Image(systemName: "circle.dotted").foregroundStyle(.gray)
                         Slider(value: $grade.contrast, in: -1...1)
                         Image(systemName: "circle.righthalf.filled").foregroundStyle(.white)
+                    }
+
+                    Text("Свет").font(.footnote).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.top, 6)
+                    gradeRow("Экспозиция", $grade.exposure)
+                    gradeRow("Тени", $grade.shadows)
+                    gradeRow("Света", $grade.highlights)
+                    gradeRow("Виньетка", $grade.vignette)
+
+                    if look != .reel {
+                        Text("Кадр").font(.footnote).foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.top, 6)
+                        HStack {
+                            Text("Горизонт").font(.footnote).frame(width: 84, alignment: .leading)
+                            Slider(value: $grade.angle, in: -10...10, step: 0.1)
+                            Text(String(format: "%+.1f°", grade.angle))
+                                .font(.footnote.monospacedDigit())
+                                .frame(width: 46, alignment: .trailing)
+                                .onTapGesture { grade.angle = 0 }
+                        }
+                        Picker("Формат", selection: $grade.crop) {
+                            ForEach(Grade.Crop.allCases) { Text($0.title).tag($0) }
+                        }
+                        .pickerStyle(.segmented)
                     }
                 }
                 .disabled(r.busy)
