@@ -1359,7 +1359,7 @@ struct ShootEditor: View {
                     Button {
                         r.run(shoot, eff, trail, denoise: denoise, grade: grade, deflicker: deflicker)
                     } label: {
-                        Label(isReady ? "Сохранить в Фото (уже готово)" : "Собрать и сохранить в Фото", systemImage: "square.and.arrow.down")
+                        Label(isReady ? "Экспорт в Фото (уже готово)" : "Экспорт в Фото", systemImage: "square.and.arrow.up")
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.borderedProminent)
