@@ -375,7 +375,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     func starFocus() {
         guard phase == .idle else { return }
         phase = .test
-        status = "Навожу фокус по звёздам, не трогай телефон..."
+        status = "Навожу фокус по звёздам, около 30 с. Не трогай телефон"
         let hold = startHold
         subTotal = 23
         subDone = 0
@@ -446,6 +446,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             self.starFocused = true
             self.subDone = 0
             self.applyCamera(forceFocus: true)
+            Haptic.success()
             self.finished("Фокус по звёздам наведён")
             if let next = self.afterFocus {
                 self.afterFocus = nil
@@ -859,6 +860,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     }
 
     private func beginRecording() {
+        Haptic.heavy()
         let f = DateFormatter()
         f.dateFormat = "yyyy-MM-dd_HH-mm-ss"
         let c = makeConfig(name: "NightLapse_" + f.string(from: Date()))
@@ -914,6 +916,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
     func stop() {
         guard phase == .recording || phase == .paused else { return }
+        Haptic.heavy()
         if cooling {
             cooling = false
             setExtra(0)
@@ -1020,8 +1023,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     }
 
     private func finished(_ msg0: String) {
-        let msg = stoppedByBattery ? "Заряд кончался, съёмка остановлена заранее. " + msg0 : msg0
-        stoppedByBattery = false
+        let msg = (stopReason ?? "") + msg0
+        stopReason = nil
         phase = .idle
         status = msg
         LiveStatus.shared.end(note: msg)
@@ -1055,7 +1058,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     @Published var batteryWarn: String?
     private var batStart: (Date, Int)?
     private var batWarnLogged = false
-    private var stoppedByBattery = false
+    /// Почему съёмка остановилась сама (заряд, память) - допишется к итоговому сообщению
+    private var stopReason: String?
 
     private var charging: Bool {
         let s = UIDevice.current.batteryState
@@ -1109,7 +1113,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         if battery <= Self.batteryStop {
             // Пока телефон не выключился сам: останавливаем съёмку, чтобы видео и кадры успели сохраниться
             Diag.event("Батарея \(battery)%: съёмка остановлена, чтобы сохранить видео")
-            stoppedByBattery = true
+            stopReason = "Заряд кончался, съёмка остановлена заранее. "
+            Haptic.warn()
             stop()
             return
         }
@@ -1120,6 +1125,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             batteryWarn = warn
             if let w = warn, !batWarnLogged {
                 batWarnLogged = true
+                Haptic.warn()
                 Diag.event("Заряд: " + w)
             }
             LiveStatus.shared.update(note: warn ?? "")
@@ -1153,7 +1159,21 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         let isHot = state == .serious || state == .critical
         if isHot != hot { hot = isHot }
         checkCooling(state, now)
-        if phase == .recording || phase == .paused { watchBattery(now) }
+        if phase == .recording || phase == .paused {
+            watchBattery(now)
+            // Память: останавливаемся заранее, пока видео ещё можно дописать
+            if freeGB > 0 && freeGB < 1.0 && phase != .saving {
+                stopReason = "Память почти кончилась, съёмка остановлена заранее. "
+                Diag.event("Свободно \(String(format: "%.1f", freeGB)) ГБ: съёмка остановлена")
+                Haptic.warn()
+                stop()
+            }
+        }
+        // Отсчёт «не трогай телефон»: сколько секунд осталось до первого кадра
+        if phase == .recording || phase == .test || phase == .idle, status.hasPrefix("Не трогай телефон") {
+            let left = holdUntil - CACurrentMediaTime()
+            if left > 0 { status = "Не трогай телефон: \(Int(left.rounded(.up))) с до первого кадра" }
+        }
         if tickCount % 10 == 0 { updateFree() }
         if phase == .idle && tickCount % 2 == 0 {
             let cs = currentSettings()
@@ -2099,8 +2119,41 @@ struct CameraPreview: UIViewRepresentable {
 
 // MARK: - Главный экран, как Камера iPhone
 
+// MARK: - Отклик и цвета
+
+/// Вибрация: ночью понятно, что нажатие сработало, не глядя на экран
+enum Haptic {
+    static func tap() { UIImpactFeedbackGenerator(style: .light).impactOccurred() }
+    static func heavy() { UIImpactFeedbackGenerator(style: .heavy).impactOccurred() }
+    static func success() { UINotificationFeedbackGenerator().notificationOccurred(.success) }
+    static func warn() { UINotificationFeedbackGenerator().notificationOccurred(.warning) }
+}
+
+/// Цвета интерфейса в одном месте. Приглушённые, не слепят.
+/// Ночной режим - всё в тёмно-красном: красный свет меньше всего сбивает глаза, привыкшие к темноте
+struct Pal {
+    let night: Bool
+    /// Главный цвет: выбранное, активное
+    var accent: Color { night ? Color(red: 0.80, green: 0.24, blue: 0.20) : Color(red: 0.93, green: 0.79, blue: 0.42) }
+    /// Обычный текст и значки
+    var text: Color { night ? Color(red: 0.82, green: 0.32, blue: 0.27) : Color(white: 0.90) }
+    /// Второстепенный текст
+    var dim: Color { night ? Color(red: 0.55, green: 0.19, blue: 0.16) : Color(white: 0.60) }
+    /// Предупреждение
+    var warn: Color { night ? Color(red: 1.0, green: 0.45, blue: 0.30) : Color(red: 0.96, green: 0.48, blue: 0.44) }
+    /// Подложка кнопок
+    var fill: Color { night ? Color(red: 0.45, green: 0.06, blue: 0.05).opacity(0.38) : Color.white.opacity(0.12) }
+    /// Кнопка записи
+    var rec: Color { night ? Color(red: 0.70, green: 0.10, blue: 0.08) : Color(red: 0.90, green: 0.27, blue: 0.23) }
+    /// Текст на выбранной (залитой accent) кнопке
+    var onAccent: Color { Color.black }
+}
+
 struct ContentView: View {
     var onSwitch: () -> Void = {}
+    /// Красный ночной интерфейс: 0 - сам, когда темно; 1 - всегда; 2 - никогда
+    @AppStorage("redUI") private var redUI = 0
+    private var t: Pal { Pal(night: redUI == 1 || (redUI == 0 && e.isDark)) }
     @StateObject private var e = LapseEngine()
     @State private var dark = false
     @State private var showFocusMenu = false
@@ -2217,8 +2270,8 @@ struct ContentView: View {
                 .font(.system(size: 13, weight: .semibold))
                 .padding(.horizontal, 11)
                 .frame(height: 34)
-                .foregroundStyle(e.starFocused ? Color.yellow : Color.white)
-                .background(Color.white.opacity(0.12), in: Capsule())
+                .foregroundStyle(e.starFocused ? t.accent : t.text)
+                .background(t.fill, in: Capsule())
             }
             .disabled(!idle)
             .accessibilityLabel(focusLabel)
@@ -2238,8 +2291,10 @@ struct ContentView: View {
                      ? "Ночью фокус наводится сам по звёздам при первом «Тест» или «Старт». Звёзды будут точками, а не кружками"
                      : "Днём коснись кадра - фокус будет в этой точке")
             }
-            roundIcon("moon.fill") { dark = true }
-            roundIcon("gearshape.fill") { showSettings = true }
+            roundIcon("moon") { dark = true }
+                .accessibilityLabel("Погасить экран")
+            roundIcon("gearshape") { showSettings = true }
+                .accessibilityLabel("Настройки")
                 .disabled(!idle)
         }
         .padding(.top, 4)
@@ -2248,24 +2303,37 @@ struct ContentView: View {
     private func roundIcon(_ name: String, _ action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: name)
-                .font(.system(size: 16, weight: .semibold))
-                .frame(width: 36, height: 36)
-                .foregroundStyle(Color.white)
-                .background(Color.white.opacity(0.12), in: Circle())
+                .font(.system(size: 17, weight: .regular))
+                .frame(width: 44, height: 44)
+                .foregroundStyle(t.text)
+                .background(t.fill, in: Circle())
+        }
+    }
+
+    /// Значок батареи по уровню, с молнией на зарядке
+    private var batteryIcon: String {
+        let st = UIDevice.current.batteryState
+        if st == .charging || st == .full { return "battery.100.bolt" }
+        switch e.battery {
+        case ..<13: return "battery.0"
+        case ..<38: return "battery.25"
+        case ..<63: return "battery.50"
+        case ..<88: return "battery.75"
+        default: return "battery.100"
         }
     }
 
     private var infoChip: some View {
         HStack(spacing: 8) {
-            Label(e.battery >= 0 ? "\(e.battery)%" : "-", systemImage: "battery.100")
+            Label(e.battery >= 0 ? "\(e.battery)%" : "-", systemImage: batteryIcon)
             Label(String(format: "%.0f ГБ", e.freeGB), systemImage: "internaldrive")
             if e.hot {
-                Image(systemName: "thermometer.high").foregroundStyle(Color.orange)
+                Image(systemName: "thermometer.high").foregroundStyle(t.warn)
             }
         }
         .font(.caption2.monospacedDigit())
         .labelStyle(.titleAndIcon)
-        .foregroundStyle(Color.white.opacity(0.8))
+        .foregroundStyle(t.dim)
     }
 
     /// Красный таймер, как при записи видео в Камере
@@ -2274,7 +2342,7 @@ struct ContentView: View {
             .font(.subheadline.monospacedDigit().weight(.semibold))
             .padding(.horizontal, 10)
             .padding(.vertical, 4)
-            .background(e.phase == .recording ? Color.red : Color.gray.opacity(0.5), in: RoundedRectangle(cornerRadius: 6))
+            .background(e.phase == .recording ? t.rec : t.fill, in: RoundedRectangle(cornerRadius: 6))
     }
 
     // MARK: Кадр
@@ -2301,19 +2369,19 @@ struct ContentView: View {
             VStack(spacing: 6) {
                 if e.phase == .recording || e.phase == .test {
                     ProgressView(value: Double(min(e.subDone, e.subTotal)), total: Double(max(e.subTotal, 1)))
-                        .tint(.red)
+                        .tint(t.rec)
                 }
                 if showStatus {
                     Text(statusLine)
                         .font(.caption)
                         .multilineTextAlignment(.center)
-                        .foregroundStyle(e.hot ? Color.orange : Color.white)
+                        .foregroundStyle(e.hot ? t.warn : t.text)
                         .padding(.horizontal, 10)
                         .padding(.vertical, 4)
                         .background(Color.black.opacity(0.55), in: Capsule())
                 }
                 if idle && e.sceneKind == .stars {
-                    PolePill(p: pole)
+                    PolePill(p: pole, pal: t)
                 }
                 Spacer()
                 if shooting {
@@ -2340,17 +2408,22 @@ struct ContentView: View {
         HStack(spacing: 6) {
             ForEach(e.zoomOptions) { z in
                 let sel = abs(z.value - e.zoom) < 0.01
-                Button { e.zoom = z.value } label: {
+                Button {
+                    Haptic.tap()
+                    e.zoom = z.value
+                } label: {
                     Text(sel ? z.title : z.title.replacingOccurrences(of: "x", with: ""))
-                        .font(.system(size: sel ? 13 : 12, weight: .bold))
-                        .foregroundStyle(sel ? Color.yellow : Color.white)
-                        .frame(width: sel ? 40 : 32, height: sel ? 40 : 32)
+                        .font(.system(size: sel ? 14 : 13, weight: .bold))
+                        .foregroundStyle(sel ? t.accent : t.text)
+                        .frame(width: sel ? 40 : 34, height: sel ? 40 : 34)
                         .background(Color.black.opacity(0.55), in: Circle())
+                        .frame(width: 44, height: 44)
+                        .contentShape(Circle())
                 }
             }
         }
         .padding(4)
-        .background(Color.white.opacity(0.08), in: Capsule())
+        .background(t.fill, in: Capsule())
         .animation(.easeOut(duration: 0.15), value: e.zoom)
     }
 
@@ -2359,14 +2432,14 @@ struct ContentView: View {
         GeometryReader { _ in
             ZStack {
                 RoundedRectangle(cornerRadius: 3)
-                    .stroke(Color.yellow, lineWidth: 1.5)
+                    .stroke(t.accent, lineWidth: 1.5)
                     .frame(width: 72, height: 72)
                     .position(m)
                 VStack(spacing: 2) {
-                    Image(systemName: "sun.max.fill")
-                    Text(String(format: "%+.1f", e.evComp)).font(.caption2.monospacedDigit())
+                    Image(systemName: "sun.max")
+                    Text(String(format: "%+.1f", e.evComp)).font(.footnote.monospacedDigit())
                 }
-                .foregroundStyle(Color.yellow)
+                .foregroundStyle(t.accent)
                 .position(x: m.x + 58, y: m.y)
             }
         }
@@ -2417,36 +2490,36 @@ struct ContentView: View {
                         Button { focusHintSeen = true } label: { Image(systemName: "xmark") }
                             .accessibilityLabel("Понятно")
                     }
-                    .font(.caption2)
-                    .foregroundStyle(Color.yellow)
+                    .font(.footnote)
+                    .foregroundStyle(t.accent)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 8)
-                    .background(Color.yellow.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
+                    .background(t.accent.opacity(0.14), in: RoundedRectangle(cornerRadius: 10))
                     .padding(.horizontal, 16)
                 }
                 if let w = firstWarning {
                     Text(w)
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(Color.red)
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(t.warn)
                         .multilineTextAlignment(.center)
                 }
                 Text(planLine)
-                    .font(.caption2)
-                    .foregroundStyle(Color.white.opacity(0.6))
+                    .font(.footnote)
+                    .foregroundStyle(t.dim)
                     .multilineTextAlignment(.center)
                 modeCarousel
             } else if e.phase == .recording || e.phase == .paused {
                 if let w = e.batteryWarn {
                     Text(w)
                         .font(.caption.weight(.semibold))
-                        .foregroundStyle(Color.red)
+                        .foregroundStyle(t.warn)
                         .multilineTextAlignment(.center)
                         .padding(.horizontal, 16)
                 } else {
                     Text(e.batteryLeftH.map { "Заряда хватит примерно на \(e.hoursText($0)). Не двигай телефон" }
-                         ?? "Не двигай телефон. Луна сверху гасит экран")
-                        .font(.caption)
-                        .foregroundStyle(Color.white.opacity(0.6))
+                         ?? "Не двигай телефон. Луна вверху гасит экран, касание - снова включает")
+                        .font(.footnote)
+                        .foregroundStyle(t.dim)
                 }
             }
             shutterRow
@@ -2456,9 +2529,9 @@ struct ContentView: View {
 
     private var paramRow: some View {
         HStack(spacing: 8) {
-            paramChip(.brightness, "sun.max.fill", String(format: "%+.1f", e.evComp), warn: evWarn != nil)
-            paramChip(.interval, "timer", expText(e.intervalSeconds), warn: intervalWarn != nil)
-            paramChip(.duration, "hourglass", e.autoStopMin == 0 ? "Пока не остановлю" : durText(Double(e.autoStopMin) * 60), warn: durationWarn != nil)
+            paramChip(.brightness, "Яркость", String(format: "%+.1f", e.evComp), warn: evWarn != nil)
+            paramChip(.interval, "Кадр каждые", expText(e.intervalSeconds), warn: intervalWarn != nil)
+            paramChip(.duration, "Сколько снимать", e.autoStopMin == 0 ? "Пока не остановлю" : durText(Double(e.autoStopMin) * 60), warn: durationWarn != nil)
         }
     }
 
@@ -2520,20 +2593,27 @@ struct ContentView: View {
         return e.focus >= 0.99 ? "Фокус: даль" : "Фокус: ручной"
     }
 
-    private func paramChip(_ p: Param, _ icon: String, _ value: String, warn: Bool = false) -> some View {
+    /// Кнопка параметра: сверху мелко что это, снизу значение. Высота 44 - попадёшь и в перчатках
+    private func paramChip(_ p: Param, _ label: String, _ value: String, warn: Bool = false) -> some View {
         let on = openParam == p
         return Button {
+            Haptic.tap()
             withAnimation(.easeOut(duration: 0.15)) { openParam = on ? nil : p }
         } label: {
-            HStack(spacing: 5) {
-                Image(systemName: icon)
-                Text(value).monospacedDigit()
+            VStack(spacing: 1) {
+                Text(label)
+                    .font(.system(size: 11, weight: .medium))
+                    .opacity(on ? 0.75 : 0.7)
+                Text(value)
+                    .font(.system(size: 15, weight: .semibold))
+                    .monospacedDigit()
+                    .lineLimit(1)
             }
-            .font(.footnote.weight(.semibold))
-            .foregroundStyle(on ? Color.black : (warn ? Color.red : Color.white))
+            .foregroundStyle(on ? t.onAccent : (warn ? t.warn : t.text))
             .padding(.horizontal, 12)
-            .padding(.vertical, 7)
-            .background(on ? Color.yellow : Color.white.opacity(0.14), in: Capsule())
+            .frame(minHeight: 44)
+            .background(on ? t.accent : t.fill, in: RoundedRectangle(cornerRadius: 12))
+            .overlay(RoundedRectangle(cornerRadius: 12).stroke(warn && !on ? t.warn.opacity(0.6) : Color.clear))
         }
     }
 
@@ -2544,12 +2624,12 @@ struct ContentView: View {
                 HStack {
                     Image(systemName: "sun.min")
                     Slider(value: $e.evComp, in: -4...2, step: 0.1)
-                        .tint(.yellow)
-                    Image(systemName: "sun.max.fill")
+                        .tint(t.accent)
+                    Image(systemName: "sun.max")
                 }
                 Text("Яркость \(String(format: "%+.1f", e.evComp)). Можно и пальцем по кадру вверх-вниз")
-                    .font(.caption2)
-                    .foregroundStyle(Color.white.opacity(0.6))
+                    .font(.footnote)
+                    .foregroundStyle(t.dim)
             case .interval:
                 HStack(spacing: 16) {
                     stepButton("minus") { e.intervalDown() }
@@ -2560,19 +2640,19 @@ struct ContentView: View {
                     stepButton("plus") { e.intervalUp() }
                 }
                 Text(intervalNote)
-                    .font(.caption2)
-                    .foregroundStyle(Color.white.opacity(0.6))
+                    .font(.footnote)
+                    .foregroundStyle(t.dim)
                     .multilineTextAlignment(.center)
             case .focus:
                 HStack(spacing: 10) {
                     stepButton("minus") { nudgeFocus(-0.005) }
                     Slider(value: $e.focus, in: 0.4...1)
-                        .tint(.yellow)
+                        .tint(t.accent)
                     stepButton("plus") { nudgeFocus(0.005) }
                 }
                 Text("Середина кадра увеличена в 4 раза. Двигай, пока звёзды не станут самыми мелкими точками")
-                    .font(.caption2)
-                    .foregroundStyle(Color.white.opacity(0.6))
+                    .font(.footnote)
+                    .foregroundStyle(t.dim)
                     .multilineTextAlignment(.center)
             case .duration:
                 ScrollView(.horizontal, showsIndicators: false) {
@@ -2582,10 +2662,10 @@ struct ContentView: View {
                             Button { e.autoStopMin = m } label: {
                                 Text(m == 0 ? "Пока не остановлю" : durText(Double(m) * 60))
                                     .font(.footnote.weight(.semibold))
-                                    .foregroundStyle(sel ? Color.black : Color.white)
+                                    .foregroundStyle(sel ? t.onAccent : t.text)
                                     .padding(.horizontal, 10)
                                     .padding(.vertical, 6)
-                                    .background(sel ? Color.yellow : Color.white.opacity(0.14), in: Capsule())
+                                    .background(sel ? t.accent : t.fill, in: Capsule())
                             }
                         }
                     }
@@ -2606,8 +2686,8 @@ struct ContentView: View {
             Image(systemName: icon)
                 .font(.system(size: 15, weight: .bold))
                 .frame(width: 38, height: 38)
-                .foregroundStyle(Color.white)
-                .background(Color.white.opacity(0.14), in: Circle())
+                .foregroundStyle(t.text)
+                .background(t.fill, in: Circle())
         }
     }
 
@@ -2625,7 +2705,10 @@ struct ContentView: View {
 
     /// Режимы листаются пальцем или касанием, как в Камере
     private var modeCarousel: some View {
-        ModeCarousel(selected: (LapseScene.allCases.firstIndex(of: e.sceneKind) ?? 0) + 1) { select($0) }
+        ModeCarousel(selected: (LapseScene.allCases.firstIndex(of: e.sceneKind) ?? 0) + 1, accent: t.accent, text: t.text) {
+            Haptic.tap()
+            select($0)
+        }
     }
 
     private func select(_ i: Int) {
@@ -2657,18 +2740,18 @@ struct ContentView: View {
             showShoots = true
         } label: {
             ZStack {
-                RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.1))
+                RoundedRectangle(cornerRadius: 8).fill(t.fill)
                 if let img = e.lastImage {
                     Image(uiImage: img)
                         .resizable()
                         .scaledToFill()
                 } else {
-                    Image(systemName: "film.stack").foregroundStyle(Color.white)
+                    Image(systemName: "film.stack").foregroundStyle(t.text)
                 }
             }
             .frame(width: 52, height: 52)
             .clipShape(RoundedRectangle(cornerRadius: 8))
-            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.white.opacity(0.4)))
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(t.dim))
         }
     }
 
@@ -2676,21 +2759,23 @@ struct ContentView: View {
     private var shutterButton: some View {
         Button {
             switch e.phase {
-            case .idle: e.start()
+            case .idle:
+                Haptic.tap()
+                e.start()
             case .recording, .paused: e.stop()
             case .test, .waiting: e.cancel()
             case .saving: break
             }
         } label: {
             ZStack {
-                Circle().stroke(Color.white, lineWidth: 4).frame(width: 78, height: 78)
+                Circle().stroke(t.text, lineWidth: 4).frame(width: 78, height: 78)
                 switch e.phase {
                 case .idle:
-                    Circle().fill(Color.red).frame(width: 64, height: 64)
+                    Circle().fill(t.rec).frame(width: 64, height: 64)
                 case .recording, .paused:
-                    RoundedRectangle(cornerRadius: 7).fill(Color.red).frame(width: 30, height: 30)
+                    RoundedRectangle(cornerRadius: 7).fill(t.rec).frame(width: 30, height: 30)
                 case .test, .waiting:
-                    Image(systemName: "xmark").font(.system(size: 26, weight: .bold)).foregroundStyle(Color.white)
+                    Image(systemName: "xmark").font(.system(size: 26, weight: .bold)).foregroundStyle(t.text)
                 case .saving:
                     ProgressView()
                 }
@@ -2701,18 +2786,21 @@ struct ContentView: View {
     }
 
     private var testButton: some View {
-        Button { e.testFrame() } label: {
+        Button {
+            Haptic.tap()
+            e.testFrame()
+        } label: {
             VStack(spacing: 1) {
                 if e.phase == .test {
                     ProgressView()
                 } else {
                     Image(systemName: "camera.aperture").font(.system(size: 18, weight: .semibold))
                 }
-                Text("Тест").font(.system(size: 9, weight: .semibold))
+                Text("Тест").font(.system(size: 11, weight: .semibold))
             }
-            .foregroundStyle(Color.white)
-            .frame(width: 52, height: 52)
-            .background(Color.white.opacity(0.14), in: Circle())
+            .foregroundStyle(t.text)
+            .frame(width: 56, height: 56)
+            .background(t.fill, in: Circle())
         }
         .disabled(!idle)
         .opacity(idle || e.phase == .test ? 1 : 0.3)
@@ -2746,13 +2834,30 @@ struct ContentView: View {
                 VStack(spacing: 6) {
                     Text("\(e.framesDone) кадров · \(hms(e.elapsed))")
                     Text(e.status)
-                    if let w = e.batteryWarn { Text(w).foregroundStyle(Color.red.opacity(0.6)) }
+                    if let w = e.batteryWarn { Text(w).foregroundStyle(t.warn) }
                     Text("Коснись, чтобы вернуться")
                 }
                 .font(.footnote)
-                .foregroundStyle(Color.red.opacity(0.35))
+                .foregroundStyle(t.dim)
             }
             .onTapGesture { dark = false }
+    }
+
+    /// Оценка пробного кадра простыми словами: по средней яркости картинки
+    private var testVerdict: (String, Bool)? {
+        guard let cg = e.lastImage?.cgImage,
+              let ctx = CGContext(data: nil, width: 32, height: 18, bitsPerComponent: 8, bytesPerRow: 128,
+                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return nil }
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: 32, height: 18))
+        guard let d = ctx.data?.assumingMemoryBound(to: UInt8.self) else { return nil }
+        var sum = 0
+        for i in 0..<(32 * 18) { sum += (Int(d[i * 4]) * 77 + Int(d[i * 4 + 1]) * 150 + Int(d[i * 4 + 2]) * 29) >> 8 }
+        let m = sum / (32 * 18)
+        if m < 10 { return ("Темно: почти ничего не видно. Подними яркость", false) }
+        if m > 150 { return ("Светло: может пересветить. Убавь яркость", false) }
+        return ("Яркость нормальная, можно снимать", true)
     }
 
     private var testSheet: some View {
@@ -2760,6 +2865,18 @@ struct ContentView: View {
             Color.black.ignoresSafeArea()
             if let img = e.lastImage {
                 Image(uiImage: img).resizable().scaledToFit()
+                if let v = testVerdict {
+                    VStack {
+                        Spacer()
+                        Label(v.0, systemImage: v.1 ? "checkmark.circle" : "exclamationmark.triangle")
+                            .font(.footnote.weight(.semibold))
+                            .foregroundStyle(v.1 ? t.text : t.warn)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 10)
+                            .background(Color.black.opacity(0.7), in: Capsule())
+                            .padding(.bottom, 24)
+                    }
+                }
             } else {
                 Text("Пока нет кадра").foregroundStyle(.secondary)
             }
@@ -2784,13 +2901,13 @@ struct GuideView: View {
         Page(icon: "hand.draw", title: "Листай режимы",
              text: "Проведи пальцем по кадру влево или вправо - режим сменится, как в Камере: Кадр дня, Найтлапс, Таймлапс"),
         Page(icon: "viewfinder", title: "Фокус и яркость",
-             text: "Коснись кадра - фокус и яркость в этой точке. Веди пальцем вверх или вниз - ярче или темнее. Ночью фокус по звёздам наводится сам перед первым кадром. Кнопка «Фокус» сверху - если хочешь сам"),
-        Page(icon: "timer", title: "Как часто и сколько",
-             text: "Внизу три кнопки: ☀︎ яркость, ⏱ как часто снимать, ⌛ сколько снимать. Выдержку приложение подбирает само под режим и свет"),
-        Page(icon: "record.circle", title: "Старт и результат",
-             text: "Красная кнопка - старт и стоп, «Тест» - пробный кадр. После «Стоп» откроется редактор: таймлапс, Starlapse и фото со следами. Все съёмки - в миниатюре слева"),
-        Page(icon: "moon.fill", title: "Ночью",
-             text: "Луна сверху гасит экран, чтобы не светил. Если телефон нагреется, пауза между кадрами сама станет длиннее. Исходные кадры всегда в Файлы → NightLapse")
+             text: "Ночью фокус по звёздам наводится сам перед первым кадром. Коснись кадра - фокус в этой точке, веди пальцем вверх-вниз - ярче или темнее"),
+        Page(icon: "slider.horizontal.3", title: "Три кнопки внизу",
+             text: "Яркость, как часто снимать кадр и сколько снимать. Если значение покраснело - так может выйти плохо, но снимать всё равно можно"),
+        Page(icon: "record.circle", title: "Старт, тест и экспорт",
+             text: "Красная кнопка - старт и стоп, «Тест» - пробный кадр. После «Стоп» откроется редактор: видео (Starlapse, Таймлапс) и фото (Следы, Звёзды). «Экспорт» - в галерею или в приложение"),
+        Page(icon: "moon", title: "Ночью",
+             text: "Интерфейс сам становится красным, чтобы не слепить. Луна вверху гасит экран. «Где Полярная звезда?» на кадре подскажет, куда навести, чтобы следы стали кругами. Приложение следит за зарядом и памятью и остановится заранее, всё сохранив")
     ]
 
     var body: some View {
@@ -2808,7 +2925,7 @@ struct GuideView: View {
                         VStack(spacing: 16) {
                             Image(systemName: pages[i].icon)
                                 .font(.system(size: 54, weight: .light))
-                                .foregroundStyle(Color.yellow)
+                                .foregroundStyle(Pal(night: false).accent)
                             Text(pages[i].title)
                                 .font(.title2.bold())
                             Text(pages[i].text)
@@ -2833,7 +2950,7 @@ struct GuideView: View {
                         .font(.headline)
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 14)
-                        .background(Color.yellow, in: Capsule())
+                        .background(Pal(night: false).accent, in: Capsule())
                         .foregroundStyle(Color.black)
                 }
             }
@@ -2848,6 +2965,8 @@ struct GuideView: View {
 /// 0 - Кадр дня, дальше режимы найтлапса по порядку
 struct ModeCarousel: View {
     let selected: Int
+    var accent: Color = Pal(night: false).accent
+    var text: Color = Pal(night: false).text
     let onSelect: (Int) -> Void
 
     struct Item: Identifiable {
@@ -2867,9 +2986,9 @@ struct ModeCarousel: View {
                 Button { if i != sel { onSelect(i) } } label: {
                     Text(item.title.uppercased())
                         .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(i == sel ? Color.yellow : Color.white)
+                        .foregroundStyle(i == sel ? accent : text)
                         .lineLimit(1)
-                        .frame(width: w, height: 28)
+                        .frame(width: w, height: 36)
                 }
             }
         }
@@ -2893,12 +3012,25 @@ struct SettingsSheet: View {
     @Environment(\.dismiss) private var dismiss
     @AppStorage("guideSeen") private var guideSeen = false
     @AppStorage("autoDark") private var autoDark = true
+    @AppStorage("redUI") private var redUI = 0
 
     var body: some View {
         NavigationStack {
             Form {
                 Section {
-                    Toggle("4K (выкл. = 1080p)", isOn: $e.uhd)
+                    Picker("Красный интерфейс", selection: $redUI) {
+                        Text("Сам, когда темно").tag(0)
+                        Text("Всегда").tag(1)
+                        Text("Никогда").tag(2)
+                    }
+                } header: {
+                    Text("Ночью")
+                } footer: {
+                    Text("Красный свет меньше всего сбивает глаза, привыкшие к темноте")
+                }
+
+                Section {
+                    Toggle("Качество 4K", isOn: $e.uhd)
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
                             Text("Баланс белого")
@@ -2919,11 +3051,11 @@ struct SettingsSheet: View {
                 } header: {
                     Text("Камера")
                 } footer: {
-                    Text("Видео будет горизонтальным или вертикальным - как держишь телефон в момент старта")
+                    Text("Без 4K - Full HD 1080p: меньше места и заряда. Видео будет горизонтальным или вертикальным - как держишь телефон в момент старта")
                 }
 
                 Section("Сохранение") {
-                    Toggle("Видео в Фото", isOn: $e.saveVideo)
+                    Toggle("Сразу сохранять видео в Фото", isOn: $e.saveVideo)
                     Picker("Кадров в секунду", selection: $e.fps) {
                         Text("24").tag(24)
                         Text("25").tag(25)
