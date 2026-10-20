@@ -158,6 +158,8 @@ enum LapseScene: String, CaseIterable, Identifiable {
 
 /// 1/8 с, 0.5 с, 17 с
 func expText(_ v: Double) -> String {
+    // 0 и мусор не делим: 1/0 давало вылет, когда выдержка равна интервалу и пауза 0
+    guard v.isFinite, v > 0.00005 else { return "0 с" }
     if v >= 1 { return abs(v - v.rounded()) < 0.05 ? "\(Int(v.rounded())) с" : String(format: "%.1f с", v) }
     let d = (1 / v).rounded()
     if abs(1 / d - v) < 0.0005 { return "1/\(Int(d)) с" }
@@ -511,7 +513,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     /// Шаг выдержки в шторке: от 1/8 с до интервала, остальное - пауза
     func exposureStep(_ up: Bool) {
         expManual = true
-        let steps = Self.exposureSteps.filter { $0 >= 0.125 - 0.0001 && $0 <= intervalSeconds + 0.0001 }
+        let steps = exposureRange
         if up {
             if let n = steps.first(where: { $0 > exposureSeconds + 0.0001 }) { exposureSeconds = n }
         } else if let n = steps.last(where: { $0 < exposureSeconds - 0.0001 }) {
@@ -520,6 +522,14 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         pauseSeconds = max(0, intervalSeconds - exposureSeconds)
         applyCamera()
     }
+
+    /// Доступные шаги: ночью от 1/8 с, днём от 1/1000 с, и не длиннее интервала
+    var exposureRange: [Double] {
+        let lo = sceneKind == .stars ? 0.125 : 0.001
+        return Self.exposureSteps.filter { $0 >= lo - 0.0001 && $0 <= intervalSeconds + 0.0001 }
+    }
+    var canExposureDown: Bool { (exposureRange.first ?? 0) < exposureSeconds - 0.0001 }
+    var canExposureUp: Bool { (exposureRange.last ?? 0) > exposureSeconds + 0.0001 }
 
     /// Выдержка снова сама: по интервалу и режиму
     func exposureAuto() {
@@ -3008,13 +3018,17 @@ struct ContentView: View {
             case .exposure:
                 HStack(spacing: 16) {
                     stepButton("minus") { e.exposureStep(false) }
+                        .disabled(!e.canExposureDown)
+                        .opacity(e.canExposureDown ? 1 : 0.35)
                     Text("Выдержка \(expText(e.exposureSeconds))")
                         .font(.subheadline.weight(.semibold))
                         .monospacedDigit()
                         .frame(minWidth: 170)
                     stepButton("plus") { e.exposureStep(true) }
+                        .disabled(!e.canExposureUp)
+                        .opacity(e.canExposureUp ? 1 : 0.35)
                 }
-                Text("Пауза между кадрами \(expText(e.pauseSeconds)). Дольше - кадр ярче и меньше шума. Яркость - пальцем по кадру вверх-вниз")
+                Text(e.pauseSeconds < 0.05 ? "Без паузы: кадры идут подряд. Дольше нельзя - выдержка равна интервалу" : "Пауза между кадрами \(expText(e.pauseSeconds)). Дольше - кадр ярче и меньше шума. Яркость - пальцем по кадру вверх-вниз")
                     .font(.footnote)
                     .foregroundStyle(t.dim)
                     .multilineTextAlignment(.center)
