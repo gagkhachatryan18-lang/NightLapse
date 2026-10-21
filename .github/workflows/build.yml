@@ -66,6 +66,12 @@ jobs:
             if [ -d "$W" ]; then
               mkdir -p Payload/NightLapse.app/Watch
               cp -R "$W" Payload/NightLapse.app/Watch/
+              # Sideloadly меняет id приложения на com.gagik.nightlapse.899CHHP2NL (бесплатный Apple ID).
+              # Часы ищут телефонное приложение по этому id - прописываем сразу его
+              P=Payload/NightLapse.app/Watch/NightLapseWatch.app/Info.plist
+              /usr/libexec/PlistBuddy -c "Set :WKCompanionAppBundleIdentifier com.gagik.nightlapse.899CHHP2NL" "$P"
+              /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier com.gagik.nightlapse.899CHHP2NL.watchkitapp" "$P"
+              /usr/libexec/PlistBuddy -c "Print" "$P" | grep -i bundle
               zip -qr out/NightLapse_watch.ipa Payload
             fi
           fi
