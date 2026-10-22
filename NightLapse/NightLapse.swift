@@ -1557,7 +1557,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             if dev.exposureMode != .custom {
                 // Касание кадра включило автоэкспозицию - через пару секунд возвращаем ночное превью
                 applyOnQueue(currentSettingsQueue)
-            } else if dev.exposureTargetOffset > 5 {
+            } else if dev.exposureTargetOffset > 2.5 {
+                // Стало светло (включили днём, зажгли свет) - обратно на автоэкспозицию, без засвеченного кадра
                 nightPreview = false
                 applyOnQueue(currentSettingsQueue)
             }
@@ -2436,6 +2437,10 @@ struct ContentView: View {
         .onDisappear { e.shutdown() }
         .onAppear { UIDevice.current.beginGeneratingDeviceOrientationNotifications(); turnIcons() }
         .onReceive(NotificationCenter.default.publisher(for: UIDevice.orientationDidChangeNotification)) { _ in turnIcons() }
+        // Вернулся в приложение - выдержка снова сама: днём не будет кадра, выставленного под ночь
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
+            if idle && e.expManual { e.exposureAuto() }
+        }
         .onChange(of: e.testCount) {
             showTest = true
             savedTests = TestStore.list().count
@@ -2834,13 +2839,17 @@ struct ContentView: View {
                     Color.clear.frame(width: 40, height: 40)
                 }
                 paramEditor(p)
-                if let w = warning(for: p) { warnText(w) }
+                if p == .exposure, let w = exposureWarn {
+                    Text(w).font(.footnote).foregroundStyle(t.dim).multilineTextAlignment(.center)
+                } else if let w = warning(for: p) {
+                    warnText(w)
+                }
             } else {
                 LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 3), spacing: 14) {
                     // Выдержка вместо яркости: яркость - пальцем по кадру вверх-вниз
                     paramCircle(.exposure, "stopwatch",
                                 e.expManual ? expText(e.exposureSeconds) : "авто \(expText(e.exposureSeconds))",
-                                warn: exposureWarn != nil)
+                                warn: false)
                     paramCircle(.interval, "timer", expText(e.intervalSeconds), warn: intervalWarn != nil)
                     paramCircle(.duration, "hourglass",
                                 e.autoStopMin == 0 ? "Пока не остановлю" : durText(Double(e.autoStopMin) * 60),
@@ -2993,12 +3002,13 @@ struct ContentView: View {
     }
 
 
-    private var firstWarning: String? { exposureWarn ?? evWarn ?? intervalWarn ?? durationWarn }
+    /// Красное - только то, что правда испортит съёмку. Длинная выдержка - осознанный выбор, о ней тихо в самой настройке
+    private var firstWarning: String? { evWarn ?? intervalWarn ?? durationWarn }
 
     /// Ночью длиннее предела звёзды тянутся чёрточками
     private var exposureWarn: String? {
         guard e.expManual, e.sceneKind == .stars, e.exposureSeconds > e.starLimit + 0.01 else { return nil }
-        return "Выдержка длиннее \(Int(e.starLimit)) с: звёзды на каждом кадре смажутся в чёрточки"
+        return "Дольше \(Int(e.starLimit)) с звёзды становятся короткими чёрточками"
     }
 
     /// Подпись кнопки резкости: одно-два слова
