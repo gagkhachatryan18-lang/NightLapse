@@ -2391,6 +2391,8 @@ struct ContentView: View {
     @State private var openParam: Param?
     /// Шторка с настройками съёмки, как панель в Камере: по касанию на сводку сверху
     @State private var panel = false
+    /// Как в Камере: экран не переворачивается, поворачиваются только значки и подписи
+    @State private var devAngle: Angle = .zero
     @State private var showShoots = false
     @AppStorage("guideSeen") private var guideSeen = false
     @State private var shootToOpen: URL?
@@ -2432,6 +2434,8 @@ struct ContentView: View {
             }
         }
         .onDisappear { e.shutdown() }
+        .onAppear { UIDevice.current.beginGeneratingDeviceOrientationNotifications(); turnIcons() }
+        .onReceive(NotificationCenter.default.publisher(for: UIDevice.orientationDidChangeNotification)) { _ in turnIcons() }
         .onChange(of: e.testCount) {
             showTest = true
             savedTests = TestStore.list().count
@@ -2553,10 +2557,24 @@ struct ContentView: View {
             + Text(Image(systemName: "hourglass")) + Text(e.autoStopMin == 0 ? " ∞" : " " + durText(Double(e.autoStopMin) * 60))
     }
 
+    /// Значки смотрят вверх, как ни держи телефон. Лицом вверх или вниз - оставляем как было
+    private func turnIcons() {
+        let a: Double
+        switch UIDevice.current.orientation {
+        case .portrait: a = 0
+        case .landscapeLeft: a = 90
+        case .landscapeRight: a = -90
+        case .portraitUpsideDown: a = 180
+        default: return
+        }
+        withAnimation(.easeInOut(duration: 0.3)) { devAngle = .degrees(a) }
+    }
+
     private func roundIcon(_ name: String, _ action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: name)
                 .font(.system(size: 17, weight: .regular))
+                .rotationEffect(devAngle)
                 .frame(width: 44, height: 44)
                 .foregroundStyle(t.text)
                 .background(t.fill, in: Circle())
@@ -2661,6 +2679,7 @@ struct ContentView: View {
                 } label: {
                     Text(sel ? z.title : z.title.replacingOccurrences(of: "x", with: ""))
                         .font(.system(size: sel ? 14 : 13, weight: .bold))
+                        .rotationEffect(devAngle)
                         .foregroundStyle(sel ? t.accent : t.text)
                         .frame(width: sel ? 40 : 34, height: sel ? 40 : 34)
                         .background(Color.black.opacity(0.55), in: Circle())
@@ -2896,6 +2915,7 @@ struct ContentView: View {
             VStack(spacing: 5) {
                 Image(systemName: icon)
                     .font(.system(size: 20))
+                    .rotationEffect(devAngle)
                     .foregroundStyle(on ? t.accent : (warn ? t.warn : t.text))
                     .frame(width: 56, height: 56)
                     .background(t.fill, in: Circle())
@@ -3175,6 +3195,7 @@ struct ContentView: View {
             .frame(width: 52, height: 52)
             .clipShape(RoundedRectangle(cornerRadius: 8))
             .overlay(RoundedRectangle(cornerRadius: 8).stroke(t.dim))
+            .rotationEffect(devAngle)
         }
     }
 
@@ -3217,6 +3238,7 @@ struct ContentView: View {
             }
             Text("Тест").font(.system(size: 11, weight: .semibold))
         }
+        .rotationEffect(devAngle)
         .foregroundStyle(t.text)
         .frame(width: 56, height: 56)
         .background(t.fill, in: Circle())
