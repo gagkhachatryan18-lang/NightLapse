@@ -1937,7 +1937,6 @@ struct ShootEditor: View {
                             ForEach([Look.startrail, .deep]) { Text($0.title).tag($0) }
                         }
                         .pickerStyle(.segmented)
-                        Text(look.hint).font(.footnote).foregroundStyle(.secondary)
                     }
                     .disabled(r.busy)
                 }

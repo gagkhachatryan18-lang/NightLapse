@@ -79,8 +79,6 @@ struct TestViewer: View {
                             .foregroundStyle(v.1 ? pal.text : pal.warn)
                     }
                     if !message.isEmpty { Text(message).foregroundStyle(pal.dim) }
-                    Text("Два пальца или двойное касание - увеличить. Листай - прошлые тесты")
-                        .foregroundStyle(pal.dim)
                 }
                 .font(.footnote.weight(.semibold))
                 .multilineTextAlignment(.center)
@@ -111,9 +109,9 @@ struct TestViewer: View {
         var sum = 0
         for i in 0..<(32 * 18) { sum += (Int(d[i * 4]) * 77 + Int(d[i * 4 + 1]) * 150 + Int(d[i * 4 + 2]) * 29) >> 8 }
         let m = sum / (32 * 18)
-        if m < 10 { return ("Темно: почти ничего не видно. Подними яркость", false) }
-        if m > 150 { return ("Светло: может пересветить. Убавь яркость", false) }
-        return ("Яркость нормальная, можно снимать", true)
+        if m < 10 { return ("Кадр может быть тёмным", false) }
+        if m > 150 { return ("Кадр может быть пересвечен", false) }
+        return ("Яркость в норме", true)
     }
 
     private func exportCurrent() {

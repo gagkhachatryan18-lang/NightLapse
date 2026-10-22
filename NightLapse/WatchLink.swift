@@ -78,7 +78,7 @@ final class WatchLink: NSObject, WCSessionDelegate {
             switch cmd {
             case "shutter":
                 switch e.phase {
-                case .idle: e.start()
+                case .idle: if e.sceneKind == .photo { e.takePhoto() } else { e.start() }
                 case .recording, .paused: e.stop()
                 case .test, .waiting: e.cancel()
                 case .saving: break

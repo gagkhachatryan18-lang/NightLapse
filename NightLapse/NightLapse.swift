@@ -126,18 +126,20 @@ enum Phase { case idle, test, waiting, recording, paused, saving }
 /// Найтлапс - ночь и звёзды: кадры почти подряд, следы, Starlapse и фото - потом в редакторе.
 /// Таймлапс - обычный, в основном днём. rawValue оставлены старые, чтобы не терялись настройки
 enum LapseScene: String, CaseIterable, Identifiable {
-    case stars, clouds
+    case stars, clouds, photo
     var id: String { rawValue }
     var title: String {
         switch self {
         case .stars: return "Найтлапс"
         case .clouds: return "Таймлапс"
+        case .photo: return "Фото"
         }
     }
     var hint: String {
         switch self {
         case .stars: return "Ночное небо"
         case .clouds: return "Дневной таймлапс"
+        case .photo: return "Одно фото"
         }
     }
     /// Снимок каждые N секунд по умолчанию
@@ -145,6 +147,7 @@ enum LapseScene: String, CaseIterable, Identifiable {
         switch self {
         case .stars: return 8
         case .clouds: return 5
+        case .photo: return 30   // у фото интервала нет: это потолок выдержки
         }
     }
     var lighten: Bool { false }
@@ -152,6 +155,7 @@ enum LapseScene: String, CaseIterable, Identifiable {
         switch self {
         case .stars: return -1
         case .clouds: return -0.5
+        case .photo: return -0.5
         }
     }
 }
@@ -318,6 +322,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         switch sc {
         case .stars: cap = starLimit
         case .clouds: cap = 2
+        case .photo: cap = starLimit   // днём сама станет короче, как в таймлапсе
         }
         let ex = expManual ? min(exposureSeconds, intervalSeconds) : min(intervalSeconds, cap)
         exposureSeconds = ex
@@ -985,6 +990,16 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
     /// Что сделать сразу после поиска резкости (тест или старт, которые его вызвали)
     private var afterFocus: (() -> Void)?
+
+    /// Режим «Фото»: тот же кадр, что «Тест», только в полном размере и сразу в галерею
+    private var photoPending = false
+
+    func takePhoto() {
+        guard phase == .idle else { return }
+        photoPending = true
+        testFrame()
+        if phase != .test { photoPending = false }
+    }
 
     func testFrame() {
         guard phase == .idle else { return }
@@ -1772,6 +1787,26 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         var mean: Float = 0
         if cfg.isoAuto, let f = frame { mean = meanLuma(f) }
 
+        if mode == .test && photoPending {
+            mode = .off
+            photoPending = false
+            DispatchQueue.main.async { self.applyCamera() }
+            let img = frame.flatMap { makeThumb($0, maxSide: 2000) }
+            let full = frame.flatMap { makeThumb($0, maxSide: 10000) }?.cgImage
+            Diag.event("Фото: подкадров \(n), сенсор \(String(format: "%.4f", CMTimeGetSeconds(curDur))) с, ISO \(Int(curISO)), выдержка \(cfg.exposure) с")
+            DispatchQueue.main.async { self.lastImage = img; self.subDone = 0 }
+            guard let cg = full, let data = ShootStore.jpeg(cg) else {
+                DispatchQueue.main.async { self.finished("Фото не получилось") }
+                return
+            }
+            PHPhotoLibrary.shared().performChanges({
+                PHAssetCreationRequest.forAsset().addResource(with: .photo, data: data, options: nil)
+            }) { ok, _ in
+                DispatchQueue.main.async { self.finished(ok ? "Фото в галерее" : "Нет доступа к галерее") }
+            }
+            return
+        }
+
         if mode == .test {
             mode = .off
             DispatchQueue.main.async { self.applyCamera() }
@@ -2557,7 +2592,10 @@ struct ContentView: View {
 
     /// Интервал, выдержка, длительность - значками, как в шторке
     private var summaryText: Text {
-        Text(Image(systemName: "timer")) + Text(" \(expText(e.intervalSeconds))   ")
+        if e.sceneKind == .photo {
+            return Text(Image(systemName: "stopwatch")) + Text(" \(expText(e.exposureSeconds))")
+        }
+        return Text(Image(systemName: "timer")) + Text(" \(expText(e.intervalSeconds))   ")
             + Text(Image(systemName: "stopwatch")) + Text(" \(expText(e.exposureSeconds))   ")
             + Text(Image(systemName: "hourglass")) + Text(e.autoStopMin == 0 ? " ∞" : " " + durText(Double(e.autoStopMin) * 60))
     }
@@ -2756,7 +2794,7 @@ struct ContentView: View {
                 if !focusHintSeen && e.needsStarFocus {
                     HStack(spacing: 8) {
                         Image(systemName: "viewfinder")
-                        Text("Фокус наведётся сам по звёздам перед первым кадром, около 15 секунд")
+                        Text("Фокус по звёздам - сам, ~15 с")
                         Button { focusHintSeen = true } label: { Image(systemName: "xmark") }
                             .accessibilityLabel("Понятно")
                     }
@@ -2850,10 +2888,12 @@ struct ContentView: View {
                     paramCircle(.exposure, "stopwatch",
                                 e.expManual ? expText(e.exposureSeconds) : "авто \(expText(e.exposureSeconds))",
                                 warn: false)
-                    paramCircle(.interval, "timer", expText(e.intervalSeconds), warn: intervalWarn != nil)
-                    paramCircle(.duration, "hourglass",
-                                e.autoStopMin == 0 ? "Пока не остановлю" : durText(Double(e.autoStopMin) * 60),
-                                warn: durationWarn != nil)
+                    if e.sceneKind != .photo {
+                        paramCircle(.interval, "timer", expText(e.intervalSeconds), warn: intervalWarn != nil)
+                        paramCircle(.duration, "hourglass",
+                                    e.autoStopMin == 0 ? "Пока не остановлю" : durText(Double(e.autoStopMin) * 60),
+                                    warn: durationWarn != nil)
+                    }
                     circleButton("viewfinder", "Фокус", focusShort, on: e.starFocused || openParam == .focus, warn: false) {
                         showFocusMenu = true
                     }
@@ -3003,12 +3043,12 @@ struct ContentView: View {
 
 
     /// Красное - только то, что правда испортит съёмку. Длинная выдержка - осознанный выбор, о ней тихо в самой настройке
-    private var firstWarning: String? { evWarn ?? intervalWarn ?? durationWarn }
+    private var firstWarning: String? { e.sceneKind == .photo ? evWarn : (evWarn ?? intervalWarn ?? durationWarn) }
 
     /// Ночью длиннее предела звёзды тянутся чёрточками
     private var exposureWarn: String? {
-        guard e.expManual, e.sceneKind == .stars, e.exposureSeconds > e.starLimit + 0.01 else { return nil }
-        return "Дольше \(Int(e.starLimit)) с звёзды становятся короткими чёрточками"
+        guard e.expManual, e.sceneKind != .clouds, e.exposureSeconds > e.starLimit + 0.01 else { return nil }
+        return "Дольше \(Int(e.starLimit)) с - звёзды чёрточками"
     }
 
     /// Подпись кнопки резкости: одно-два слова
@@ -3058,7 +3098,7 @@ struct ContentView: View {
                         .disabled(!e.canExposureUp)
                         .opacity(e.canExposureUp ? 1 : 0.35)
                 }
-                Text(e.pauseSeconds < 0.05 ? "Без паузы: кадры идут подряд. Дольше нельзя - выдержка равна интервалу" : "Пауза между кадрами \(expText(e.pauseSeconds)). Дольше - кадр ярче и меньше шума. Яркость - пальцем по кадру вверх-вниз")
+                Text(e.sceneKind == .photo ? "Дольше - ярче и чище" : (e.pauseSeconds < 0.05 ? "Без пауз" : "Пауза \(expText(e.pauseSeconds))"))
                     .font(.footnote)
                     .foregroundStyle(t.dim)
                     .multilineTextAlignment(.center)
@@ -3074,7 +3114,7 @@ struct ContentView: View {
                         .tint(t.accent)
                     Image(systemName: "sun.max")
                 }
-                Text("Яркость \(String(format: "%+.1f", e.evComp)). Можно и пальцем по кадру вверх-вниз")
+                Text("Яркость \(String(format: "%+.1f", e.evComp))")
                     .font(.footnote)
                     .foregroundStyle(t.dim)
             case .interval:
@@ -3097,8 +3137,7 @@ struct ContentView: View {
                         .tint(t.accent)
                     stepButton("plus") { nudgeFocus(0.005) }
                 }
-                Text(e.isDark ? "Середина кадра увеличена в 4 раза. Двигай, пока звёзды не станут самыми мелкими точками"
-                     : "Середина кадра увеличена в 4 раза. Двигай, пока детали не станут самыми чёткими")
+                Text(e.isDark ? "Звёзды - самые мелкие точки" : "До самой чёткой картинки")
                     .font(.footnote)
                     .foregroundStyle(t.dim)
                     .multilineTextAlignment(.center)
@@ -3147,13 +3186,12 @@ struct ContentView: View {
         let ex = expText(e.exposureSeconds)
         switch e.sceneKind {
         case .stars:
-            return e.pauseSeconds > 1.5
-                ? (e.zoom > 1.01
-                    ? "На \(zoomText(e.zoom)) выдержка до \(ex), иначе звёзды смажутся. Длиннее - на 1x или 0.5x"
-                    : "Выдержка \(ex), остальное - пауза. Следы между кадрами редактор дорисует")
-                : "Выдержка \(ex), почти без пауз - следы сплошные"
+            if e.zoom > 1.01 && !e.expManual { return "На \(zoomText(e.zoom)) выдержка до \(ex)" }
+            return e.pauseSeconds > 0.05 ? "Выдержка \(ex), пауза \(expText(e.pauseSeconds))" : "Выдержка \(ex), без пауз"
         case .clouds:
-            return "Выдержка до \(ex), днём сама короче"
+            return "Выдержка до \(ex)"
+        case .photo:
+            return "Выдержка \(ex)"
         }
     }
 
@@ -3182,7 +3220,8 @@ struct ContentView: View {
             Spacer()
             shutterButton
             Spacer()
-            testButton.opacity(shooting ? 0 : 1)
+            testButton.opacity(shooting || e.sceneKind == .photo ? 0 : 1)
+                .disabled(e.sceneKind == .photo)
         }
         .padding(.horizontal, 28)
     }
@@ -3214,7 +3253,7 @@ struct ContentView: View {
         Button {
             switch e.phase {
             case .idle:
-                    e.start()
+                if e.sceneKind == .photo { e.takePhoto() } else { e.start() }
             case .recording, .paused: e.stop()
             case .test, .waiting: e.cancel()
             case .saving: break
@@ -3224,7 +3263,8 @@ struct ContentView: View {
                 Circle().stroke(t.text, lineWidth: 4).frame(width: 78, height: 78)
                 switch e.phase {
                 case .idle:
-                    Circle().fill(t.rec).frame(width: 64, height: 64)
+                    // Фото - белая кнопка, как в Камере; съёмка - красная
+                    Circle().fill(e.sceneKind == .photo ? t.text : t.rec).frame(width: 64, height: 64)
                 case .recording, .paused:
                     RoundedRectangle(cornerRadius: 7).fill(t.rec).frame(width: 30, height: 30)
                 case .test, .waiting:
@@ -3277,7 +3317,8 @@ struct ContentView: View {
         let interval = max(e.intervalSeconds, 0.01)
         let fps = Double(max(e.fps, 1))
         let videoPerHour = 3600 / interval / fps
-        var s = "\(e.sceneKind.hint) · 1 час съёмки = \(String(format: "%.1f", videoPerHour)) с видео"
+        if e.sceneKind == .photo { return "Одно фото с длинной выдержкой - сразу в галерею" }
+        var s = "\(e.sceneKind.hint) · 1 час = \(String(format: "%.0f", videoPerHour)) с видео"
         if e.autoStopMin > 0 {
             s += ", за \(durText(Double(e.autoStopMin) * 60)) - \(String(format: "%.1f", videoPerHour * Double(e.autoStopMin) / 60)) с"
         }
