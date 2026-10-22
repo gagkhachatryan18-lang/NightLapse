@@ -1922,14 +1922,23 @@ struct ShootEditor: View {
             VStack(spacing: 16) {
                 previewBox.aspectRatio(eff == .reel ? 0.75 : 16 / 9, contentMode: .fit)
                 VStack(spacing: 4) {
-                    Text(day ? "Таймлапс готов" : "Ночь готова").font(.title2.bold())
+                    Text(look.isVideo ? "Видео готово" : "Фото готово").font(.title2.bold())
                     Text("\(durationText) · \(shoot.frames) кадров").font(.subheadline).foregroundStyle(.secondary)
                 }
                 if !day {
-                    Picker("Вид", selection: $look) {
-                        ForEach([Look.starlapse, .timelapse]) { Text($0.title).tag($0) }
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Видео").font(.footnote).foregroundStyle(.secondary)
+                        Picker("Видео", selection: $look) {
+                            ForEach([Look.starlapse, .timelapse]) { Text($0.title).tag($0) }
+                        }
+                        .pickerStyle(.segmented)
+                        Text("Фото").font(.footnote).foregroundStyle(.secondary)
+                        Picker("Фото", selection: $look) {
+                            ForEach([Look.startrail, .deep]) { Text($0.title).tag($0) }
+                        }
+                        .pickerStyle(.segmented)
+                        Text(look.hint).font(.footnote).foregroundStyle(.secondary)
                     }
-                    .pickerStyle(.segmented)
                     .disabled(r.busy)
                 }
                 Button { askExport = true } label: {
