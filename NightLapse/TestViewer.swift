@@ -16,13 +16,20 @@ enum TestStore {
         return f
     }()
 
-    static func save(_ img: CGImage) {
+    static func save(_ img: CGImage, label: String = "") {
         guard let data = ShootStore.jpeg(img) else { return }
-        let url = dir.appendingPathComponent("test_\(fmt.string(from: Date())).jpg")
+        let tail = label.isEmpty ? "" : "_" + label.replacingOccurrences(of: "_", with: " ").replacingOccurrences(of: "/", with: "-")
+        let url = dir.appendingPathComponent("test_\(fmt.string(from: Date()))\(tail).jpg")
         try? data.write(to: url)
         // Храним только последние 30
         let all = list()
         if all.count > 30 { for u in all.dropFirst(30) { try? FileManager.default.removeItem(at: u) } }
+    }
+
+    /// Подпись способа из имени файла (для сравнения), у обычного теста - пусто
+    static func label(_ u: URL) -> String {
+        let parts = u.deletingPathExtension().lastPathComponent.split(separator: "_", maxSplits: 3)
+        return parts.count > 3 ? String(parts[3]) : ""
     }
 
     /// Новые первыми
@@ -63,7 +70,12 @@ struct TestViewer: View {
                     Button("Закрыть") { dismiss() }
                     Spacer()
                     if !urls.isEmpty {
-                        Text("\(idx + 1) из \(urls.count)").monospacedDigit().foregroundStyle(pal.dim)
+                        VStack(spacing: 2) {
+                            Text("\(idx + 1) из \(urls.count)").monospacedDigit().foregroundStyle(pal.dim)
+                            if idx < urls.count, !TestStore.label(urls[idx]).isEmpty {
+                                Text(TestStore.label(urls[idx])).font(.footnote).foregroundStyle(pal.text)
+                            }
+                        }
                         Spacer()
                         Button("Экспорт") { exportCurrent() }
                     }

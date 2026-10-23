@@ -740,7 +740,11 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
                     dev.activeFormat = f
                     dev.unlockForConfiguration()
                 }
-                if let r = self.photoOut.availableRawPhotoPixelFormatTypes.first(where: { AVCapturePhotoOutput.isBayerRAWPixelFormat($0) }) {
+                // Обычный RAW, а если его нет (на новых iPhone бывает только ProRAW) - ProRAW
+                if self.photoOut.isAppleProRAWSupported { self.photoOut.isAppleProRAWEnabled = true }
+                let types = self.photoOut.availableRawPhotoPixelFormatTypes
+                if let r = types.first(where: { AVCapturePhotoOutput.isBayerRAWPixelFormat($0) })
+                    ?? types.first(where: { AVCapturePhotoOutput.isAppleProRAWPixelFormat($0) }) {
                     found = r
                     if let big = f.supportedMaxPhotoDimensions.max(by: { Int($0.width) * Int($0.height) < Int($1.width) * Int($1.height) }) {
                         self.photoOut.maxPhotoDimensions = big
@@ -800,35 +804,78 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         }
     }
 
-    // MARK: Режим «Фото»: снимки через фото-обработку iPhone (шумодав, Deep Fusion), ночью - серия и среднее
+    // MARK: Режим «Фото» и сравнение способов: снимки через фото-обработку iPhone
+
+    /// Один способ снять: авто как в Камере или своя выдержка и ISO, сколько снимков сложить, подтягивать ли яркость
+    struct PhotoJob {
+        var label: String
+        var auto = false
+        var dur = 1.0
+        var iso: Float = 0          // 0 - максимальный
+        var count = 1
+        var normalize = false
+    }
 
     /// Идёт серия фото: снимки из делегата идут сюда, а не в RAW
     fileprivate var seriesActive = false
+    private var jobs: [PhotoJob] = []
+    private var jobIdx = 0
+    private var jobsToGallery = true
     private var seriesAcc: [UInt16] = []
     private var seriesW = 0
     private var seriesH = 0
     private var seriesN = 0
     private var seriesLeft = 0
     private var seriesTotal = 0
-    private var seriesDark = false
     private var seriesEV = 0.0
+    private var seriesThumb: UIImage?
+    private var seriesSaved = 0
 
-    /// Днём - один снимок с автоэкспозицией, как в Камере. Ночью или с выдержкой, выставленной руками, -
-    /// серия снимков до 1 с, их среднее: чем длиннее выдержка, тем больше снимков и тем чище кадр
+    /// Режим «Фото». Днём - один снимок с автоэкспозицией, как в Камере. Ночью или с выдержкой, выставленной руками, -
+    /// серия снимков до 1 с и их среднее: чем длиннее выдержка, тем больше снимков и тем чище кадр
     func photoSeries() {
+        guard phase == .idle, let dev = device else { return }
+        let fmt = dev.activeFormat
+        var j = PhotoJob(label: "Фото")
+        if isDark || expManual {
+            let dmax = min(1.0, CMTimeGetSeconds(fmt.maxExposureDuration))
+            j.count = min(60, max(1, Int((exposureSeconds / dmax - 0.001).rounded(.up))))
+            j.dur = max(exposureSeconds / Double(j.count), CMTimeGetSeconds(fmt.minExposureDuration))
+            if !isDark {
+                // Яркость как в превью: то же количество света, только другой выдержкой
+                j.iso = Float(Double(dev.iso) * CMTimeGetSeconds(dev.exposureDuration) / j.dur)
+            }
+            j.normalize = isDark
+        } else {
+            j.auto = true
+        }
+        runJobs([j], toGallery: true)
+    }
+
+    /// Эксперимент: несколько способов подряд, все кадры - в «Тесты», чтобы сравнить и выбрать лучший
+    func compareTest() {
+        let n = 8
+        runJobs([
+            PhotoJob(label: "1 авто как Камера", auto: true),
+            PhotoJob(label: "2 один кадр 1 с", dur: 1),
+            PhotoJob(label: "3 среднее \(n) по 1 с", dur: 1, count: n),
+            PhotoJob(label: "4 среднее \(n) по 1 с ярче", dur: 1, count: n, normalize: true),
+            PhotoJob(label: "5 ISO ниже, среднее \(n)", dur: 1, iso: -2, count: n, normalize: true),
+        ], toGallery: false)
+    }
+
+    private func runJobs(_ list: [PhotoJob], toGallery: Bool) {
         guard phase == .idle else { return }
-        let dark = isDark
-        let manual = expManual
-        let total = exposureSeconds
-        let ev = evComp
         let hold = startHold
         phase = .test
         subDone = 0
+        subTotal = list.reduce(0) { $0 + $1.count }
         status = "Не трогай телефон \(hold) с..."
         UIApplication.shared.isIdleTimerDisabled = true
         let angle = captureAngle()
+        let ev = evComp
         queue.async {
-            guard let dev = self.device else { return self.seriesDone("Камера недоступна", nil) }
+            guard let dev = self.device else { return self.jobsDone("Камера недоступна") }
             self.session.beginConfiguration()
             if !self.session.outputs.contains(self.photoOut), self.session.canAddOutput(self.photoOut) {
                 self.session.addOutput(self.photoOut)
@@ -841,41 +888,50 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             if let c = self.photoOut.connection(with: .video), c.isVideoRotationAngleSupported(angle) {
                 c.videoRotationAngle = angle
             }
-            let fmt = dev.activeFormat
-            var k = 1
-            if dark || manual {
-                let dmax = min(1.0, CMTimeGetSeconds(fmt.maxExposureDuration))
-                k = min(60, max(1, Int((total / dmax - 0.001).rounded(.up))))
-                let d = max(total / Double(k), CMTimeGetSeconds(fmt.minExposureDuration))
-                var iso = fmt.maxISO
-                if !dark {
-                    // Яркость как в превью: то же количество света, только другой выдержкой
-                    let normal = Double(dev.iso) * CMTimeGetSeconds(dev.exposureDuration)
-                    iso = Float(normal / d)
-                }
-                iso = min(max(iso, fmt.minISO), fmt.maxISO)
-                if (try? dev.lockForConfiguration()) != nil {
-                    dev.setExposureModeCustom(duration: CMTime(seconds: d, preferredTimescale: 1_000_000), iso: iso, completionHandler: nil)
-                    dev.unlockForConfiguration()
-                }
-            }
-            self.seriesAcc = []
-            self.seriesW = 0
-            self.seriesH = 0
-            self.seriesN = 0
-            self.seriesLeft = k
-            self.seriesTotal = k
-            self.seriesDark = dark
+            self.jobs = list
+            self.jobIdx = 0
+            self.jobsToGallery = toGallery
             self.seriesEV = ev
+            self.seriesThumb = nil
+            self.seriesSaved = 0
             self.seriesActive = true
-            Diag.event("Фото: снимков \(k), ночь \(dark), выдержка \(total) с, руками \(manual)")
-            DispatchQueue.main.async { self.subTotal = k }
-            // Пока телефон успокоится после касания и встанет выдержка
-            self.queue.asyncAfter(deadline: .now() + Double(hold)) {
-                DispatchQueue.main.async { self.status = k > 1 ? "Снимаю \(k) кадров, не трогай телефон" : "Снимаю..." }
-                self.shootSeries()
-            }
+            Diag.event("Фото: \(list.map { "\($0.label) \($0.count)×\($0.auto ? "авто" : String(format: "%.2f с", $0.dur))" }.joined(separator: "; "))")
+            // Пока телефон успокоится после касания
+            self.queue.asyncAfter(deadline: .now() + Double(hold)) { self.startJob() }
         }
+    }
+
+    /// queue: выставить выдержку способа и начать его снимки
+    private func startJob() {
+        guard seriesActive else { return }
+        guard jobIdx < jobs.count, let dev = device else { return jobsDone(nil) }
+        let j = jobs[jobIdx]
+        let fmt = dev.activeFormat
+        if (try? dev.lockForConfiguration()) != nil {
+            if j.auto {
+                if dev.isExposureModeSupported(.continuousAutoExposure) { dev.exposureMode = .continuousAutoExposure }
+                dev.setExposureTargetBias(min(max(Float(seriesEV), dev.minExposureTargetBias), dev.maxExposureTargetBias), completionHandler: nil)
+            } else {
+                var iso = j.iso > 0 ? j.iso : fmt.maxISO
+                if j.iso < 0 { iso = fmt.maxISO * powf(2, j.iso) }   // -2: на 2 ступени ниже максимума
+                iso = min(max(iso, fmt.minISO), fmt.maxISO)
+                let d = min(max(j.dur, CMTimeGetSeconds(fmt.minExposureDuration)), CMTimeGetSeconds(fmt.maxExposureDuration))
+                dev.setExposureModeCustom(duration: CMTime(seconds: d, preferredTimescale: 1_000_000), iso: iso, completionHandler: nil)
+            }
+            dev.unlockForConfiguration()
+        }
+        seriesAcc = []
+        seriesW = 0
+        seriesH = 0
+        seriesN = 0
+        seriesLeft = j.count
+        seriesTotal = j.count
+        let label = j.label
+        DispatchQueue.main.async {
+            self.status = self.jobs.count > 1 ? "\(label): снимаю" : (j.count > 1 ? "Снимаю \(j.count) кадров, не трогай телефон" : "Снимаю...")
+        }
+        // Выдержке встать: авто нужно чуть дольше
+        queue.asyncAfter(deadline: .now() + (j.auto ? 1.5 : 1.2)) { self.shootSeries() }
     }
 
     private func shootSeries() {
@@ -889,10 +945,10 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     fileprivate func seriesShot(_ data: Data?) {
         queue.async {
             guard self.seriesActive else { return }
-            // Нажали «Отмена» - ничего не сохраняем
+            // Нажали «Отмена» - дальше не снимаем, лишнего не сохраняем
             if self.phase != .test {
                 self.seriesAcc = []
-                return self.seriesDone("Отменено", nil)
+                return self.jobsDone("Отменено")
             }
             if let d = data, let src = CGImageSourceCreateWithData(d as CFData, nil),
                let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, [
@@ -903,12 +959,13 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
                 self.seriesAdd(cg)
             }
             self.seriesLeft -= 1
-            let done = self.seriesTotal - self.seriesLeft
-            DispatchQueue.main.async { self.subDone = done }
+            DispatchQueue.main.async { self.subDone += 1 }
             if self.seriesLeft > 0 {
                 self.shootSeries()
             } else {
-                self.seriesFinish()
+                self.finishJob()
+                self.jobIdx += 1
+                self.startJob()
             }
         }
     }
@@ -938,13 +995,14 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         seriesN += 1
     }
 
-    private func seriesFinish() {
-        seriesActive = false
+    /// queue: среднее способа -> в галерею (режим «Фото») или в «Тесты» (сравнение)
+    private func finishJob() {
+        let j = jobs[jobIdx]
         let n = seriesN, w = seriesW, h = seriesH
-        guard n > 0 else { return seriesDone("Фото не получилось", nil) }
-        // Среднее. Ночью ещё и яркость: небо по середине гистограммы - к спокойному тёмному тону, как у Камеры
+        guard n > 0 else { return }
+        // Ночью - ещё и яркость: середина гистограммы к спокойному тёмному тону
         var gain: Float = 1
-        if seriesDark {
+        if j.normalize {
             var hist = [Int](repeating: 0, count: 256 * n + 1)
             var i = 0
             while i < seriesAcc.count {
@@ -956,8 +1014,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             var acc = 0, med = 1
             for (v, c) in hist.enumerated() { acc += c; if acc >= half { med = max(v, 1); break } }
             let median = Float(med) / Float(n)
-            let target = 45 * Float(pow(2, seriesEV + 0.5))
-            gain = min(max(target / median, 0.5), 8)
+            gain = min(max(45 * Float(pow(2, seriesEV + 0.5)) / median, 0.5), 8)
         }
         let k = gain / Float(n)
         var out = [UInt8](repeating: 255, count: w * h * 4)
@@ -967,32 +1024,45 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             }
         }
         seriesAcc = []
-        let data = Data(out)
-        guard let prov = CGDataProvider(data: data as CFData),
+        guard let prov = CGDataProvider(data: Data(out) as CFData),
               let cg = CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: w * 4,
                                space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
-                               provider: prov, decode: nil, shouldInterpolate: false, intent: .defaultIntent),
-              let jpg = ShootStore.jpeg(cg) else { return seriesDone("Фото не получилось", nil) }
-        let thumb = ShootStore.thumbData(jpg, maxPixel: 600)
-        PHPhotoLibrary.shared().performChanges({
-            PHAssetCreationRequest.forAsset().addResource(with: .photo, data: jpg, options: nil)
-        }) { ok, _ in
-            self.queue.async { self.seriesDone(ok ? "Фото в галерее" : "Нет доступа к галерее", thumb) }
+                               provider: prov, decode: nil, shouldInterpolate: false, intent: .defaultIntent) else { return }
+        if jobsToGallery {
+            guard let jpg = ShootStore.jpeg(cg) else { return }
+            seriesThumb = ShootStore.thumbData(jpg, maxPixel: 600)
+            let sem = DispatchSemaphore(value: 0)
+            PHPhotoLibrary.shared().performChanges({
+                PHAssetCreationRequest.forAsset().addResource(with: .photo, data: jpg, options: nil)
+            }) { ok, _ in
+                if ok { self.seriesSaved += 1 }
+                sem.signal()
+            }
+            sem.wait()
+        } else {
+            TestStore.save(cg, label: j.label)
+            seriesSaved += 1
         }
     }
 
-    /// Убрать фото-выход, вернуть превью
-    private func seriesDone(_ msg: String, _ thumb: UIImage?) {
+    /// queue: убрать фото-выход, вернуть превью
+    private func jobsDone(_ msg0: String?) {
         seriesActive = false
         session.beginConfiguration()
         if session.outputs.contains(photoOut) { session.removeOutput(photoOut) }
         session.commitConfiguration()
+        let msg = msg0 ?? (jobsToGallery
+            ? (seriesSaved > 0 ? "Фото в галерее" : "Фото не сохранилось")
+            : "Сравнение готово: \(seriesSaved) вариантов в «Тестах»")
         Diag.event(msg)
+        let thumb = seriesThumb
+        let showTests = msg0 == nil && !jobsToGallery && seriesSaved > 0
         DispatchQueue.main.async {
             if let t = thumb { self.lastImage = t }
             self.subDone = 0
             self.applyCamera()
             self.finished(msg)
+            if showTests { self.testCount += 1 }
         }
     }
 
@@ -3728,14 +3798,18 @@ struct SettingsSheet: View {
                 }
 
                 Section {
+                    Button("Сравнить способы съёмки") {
+                        dismiss()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { e.compareTest() }
+                    }
                     Button("Снять 5 RAW-кадров по 1 с") {
                         dismiss()
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { e.rawTest() }
                     }
                 } header: {
-                    Text("Эксперимент: RAW")
+                    Text("Эксперимент")
                 } footer: {
-                    Text("Сырые кадры (DNG) для сравнения в Lightroom. Лягут в Файлы → На iPhone → NightLapse → RAW")
+                    Text("Сравнение - 5 способов подряд, около минуты, все кадры в «Тестах». RAW - в Файлы → NightLapse → RAW")
                 }
 
                 Section("Подсказки") {
