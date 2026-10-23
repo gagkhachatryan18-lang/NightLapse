@@ -800,6 +800,202 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         }
     }
 
+    // MARK: Режим «Фото»: снимки через фото-обработку iPhone (шумодав, Deep Fusion), ночью - серия и среднее
+
+    /// Идёт серия фото: снимки из делегата идут сюда, а не в RAW
+    fileprivate var seriesActive = false
+    private var seriesAcc: [UInt16] = []
+    private var seriesW = 0
+    private var seriesH = 0
+    private var seriesN = 0
+    private var seriesLeft = 0
+    private var seriesTotal = 0
+    private var seriesDark = false
+    private var seriesEV = 0.0
+
+    /// Днём - один снимок с автоэкспозицией, как в Камере. Ночью или с выдержкой, выставленной руками, -
+    /// серия снимков до 1 с, их среднее: чем длиннее выдержка, тем больше снимков и тем чище кадр
+    func photoSeries() {
+        guard phase == .idle else { return }
+        let dark = isDark
+        let manual = expManual
+        let total = exposureSeconds
+        let ev = evComp
+        let hold = startHold
+        phase = .test
+        subDone = 0
+        status = "Не трогай телефон \(hold) с..."
+        UIApplication.shared.isIdleTimerDisabled = true
+        let angle = captureAngle()
+        queue.async {
+            guard let dev = self.device else { return self.seriesDone("Камера недоступна", nil) }
+            self.session.beginConfiguration()
+            if !self.session.outputs.contains(self.photoOut), self.session.canAddOutput(self.photoOut) {
+                self.session.addOutput(self.photoOut)
+            }
+            self.session.commitConfiguration()
+            self.photoOut.maxPhotoQualityPrioritization = .quality
+            if let big = dev.activeFormat.supportedMaxPhotoDimensions.max(by: { Int($0.width) * Int($0.height) < Int($1.width) * Int($1.height) }) {
+                self.photoOut.maxPhotoDimensions = big
+            }
+            if let c = self.photoOut.connection(with: .video), c.isVideoRotationAngleSupported(angle) {
+                c.videoRotationAngle = angle
+            }
+            let fmt = dev.activeFormat
+            var k = 1
+            if dark || manual {
+                let dmax = min(1.0, CMTimeGetSeconds(fmt.maxExposureDuration))
+                k = min(60, max(1, Int((total / dmax - 0.001).rounded(.up))))
+                let d = max(total / Double(k), CMTimeGetSeconds(fmt.minExposureDuration))
+                var iso = fmt.maxISO
+                if !dark {
+                    // Яркость как в превью: то же количество света, только другой выдержкой
+                    let normal = Double(dev.iso) * CMTimeGetSeconds(dev.exposureDuration)
+                    iso = Float(normal / d)
+                }
+                iso = min(max(iso, fmt.minISO), fmt.maxISO)
+                if (try? dev.lockForConfiguration()) != nil {
+                    dev.setExposureModeCustom(duration: CMTime(seconds: d, preferredTimescale: 1_000_000), iso: iso, completionHandler: nil)
+                    dev.unlockForConfiguration()
+                }
+            }
+            self.seriesAcc = []
+            self.seriesW = 0
+            self.seriesH = 0
+            self.seriesN = 0
+            self.seriesLeft = k
+            self.seriesTotal = k
+            self.seriesDark = dark
+            self.seriesEV = ev
+            self.seriesActive = true
+            Diag.event("Фото: снимков \(k), ночь \(dark), выдержка \(total) с, руками \(manual)")
+            DispatchQueue.main.async { self.subTotal = k }
+            // Пока телефон успокоится после касания и встанет выдержка
+            self.queue.asyncAfter(deadline: .now() + Double(hold)) {
+                DispatchQueue.main.async { self.status = k > 1 ? "Снимаю \(k) кадров, не трогай телефон" : "Снимаю..." }
+                self.shootSeries()
+            }
+        }
+    }
+
+    private func shootSeries() {
+        guard seriesActive else { return }
+        let st = AVCapturePhotoSettings()
+        st.photoQualityPrioritization = .quality
+        st.maxPhotoDimensions = photoOut.maxPhotoDimensions
+        photoOut.capturePhoto(with: st, delegate: self)
+    }
+
+    fileprivate func seriesShot(_ data: Data?) {
+        queue.async {
+            guard self.seriesActive else { return }
+            // Нажали «Отмена» - ничего не сохраняем
+            if self.phase != .test {
+                self.seriesAcc = []
+                return self.seriesDone("Отменено", nil)
+            }
+            if let d = data, let src = CGImageSourceCreateWithData(d as CFData, nil),
+               let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, [
+                   kCGImageSourceCreateThumbnailFromImageAlways: true,
+                   kCGImageSourceCreateThumbnailWithTransform: true,
+                   kCGImageSourceThumbnailMaxPixelSize: 12000,
+               ] as CFDictionary) {
+                self.seriesAdd(cg)
+            }
+            self.seriesLeft -= 1
+            let done = self.seriesTotal - self.seriesLeft
+            DispatchQueue.main.async { self.subDone = done }
+            if self.seriesLeft > 0 {
+                self.shootSeries()
+            } else {
+                self.seriesFinish()
+            }
+        }
+    }
+
+    /// Сложить снимок в сумму (16 бит на канал - хватит на 256 снимков)
+    private func seriesAdd(_ cg: CGImage) {
+        if seriesN == 0 {
+            seriesW = cg.width
+            seriesH = cg.height
+            seriesAcc = [UInt16](repeating: 0, count: seriesW * seriesH * 4)
+        }
+        let w = seriesW, h = seriesH
+        var px = [UInt8](repeating: 0, count: w * h * 4)
+        let ok: Bool = px.withUnsafeMutableBytes { b in
+            guard let ctx = CGContext(data: b.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                                      space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return false }
+            ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+            return true
+        }
+        guard ok else { return }
+        seriesAcc.withUnsafeMutableBufferPointer { a in
+            px.withUnsafeBufferPointer { p in
+                for i in 0..<a.count { a[i] &+= UInt16(p[i]) }
+            }
+        }
+        seriesN += 1
+    }
+
+    private func seriesFinish() {
+        seriesActive = false
+        let n = seriesN, w = seriesW, h = seriesH
+        guard n > 0 else { return seriesDone("Фото не получилось", nil) }
+        // Среднее. Ночью ещё и яркость: небо по середине гистограммы - к спокойному тёмному тону, как у Камеры
+        var gain: Float = 1
+        if seriesDark {
+            var hist = [Int](repeating: 0, count: 256 * n + 1)
+            var i = 0
+            while i < seriesAcc.count {
+                let l = (Int(seriesAcc[i]) * 77 + Int(seriesAcc[i + 1]) * 150 + Int(seriesAcc[i + 2]) * 29) >> 8
+                hist[min(l, hist.count - 1)] += 1
+                i += 4 * 7
+            }
+            let half = hist.reduce(0, +) / 2
+            var acc = 0, med = 1
+            for (v, c) in hist.enumerated() { acc += c; if acc >= half { med = max(v, 1); break } }
+            let median = Float(med) / Float(n)
+            let target = 45 * Float(pow(2, seriesEV + 0.5))
+            gain = min(max(target / median, 0.5), 8)
+        }
+        let k = gain / Float(n)
+        var out = [UInt8](repeating: 255, count: w * h * 4)
+        seriesAcc.withUnsafeBufferPointer { a in
+            out.withUnsafeMutableBufferPointer { o in
+                for i in 0..<a.count where i % 4 != 3 { o[i] = UInt8(min(255, Float(a[i]) * k + 0.5)) }
+            }
+        }
+        seriesAcc = []
+        let data = Data(out)
+        guard let prov = CGDataProvider(data: data as CFData),
+              let cg = CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: w * 4,
+                               space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
+                               provider: prov, decode: nil, shouldInterpolate: false, intent: .defaultIntent),
+              let jpg = ShootStore.jpeg(cg) else { return seriesDone("Фото не получилось", nil) }
+        let thumb = ShootStore.thumbData(jpg, maxPixel: 600)
+        PHPhotoLibrary.shared().performChanges({
+            PHAssetCreationRequest.forAsset().addResource(with: .photo, data: jpg, options: nil)
+        }) { ok, _ in
+            self.queue.async { self.seriesDone(ok ? "Фото в галерее" : "Нет доступа к галерее", thumb) }
+        }
+    }
+
+    /// Убрать фото-выход, вернуть превью
+    private func seriesDone(_ msg: String, _ thumb: UIImage?) {
+        seriesActive = false
+        session.beginConfiguration()
+        if session.outputs.contains(photoOut) { session.removeOutput(photoOut) }
+        session.commitConfiguration()
+        Diag.event(msg)
+        DispatchQueue.main.async {
+            if let t = thumb { self.lastImage = t }
+            self.subDone = 0
+            self.applyCamera()
+            self.finished(msg)
+        }
+    }
+
     /// Убрать фото-выход и вернуть видео-формат и настройки
     private func rawDone(_ msg: String) {
         session.beginConfiguration()
@@ -995,10 +1191,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     private var photoPending = false
 
     func takePhoto() {
-        guard phase == .idle else { return }
-        photoPending = true
-        testFrame()
-        if phase != .test { photoPending = false }
+        photoSeries()
     }
 
     func testFrame() {
@@ -3604,6 +3797,10 @@ struct CameraLayout: Layout {
 
 extension LapseEngine: AVCapturePhotoCaptureDelegate {
     func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
+        if seriesActive {
+            seriesShot(error == nil ? photo.fileDataRepresentation() : nil)
+            return
+        }
         rawFinished(error == nil && photo.isRawPhoto ? photo.fileDataRepresentation() : nil)
     }
 }

@@ -101,6 +101,17 @@ enum ShootStore {
         }
     }
 
+    /// Маленькая картинка из готового JPEG - для миниатюры
+    static func thumbData(_ d: Data, maxPixel: Int) -> UIImage? {
+        guard let src = CGImageSourceCreateWithData(d as CFData, nil),
+              let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, [
+                  kCGImageSourceCreateThumbnailFromImageAlways: true,
+                  kCGImageSourceCreateThumbnailWithTransform: true,
+                  kCGImageSourceThumbnailMaxPixelSize: maxPixel,
+              ] as CFDictionary) else { return nil }
+        return UIImage(cgImage: cg)
+    }
+
     static func jpeg(_ img: CGImage) -> Data? {
         let data = NSMutableData()
         guard let dest = CGImageDestinationCreateWithData(data as CFMutableData, UTType.jpeg.identifier as CFString, 1, nil) else {
