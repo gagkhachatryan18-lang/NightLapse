@@ -3066,7 +3066,7 @@ struct ContentView: View {
                     stepButton("minus") { e.exposureStep(false) }
                         .disabled(!e.canExposureDown)
                         .opacity(e.canExposureDown ? 1 : 0.35)
-                    Text("Выдержка \(expText(e.exposureSeconds))")
+                    Text(expText(e.exposureSeconds))
                         .font(.subheadline.weight(.semibold))
                         .monospacedDigit()
                         .frame(minWidth: 170)
@@ -3074,10 +3074,6 @@ struct ContentView: View {
                         .disabled(!e.canExposureUp)
                         .opacity(e.canExposureUp ? 1 : 0.35)
                 }
-                Text(e.sceneKind == .photo ? "Короче - чётче движение, дольше - ярче" : (e.pauseSeconds < 0.05 ? "Без пауз" : "Пауза \(expText(e.pauseSeconds))"))
-                    .font(.footnote)
-                    .foregroundStyle(t.dim)
-                    .multilineTextAlignment(.center)
                 if e.expManual {
                     Button("Вернуть авто") { e.exposureAuto() }
                         .font(.footnote.weight(.semibold))
@@ -3096,7 +3092,7 @@ struct ContentView: View {
             case .interval:
                 HStack(spacing: 16) {
                     stepButton("minus") { e.intervalDown() }
-                    Text("Интервал \(expText(e.intervalSeconds))")
+                    Text(expText(e.intervalSeconds))
                         .font(.subheadline.weight(.semibold))
                         .monospacedDigit()
                         .frame(minWidth: 170)
