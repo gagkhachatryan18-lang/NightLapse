@@ -320,7 +320,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         let sc = sceneKind
         let cap: Double
         switch sc {
-        case .stars: cap = starLimit
+        case .stars: cap = intervalSeconds   // без скрытых ограничений: кадр на весь интервал, что выйдет - покажет тест
         case .clouds: cap = 2
         case .photo: cap = starLimit   // днём сама станет короче, как в таймлапсе
         }
@@ -2999,29 +2999,9 @@ struct ContentView: View {
     /// Ночь: режим Найтлапс или темно по превью
     private var nightish: Bool { e.sceneKind == .stars || e.isDark }
 
-    private var evWarn: String? {
-        if nightish {
-            if e.evComp < -2.05 { return "Яркость слишком низкая: ночью кадр выйдет почти чёрным. Лучше от -2 до +0.5" }
-            if e.evComp > 0.55 { return "Яркость слишком высокая: ночью будет много шума. Лучше от -2 до +0.5" }
-        } else if e.evComp < -2.55 || e.evComp > 1.55 {
-            return "Яркость далеко от нормы: днём лучше от -2.5 до +1.5"
-        }
-        return nil
-    }
-
-    private var intervalWarn: String? {
-        if e.sceneKind == .stars {
-            if e.intervalSeconds > 30.5 {
-                return "Большой интервал: видео выйдет коротким и рывками, следы - с разрывами"
-            }
-            if e.intervalSeconds < e.starLimit - 0.5 {
-                return "Интервал меньше \(Int(e.starLimit)) с: ночью будет больше шума"
-            }
-        } else if e.intervalSeconds > 60.5 {
-            return "Большой интервал: облака будут прыгать, а не плыть"
-        }
-        return nil
-    }
+    // Как выйдет кадр - покажет «Тест». Предупреждаем только о заряде и памяти
+    private var evWarn: String? { nil }
+    private var intervalWarn: String? { nil }
 
     private var durationWarn: String? {
         let hours = e.autoStopMin == 0 ? 8.0 : Double(e.autoStopMin) / 60
@@ -3043,13 +3023,9 @@ struct ContentView: View {
 
 
     /// Красное - только то, что правда испортит съёмку. Длинная выдержка - осознанный выбор, о ней тихо в самой настройке
-    private var firstWarning: String? { e.sceneKind == .photo ? evWarn : (evWarn ?? intervalWarn ?? durationWarn) }
+    private var firstWarning: String? { e.sceneKind == .photo ? nil : durationWarn }
 
-    /// Ночью длиннее предела звёзды тянутся чёрточками
-    private var exposureWarn: String? {
-        guard e.expManual, e.sceneKind != .clouds, e.exposureSeconds > e.starLimit + 0.01 else { return nil }
-        return "Дольше \(Int(e.starLimit)) с - звёзды чёрточками"
-    }
+    private var exposureWarn: String? { nil }
 
     /// Подпись кнопки резкости: одно-два слова
     private var focusLabel: String {
@@ -3126,10 +3102,6 @@ struct ContentView: View {
                         .frame(minWidth: 170)
                     stepButton("plus") { e.intervalUp() }
                 }
-                Text(intervalNote)
-                    .font(.footnote)
-                    .foregroundStyle(t.dim)
-                    .multilineTextAlignment(.center)
             case .focus:
                 HStack(spacing: 10) {
                     stepButton("minus") { nudgeFocus(-0.005) }
