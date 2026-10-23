@@ -21,9 +21,9 @@ enum TestStore {
         let tail = label.isEmpty ? "" : "_" + label.replacingOccurrences(of: "_", with: " ").replacingOccurrences(of: "/", with: "-")
         let url = dir.appendingPathComponent("test_\(fmt.string(from: Date()))\(tail).jpg")
         try? data.write(to: url)
-        // Храним только последние 30
+        // Храним только последние 80 (сравнение даёт около 30 за раз)
         let all = list()
-        if all.count > 30 { for u in all.dropFirst(30) { try? FileManager.default.removeItem(at: u) } }
+        if all.count > 80 { for u in all.dropFirst(80) { try? FileManager.default.removeItem(at: u) } }
     }
 
     /// Подпись способа из имени файла (для сравнения), у обычного теста - пусто

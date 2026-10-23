@@ -808,12 +808,16 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
     /// Один способ снять: авто как в Камере или своя выдержка и ISO, сколько снимков сложить, подтягивать ли яркость
     struct PhotoJob {
+        enum Look { case asIs, night(Float), nightContrast(Float) }
         var label: String
         var auto = false
         var dur = 1.0
-        var iso: Float = 0          // 0 - максимальный
+        var iso: Float = 0          // 0 - максимальный, -2 - на 2 ступени ниже
         var count = 1
         var normalize = false
+        var fast = false            // без тяжёлой обработки iPhone - сравнить, что она даёт
+        var checkpoints: [Int] = []  // после скольких снимков сохранять промежуточное среднее (для сравнения)
+        var looks: [Look] = []       // какие обработки сохранять в каждой точке
     }
 
     /// Идёт серия фото: снимки из делегата идут сюда, а не в RAW
@@ -849,18 +853,22 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         } else {
             j.auto = true
         }
+        j.checkpoints = [j.count]
+        j.looks = [j.normalize ? .night(45) : .asIs]
         runJobs([j], toGallery: true)
     }
 
     /// Эксперимент: несколько способов подряд, все кадры - в «Тесты», чтобы сравнить и выбрать лучший
+    /// Одни и те же снимки обрабатываются по-разному: кадров снимается немного, вариантов выходит много
     func compareTest() {
-        let n = 8
+        let three: [PhotoJob.Look] = [.asIs, .night(45), .nightContrast(45)]
         runJobs([
-            PhotoJob(label: "1 авто как Камера", auto: true),
-            PhotoJob(label: "2 один кадр 1 с", dur: 1),
-            PhotoJob(label: "3 среднее \(n) по 1 с", dur: 1, count: n),
-            PhotoJob(label: "4 среднее \(n) по 1 с ярче", dur: 1, count: n, normalize: true),
-            PhotoJob(label: "5 ISO ниже, среднее \(n)", dur: 1, iso: -2, count: n, normalize: true),
+            PhotoJob(label: "А авто как Камера", auto: true, checkpoints: [1], looks: [.asIs, .night(45)]),
+            PhotoJob(label: "Б 1 с ISO макс", dur: 1, count: 16, checkpoints: [1, 4, 16], looks: three),
+            PhotoJob(label: "В 1 с ISO ниже", dur: 1, iso: -2, count: 16, checkpoints: [4, 16], looks: three),
+            PhotoJob(label: "Г 0.5 с ISO макс", dur: 0.5, count: 16, checkpoints: [16], looks: three),
+            PhotoJob(label: "Д 1 с без обработки", dur: 1, count: 16, fast: true, checkpoints: [1, 16], looks: three),
+            PhotoJob(label: "Е 1 с темнее", dur: 1, count: 16, checkpoints: [16], looks: [.night(30), .nightContrast(30)]),
         ], toGallery: false)
     }
 
@@ -937,7 +945,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     private func shootSeries() {
         guard seriesActive else { return }
         let st = AVCapturePhotoSettings()
-        st.photoQualityPrioritization = .quality
+        st.photoQualityPrioritization = jobIdx < jobs.count && jobs[jobIdx].fast ? .speed : .quality
         st.maxPhotoDimensions = photoOut.maxPhotoDimensions
         photoOut.capturePhoto(with: st, delegate: self)
     }
@@ -957,13 +965,14 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
                    kCGImageSourceThumbnailMaxPixelSize: 12000,
                ] as CFDictionary) {
                 self.seriesAdd(cg)
+                if self.jobs[self.jobIdx].checkpoints.contains(self.seriesN) { self.emitJob() }
             }
             self.seriesLeft -= 1
             DispatchQueue.main.async { self.subDone += 1 }
             if self.seriesLeft > 0 {
                 self.shootSeries()
             } else {
-                self.finishJob()
+                self.seriesAcc = []
                 self.jobIdx += 1
                 self.startJob()
             }
@@ -995,53 +1004,68 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         seriesN += 1
     }
 
-    /// queue: среднее способа -> в галерею (режим «Фото») или в «Тесты» (сравнение)
-    private func finishJob() {
+    /// queue: текущее среднее способа во всех нужных обработках -> в галерею (режим «Фото») или в «Тесты» (сравнение)
+    private func emitJob() {
         let j = jobs[jobIdx]
         let n = seriesN, w = seriesW, h = seriesH
         guard n > 0 else { return }
-        // Ночью - ещё и яркость: середина гистограммы к спокойному тёмному тону
-        var gain: Float = 1
-        if j.normalize {
-            var hist = [Int](repeating: 0, count: 256 * n + 1)
-            var i = 0
-            while i < seriesAcc.count {
-                let l = (Int(seriesAcc[i]) * 77 + Int(seriesAcc[i + 1]) * 150 + Int(seriesAcc[i + 2]) * 29) >> 8
-                hist[min(l, hist.count - 1)] += 1
-                i += 4 * 7
-            }
-            let half = hist.reduce(0, +) / 2
-            var acc = 0, med = 1
-            for (v, c) in hist.enumerated() { acc += c; if acc >= half { med = max(v, 1); break } }
-            let median = Float(med) / Float(n)
-            gain = min(max(45 * Float(pow(2, seriesEV + 0.5)) / median, 0.5), 8)
+        // Гистограмма яркости суммы: середина (небо) и 1% самых тёмных (чёрная точка)
+        var hist = [Int](repeating: 0, count: 256 * n + 1)
+        var i = 0
+        while i < seriesAcc.count {
+            let l = (Int(seriesAcc[i]) * 77 + Int(seriesAcc[i + 1]) * 150 + Int(seriesAcc[i + 2]) * 29) >> 8
+            hist[min(l, hist.count - 1)] += 1
+            i += 4 * 7
         }
-        let k = gain / Float(n)
-        var out = [UInt8](repeating: 255, count: w * h * 4)
-        seriesAcc.withUnsafeBufferPointer { a in
-            out.withUnsafeMutableBufferPointer { o in
-                for i in 0..<a.count where i % 4 != 3 { o[i] = UInt8(min(255, Float(a[i]) * k + 0.5)) }
-            }
+        let all = hist.reduce(0, +)
+        func pct(_ p: Double) -> Float {
+            let need = Int(Double(all) * p)
+            var acc = 0
+            for (v, c) in hist.enumerated() { acc += c; if acc >= need { return Float(max(v, 1)) / Float(n) } }
+            return 1
         }
-        seriesAcc = []
-        guard let prov = CGDataProvider(data: Data(out) as CFData),
-              let cg = CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: w * 4,
-                               space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
-                               provider: prov, decode: nil, shouldInterpolate: false, intent: .defaultIntent) else { return }
-        if jobsToGallery {
-            guard let jpg = ShootStore.jpeg(cg) else { return }
-            seriesThumb = ShootStore.thumbData(jpg, maxPixel: 600)
-            let sem = DispatchSemaphore(value: 0)
-            PHPhotoLibrary.shared().performChanges({
-                PHAssetCreationRequest.forAsset().addResource(with: .photo, data: jpg, options: nil)
-            }) { ok, _ in
-                if ok { self.seriesSaved += 1 }
-                sem.signal()
+        let median = pct(0.5), black = pct(0.01) * 0.9
+        let ev = Float(pow(2, seriesEV + 0.5))
+        for look in j.looks {
+            var k: Float = 1 / Float(n)
+            var b: Float = 0
+            var name = "как есть"
+            switch look {
+            case .asIs: break
+            case .night(let t):
+                k = min(max(t * ev / median, 0.5), 8) / Float(n)
+                name = "ночь \(Int(t))"
+            case .nightContrast(let t):
+                b = black
+                k = min(max(t * ev / max(median - b, 1), 0.5), 12) / Float(n)
+                name = "ночь \(Int(t)) контраст"
             }
-            sem.wait()
-        } else {
-            TestStore.save(cg, label: j.label)
-            seriesSaved += 1
+            let bn = b * Float(n)
+            var out = [UInt8](repeating: 255, count: w * h * 4)
+            seriesAcc.withUnsafeBufferPointer { a in
+                out.withUnsafeMutableBufferPointer { o in
+                    for i in 0..<a.count where i % 4 != 3 { o[i] = UInt8(min(255, max(0, (Float(a[i]) - bn) * k) + 0.5)) }
+                }
+            }
+            guard let prov = CGDataProvider(data: Data(out) as CFData),
+                  let cg = CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: w * 4,
+                                   space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
+                                   provider: prov, decode: nil, shouldInterpolate: false, intent: .defaultIntent) else { continue }
+            if jobsToGallery {
+                guard let jpg = ShootStore.jpeg(cg) else { continue }
+                seriesThumb = ShootStore.thumbData(jpg, maxPixel: 600)
+                let sem = DispatchSemaphore(value: 0)
+                PHPhotoLibrary.shared().performChanges({
+                    PHAssetCreationRequest.forAsset().addResource(with: .photo, data: jpg, options: nil)
+                }) { ok, _ in
+                    if ok { self.seriesSaved += 1 }
+                    sem.signal()
+                }
+                sem.wait()
+            } else {
+                TestStore.save(cg, label: "\(j.label), \(n) кадр., \(name)")
+                seriesSaved += 1
+            }
         }
     }
 
@@ -3809,7 +3833,7 @@ struct SettingsSheet: View {
                 } header: {
                     Text("Эксперимент")
                 } footer: {
-                    Text("Сравнение - 5 способов подряд, около минуты, все кадры в «Тестах». RAW - в Файлы → NightLapse → RAW")
+                    Text("Сравнение - около 3 минут на штативе, больше 25 вариантов в «Тестах». RAW - в Файлы → NightLapse → RAW")
                 }
 
                 Section("Подсказки") {
