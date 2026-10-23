@@ -2677,7 +2677,7 @@ struct ContentView: View {
                           },
                           onSwipe: { d in
                               guard idle else { return }
-                              select((LapseScene.allCases.firstIndex(of: e.sceneKind) ?? 0) + 1 + d)
+                              select((LapseScene.allCases.firstIndex(of: e.sceneKind) ?? 0) + d)
                           })
             if let m = focusMark { focusIndicator(at: m) }
             VStack(spacing: 6) {
@@ -3098,7 +3098,7 @@ struct ContentView: View {
                         .disabled(!e.canExposureUp)
                         .opacity(e.canExposureUp ? 1 : 0.35)
                 }
-                Text(e.sceneKind == .photo ? "Дольше - ярче и чище" : (e.pauseSeconds < 0.05 ? "Без пауз" : "Пауза \(expText(e.pauseSeconds))"))
+                Text(e.sceneKind == .photo ? "Короче - чётче движение, дольше - ярче" : (e.pauseSeconds < 0.05 ? "Без пауз" : "Пауза \(expText(e.pauseSeconds))"))
                     .font(.footnote)
                     .foregroundStyle(t.dim)
                     .multilineTextAlignment(.center)
@@ -3197,21 +3197,20 @@ struct ContentView: View {
 
     /// Режимы листаются пальцем или касанием, как в Камере
     private var modeCarousel: some View {
-        ModeCarousel(selected: (LapseScene.allCases.firstIndex(of: e.sceneKind) ?? 0) + 1, accent: t.accent, text: t.text) {
+        ModeCarousel(selected: LapseScene.allCases.firstIndex(of: e.sceneKind) ?? 0, accent: t.accent, text: t.text) {
             select($0)
         }
     }
 
     private func select(_ i: Int) {
-        guard idle else { return }
-        if i <= 0 {
+        guard idle, i >= 0 else { return }
+        let all = LapseScene.allCases
+        if i >= all.count {
             onSwitch()
             return
         }
-        let all = LapseScene.allCases
-        guard i - 1 < all.count else { return }
         openParam = nil
-        e.applyScene(all[i - 1])
+        e.applyScene(all[i])
     }
 
     private var shutterRow: some View {
@@ -3317,7 +3316,7 @@ struct ContentView: View {
         let interval = max(e.intervalSeconds, 0.01)
         let fps = Double(max(e.fps, 1))
         let videoPerHour = 3600 / interval / fps
-        if e.sceneKind == .photo { return "Одно фото с длинной выдержкой - сразу в галерею" }
+        if e.sceneKind == .photo { return "Фото сразу в галерею" }
         var s = "\(e.sceneKind.hint) · 1 час = \(String(format: "%.0f", videoPerHour)) с видео"
         if e.autoStopMin > 0 {
             s += ", за \(durText(Double(e.autoStopMin) * 60)) - \(String(format: "%.1f", videoPerHour * Double(e.autoStopMin) / 60)) с"
@@ -3447,8 +3446,9 @@ struct ModeCarousel: View {
     }
 
     var body: some View {
-        let items: [Item] = [Item(title: "Кадр дня", index: 0)]
-            + LapseScene.allCases.enumerated().map { Item(title: $0.element.title, index: $0.offset + 1) }
+        // Как в Камере: Найтлапс, Таймлапс, Фото, а за Фото - Кадр дня
+        let items: [Item] = LapseScene.allCases.enumerated().map { Item(title: $0.element.title, index: $0.offset) }
+            + [Item(title: "Кадр дня", index: LapseScene.allCases.count)]
         let w: CGFloat = 86
         let sel = selected
         HStack(spacing: 0) {

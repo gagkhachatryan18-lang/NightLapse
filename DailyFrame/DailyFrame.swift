@@ -658,6 +658,8 @@ struct CameraView: View {
     @AppStorage("ovOpacity") private var opacity = 0.45
     @AppStorage("grid") private var grid = false
     @AppStorage("copyToPhotos") private var copyToPhotos = true
+    /// Короткое объяснение - только при первом открытии
+    @AppStorage("dailyIntroSeen") private var introSeen = false
     @State private var overlayImage: UIImage?
     @State private var toast: String?
     @State private var pending: Shot?
@@ -672,6 +674,32 @@ struct CameraView: View {
 
     private var overlayKey: String {
         "\(store.current)|\(mode.rawValue)|\(target.rawValue)|\(store.photos.count)|\(store.meta.ref ?? "")|\(store.ghostVersion)"
+    }
+
+    private var intro: some View {
+        ZStack {
+            Color.black.opacity(0.7).ignoresSafeArea()
+            VStack(spacing: 14) {
+                Image(systemName: "calendar").font(.system(size: 34))
+                Text("Кадр дня").font(.title2.bold())
+                Text("Одно фото в день с одного и того же места. Прошлый кадр виден поверх - совмести и снимай. Из всех дней соберётся видео, как место меняется")
+                    .font(.subheadline)
+                    .multilineTextAlignment(.center)
+                    .foregroundStyle(Color.white.opacity(0.8))
+                Button {
+                    withAnimation { introSeen = true }
+                } label: {
+                    Text("Понятно").font(.headline).foregroundStyle(Color.black)
+                        .frame(maxWidth: .infinity).frame(height: 48)
+                        .background(Pal(night: false).accent, in: RoundedRectangle(cornerRadius: 14))
+                }
+            }
+            .foregroundStyle(Color.white)
+            .padding(24)
+            .background(Color(white: 0.12), in: RoundedRectangle(cornerRadius: 24))
+            .padding(28)
+        }
+        .transition(.opacity)
     }
 
     var body: some View {
@@ -692,6 +720,7 @@ struct CameraView: View {
                 }
             }
             .frame(width: geo.size.width, height: geo.size.height)
+            .overlay { if !introSeen { intro } }
         }
         .onAppear {
             cam.onPhoto = { data, ext in handle(data, ext) }
@@ -771,8 +800,8 @@ struct CameraView: View {
                           keepMark()
                       },
                       onSwipe: { d in
-                          // Кадр дня - первый режим: свайп влево ведёт в «Найтлапс»
-                          if d > 0, let first = LapseScene.allCases.first { onScene(first) }
+                          // Кадр дня - последний режим, сразу за «Фото»: свайп вправо ведёт обратно в «Фото»
+                          if d < 0, let last = LapseScene.allCases.last { onScene(last) }
                       })
             // Призрак и сетка ложатся ровно на картинку камеры (кадр 4:3), фото другой формы обрезается по центру
             overlayLayer
@@ -934,9 +963,9 @@ struct CameraView: View {
                     .multilineTextAlignment(.center)
                     .padding(.horizontal, 16)
             }
-            ModeCarousel(selected: 0) { i in
+            ModeCarousel(selected: LapseScene.allCases.count) { i in
                 let all = LapseScene.allCases
-                if i >= 1 && i - 1 < all.count { onScene(all[i - 1]) }
+                if i >= 0 && i < all.count { onScene(all[i]) }
             }
             HStack {
                 Button { showArchive = true } label: {
