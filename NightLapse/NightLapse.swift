@@ -825,7 +825,9 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     private var jobs: [PhotoJob] = []
     private var jobIdx = 0
     private var jobsToGallery = true
-    private var seriesAcc: [UInt16] = []
+    private var seriesAcc: [UInt32] = []
+    /// Для сравнения: маленькая копия, кусок 100% из середины и подпись каждого варианта - потом два общих листа
+    private var sheet: [(label: String, small: CGImage, crop: CGImage)] = []
     private var seriesW = 0
     private var seriesH = 0
     private var seriesN = 0
@@ -899,6 +901,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             self.jobs = list
             self.jobIdx = 0
             self.jobsToGallery = toGallery
+            self.sheet = []
             self.seriesEV = ev
             self.seriesThumb = nil
             self.seriesSaved = 0
@@ -979,26 +982,38 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         }
     }
 
-    /// Сложить снимок в сумму (16 бит на канал - хватит на 256 снимков)
+    /// Сложить снимок в сумму. Снимок читается в 16 бит на канал: при сильном осветлении не будет полос
     private func seriesAdd(_ cg: CGImage) {
         if seriesN == 0 {
             seriesW = cg.width
             seriesH = cg.height
-            seriesAcc = [UInt16](repeating: 0, count: seriesW * seriesH * 4)
+            seriesAcc = [UInt32](repeating: 0, count: seriesW * seriesH * 4)
         }
         let w = seriesW, h = seriesH
-        var px = [UInt8](repeating: 0, count: w * h * 4)
-        let ok: Bool = px.withUnsafeMutableBytes { b in
-            guard let ctx = CGContext(data: b.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+        var px = [UInt16](repeating: 0, count: w * h * 4)
+        var ok: Bool = px.withUnsafeMutableBytes { b in
+            guard let ctx = CGContext(data: b.baseAddress, width: w, height: h, bitsPerComponent: 16, bytesPerRow: w * 8,
                                       space: CGColorSpaceCreateDeviceRGB(),
-                                      bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return false }
+                                      bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue | CGBitmapInfo.byteOrder16Little.rawValue) else { return false }
             ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
             return true
+        }
+        if !ok {
+            // Запасной путь: 8 бит, растянутые в 16
+            var p8 = [UInt8](repeating: 0, count: w * h * 4)
+            ok = p8.withUnsafeMutableBytes { b in
+                guard let ctx = CGContext(data: b.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                                          space: CGColorSpaceCreateDeviceRGB(),
+                                          bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return false }
+                ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+                return true
+            }
+            if ok { for i in 0..<px.count { px[i] = UInt16(p8[i]) * 257 } }
         }
         guard ok else { return }
         seriesAcc.withUnsafeMutableBufferPointer { a in
             px.withUnsafeBufferPointer { p in
-                for i in 0..<a.count { a[i] &+= UInt16(p[i]) }
+                for i in 0..<a.count { a[i] &+= UInt32(p[i]) }
             }
         }
         seriesN += 1
@@ -1009,42 +1024,49 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         let j = jobs[jobIdx]
         let n = seriesN, w = seriesW, h = seriesH
         guard n > 0 else { return }
-        // Гистограмма яркости суммы: середина (небо) и 1% самых тёмных (чёрная точка)
-        var hist = [Int](repeating: 0, count: 256 * n + 1)
+        // Гистограмма яркости среднего (0...255): середина (небо) и 1% самых тёмных (чёрная точка)
+        let div = Float(n) * 257
+        var hist = [Int](repeating: 0, count: 256)
         var i = 0
         while i < seriesAcc.count {
-            let l = (Int(seriesAcc[i]) * 77 + Int(seriesAcc[i + 1]) * 150 + Int(seriesAcc[i + 2]) * 29) >> 8
-            hist[min(l, hist.count - 1)] += 1
+            let l = (Float(seriesAcc[i]) * 0.3 + Float(seriesAcc[i + 1]) * 0.59 + Float(seriesAcc[i + 2]) * 0.11) / div
+            hist[min(max(Int(l), 0), 255)] += 1
             i += 4 * 7
         }
         let all = hist.reduce(0, +)
         func pct(_ p: Double) -> Float {
             let need = Int(Double(all) * p)
             var acc = 0
-            for (v, c) in hist.enumerated() { acc += c; if acc >= need { return Float(max(v, 1)) / Float(n) } }
+            for (v, c) in hist.enumerated() { acc += c; if acc >= need { return Float(max(v, 1)) } }
             return 1
         }
         let median = pct(0.5), black = pct(0.01) * 0.9
         let ev = Float(pow(2, seriesEV + 0.5))
         for look in j.looks {
-            var k: Float = 1 / Float(n)
+            var g: Float = 1
             var b: Float = 0
             var name = "как есть"
             switch look {
             case .asIs: break
             case .night(let t):
-                k = min(max(t * ev / median, 0.5), 8) / Float(n)
+                g = min(max(t * ev / median, 0.5), 8)
                 name = "ночь \(Int(t))"
             case .nightContrast(let t):
                 b = black
-                k = min(max(t * ev / max(median - b, 1), 0.5), 12) / Float(n)
+                g = min(max(t * ev / max(median - b, 1), 0.5), 12)
                 name = "ночь \(Int(t)) контраст"
             }
-            let bn = b * Float(n)
+            // 8 бит на выходе + лёгкий шум против полос на гладком небе
+            let k = g / div
             var out = [UInt8](repeating: 255, count: w * h * 4)
             seriesAcc.withUnsafeBufferPointer { a in
                 out.withUnsafeMutableBufferPointer { o in
-                    for i in 0..<a.count where i % 4 != 3 { o[i] = UInt8(min(255, max(0, (Float(a[i]) - bn) * k) + 0.5)) }
+                    var seed: UInt32 = 12345
+                    for i in 0..<a.count where i % 4 != 3 {
+                        seed = seed &* 1664525 &+ 1013904223
+                        let dither = Float(seed >> 24) / 256 - 0.5
+                        o[i] = UInt8(min(255, max(0, (Float(a[i]) * k - b * g) + 0.5 + dither)))
+                    }
                 }
             }
             guard let prov = CGDataProvider(data: Data(out) as CFData),
@@ -1063,21 +1085,74 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
                 }
                 sem.wait()
             } else {
-                TestStore.save(cg, label: "\(j.label), \(n) кадр., \(name)")
+                let label = "\(j.label), \(n) кадр., \(name)"
+                TestStore.save(cg, label: label)
                 seriesSaved += 1
+                // Для общих листов: уменьшенная копия и кусок неба 100% из середины
+                let sw = 600, sh = max(1, h * 600 / max(w, 1))
+                if let ctx = CGContext(data: nil, width: sw, height: sh, bitsPerComponent: 8, bytesPerRow: 0,
+                                       space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) {
+                    ctx.interpolationQuality = .high
+                    ctx.draw(cg, in: CGRect(x: 0, y: 0, width: sw, height: sh))
+                    let side = min(400, w, h)
+                    // Кусок чуть выше середины - там обычно небо
+                    let r = CGRect(x: (w - side) / 2, y: max(0, h / 3 - side / 2), width: side, height: side)
+                    if let small = ctx.makeImage(), let crop = cg.cropping(to: r) {
+                        sheet.append((label, small, crop))
+                    }
+                }
             }
         }
+    }
+
+    /// Два общих листа сравнения: все варианты целиком и куски 100% - удобно прислать одной картинкой
+    private func makeSheets() {
+        guard !sheet.isEmpty else { return }
+        func render(_ cellW: Int, _ cellH: Int, _ cols: Int, _ pick: (Int) -> CGImage) -> CGImage? {
+            let rows = (sheet.count + cols - 1) / cols
+            let labelH = 34
+            let size = CGSize(width: cols * cellW, height: rows * (cellH + labelH))
+            let f = UIGraphicsImageRendererFormat()
+            f.scale = 1
+            let img = UIGraphicsImageRenderer(size: size, format: f).image { c in
+                UIColor.black.setFill()
+                c.fill(CGRect(origin: .zero, size: size))
+                for (i, it) in sheet.enumerated() {
+                    let x = (i % cols) * cellW, y = (i / cols) * (cellH + labelH)
+                    UIImage(cgImage: pick(i)).draw(in: CGRect(x: x + 2, y: y + labelH, width: cellW - 4, height: cellH - 4))
+                    (it.label as NSString).draw(in: CGRect(x: x + 6, y: y + 6, width: cellW - 12, height: labelH - 6),
+                                                withAttributes: [.font: UIFont.systemFont(ofSize: 17, weight: .semibold),
+                                                                 .foregroundColor: UIColor.white])
+                }
+            }
+            return img.cgImage
+        }
+        let sw = sheet[0].small.width, sh = sheet[0].small.height
+        let whole = render(sw, sh, 4) { self.sheet[$0].small }
+        let crops = render(400, 400, 4) { self.sheet[$0].crop }
+        for (img, name) in [(whole, "ЛИСТ общий вид"), (crops, "ЛИСТ кусок неба 100%")] {
+            guard let cg = img else { continue }
+            TestStore.save(cg, label: name)
+            if let jpg = ShootStore.jpeg(cg) {
+                PHPhotoLibrary.shared().performChanges({
+                    PHAssetCreationRequest.forAsset().addResource(with: .photo, data: jpg, options: nil)
+                }, completionHandler: nil)
+            }
+        }
+        sheet = []
     }
 
     /// queue: убрать фото-выход, вернуть превью
     private func jobsDone(_ msg0: String?) {
         seriesActive = false
+        if msg0 == nil && !jobsToGallery { makeSheets() }
+        sheet = []
         session.beginConfiguration()
         if session.outputs.contains(photoOut) { session.removeOutput(photoOut) }
         session.commitConfiguration()
         let msg = msg0 ?? (jobsToGallery
             ? (seriesSaved > 0 ? "Фото в галерее" : "Фото не сохранилось")
-            : "Сравнение готово: \(seriesSaved) вариантов в «Тестах»")
+            : "Сравнение готово: \(seriesSaved) вариантов в «Тестах», два общих листа - и в галерее")
         Diag.event(msg)
         let thumb = seriesThumb
         let showTests = msg0 == nil && !jobsToGallery && seriesSaved > 0
@@ -1228,8 +1303,15 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         }
     }
 
+    /// Экран всегда вертикальный (как в Камере), поэтому поворот кадра берём прямо из положения телефона
     private func captureAngle() -> CGFloat {
-        coordinator?.videoRotationAngleForHorizonLevelCapture ?? 90
+        switch UIDevice.current.orientation {
+        case .portrait: return 90
+        case .landscapeLeft: return 0
+        case .landscapeRight: return 180
+        case .portraitUpsideDown: return 270
+        default: return coordinator?.videoRotationAngleForHorizonLevelCapture ?? 90
+        }
     }
 
     /// queue: кадры с сенсора поворачиваются так, как держишь телефон в момент старта
