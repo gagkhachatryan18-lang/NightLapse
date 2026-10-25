@@ -2974,12 +2974,15 @@ struct ContentView: View {
     }
 
     /// Интервал, выдержка, длительность - значками, как в шторке
+    /// Выдержка одним словом: «Авто» или число - не оба сразу
+    private var expShort: String { e.expManual ? expText(e.exposureSeconds) : "Авто" }
+
     private var summaryText: Text {
         if e.sceneKind == .photo {
-            return Text(Image(systemName: "stopwatch")) + Text(" \(expText(e.exposureSeconds))")
+            return Text(Image(systemName: "stopwatch")) + Text(" \(expShort)")
         }
         return Text(Image(systemName: "timer")) + Text(" \(expText(e.intervalSeconds))   ")
-            + Text(Image(systemName: "stopwatch")) + Text(" \(expText(e.exposureSeconds))   ")
+            + Text(Image(systemName: "stopwatch")) + Text(" \(expShort)   ")
             + Text(Image(systemName: "hourglass")) + Text(e.autoStopMin == 0 ? " ∞" : " " + durText(Double(e.autoStopMin) * 60))
     }
 
@@ -3269,7 +3272,7 @@ struct ContentView: View {
                 LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 3), spacing: 14) {
                     // Выдержка вместо яркости: яркость - пальцем по кадру вверх-вниз
                     paramCircle(.exposure, "stopwatch",
-                                e.expManual ? expText(e.exposureSeconds) : "авто \(expText(e.exposureSeconds))",
+                                e.expManual ? expText(e.exposureSeconds) : "Авто",
                                 warn: false)
                     if e.sceneKind != .photo {
                         paramCircle(.interval, "timer", expText(e.intervalSeconds), warn: intervalWarn != nil)
@@ -3449,7 +3452,7 @@ struct ContentView: View {
                     stepButton("minus") { e.exposureStep(false) }
                         .disabled(!e.canExposureDown)
                         .opacity(e.canExposureDown ? 1 : 0.35)
-                    Text(expText(e.exposureSeconds))
+                    Text(e.expManual ? expText(e.exposureSeconds) : "Авто")
                         .font(.subheadline.weight(.semibold))
                         .monospacedDigit()
                         .frame(minWidth: 170)
@@ -3458,7 +3461,7 @@ struct ContentView: View {
                         .opacity(e.canExposureUp ? 1 : 0.35)
                 }
                 if e.expManual {
-                    Button("Вернуть авто") { e.exposureAuto() }
+                    Button("Авто") { e.exposureAuto() }
                         .font(.footnote.weight(.semibold))
                         .foregroundStyle(t.accent)
                 }
