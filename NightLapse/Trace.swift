@@ -311,6 +311,8 @@ struct CameraTrace: ViewModifier {
             .onChange(of: e.zoom) { Trace.state("Зум: \(e.zoom)") }
             .onChange(of: e.scene) { Trace.state("Режим: \(e.scene)") }
             .onChange(of: e.intervalSeconds) { Trace.state("Интервал: \(e.intervalSeconds) с") }
+            .onChange(of: e.expManual) { Trace.state(e.expManual ? "Выдержка: вручную" : "Выдержка: авто") }
+            .onChange(of: e.exposureSeconds) { Trace.state("Выдержка: \(e.exposureSeconds) с") }
             .onChange(of: e.evComp) { Trace.state("Яркость: \(String(format: "%.1f", e.evComp))") }
             .onChange(of: e.autoStopMin) { Trace.state("Длительность: \(e.autoStopMin) мин") }
             .onChange(of: e.focusAuto) { Trace.state("Фокус: \(e.focusAuto ? "авто" : "вручную")") }

@@ -324,11 +324,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         case .clouds: cap = 2
         case .photo: cap = starLimit   // днём сама станет короче, как в таймлапсе
         }
-        // Ручная выдержка длиннее интервала - интервал растёт до неё (как на GoPro), выдержку не режем
-        if expManual && exposureSeconds > intervalSeconds + 0.0001 {
-            intervalSeconds = Self.intervalSteps.first(where: { $0 >= exposureSeconds - 0.0001 }) ?? exposureSeconds
-        }
-        let ex = expManual ? min(exposureSeconds, intervalSeconds) : min(intervalSeconds, cap)
+        // Ручная выдержка ни от чего не зависит. Длиннее интервала - кадры идут подряд, без паузы
+        let ex = expManual ? exposureSeconds : min(intervalSeconds, cap)
         exposureSeconds = ex
         pauseSeconds = max(0, intervalSeconds - ex)
         lighten = sc.lighten
@@ -341,8 +338,6 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
     func intervalDown() {
         if let n = Self.intervalSteps.last(where: { $0 < intervalSeconds - 0.001 }) { intervalSeconds = n }
-        // Интервал короче ручной выдержки - выдержка становится равной интервалу
-        if expManual && exposureSeconds > intervalSeconds { exposureSeconds = intervalSeconds }
         syncExposure()
     }
 
@@ -390,15 +385,16 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     func starFocus() {
         guard phase == .idle else { return }
         phase = .test
-        status = "Навожу фокус по звёздам, около 15 с. Не трогай телефон"
+        status = "Навожу фокус по звёздам, около 12 с. Не трогай телефон"
         let hold = startHold
-        subTotal = 20
+        subTotal = 14
         subDone = 0
         UIApplication.shared.isIdleTimerDisabled = true
         queue.async {
             guard let dev = self.device else { return }
-            // Грубо через 0.05 (13 положений), потом точно ±0.03 вокруг лучшего: всего 20 шагов по 0.75 с
-            self.focusPlan = stride(from: 0.40, through: 1.0001, by: 0.05).map { Float(min($0, 1)) }
+            // Грубо через 0.05 от 0.60 (9 положений - звёзды всегда были между 0.70 и 1.00),
+            // потом точно ±0.03 вокруг лучшего: всего 14 шагов по 0.75 с
+            self.focusPlan = stride(from: 0.60, through: 1.0001, by: 0.05).map { Float(min($0, 1)) }
             self.focusFine = false
             self.focusResults = []
             self.focusIdx = 0
@@ -452,7 +448,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         if !focusFine {
             // Второй проход: точнее вокруг лучшего места
             focusFine = true
-            focusPlan = stride(from: Double(best) - 0.03, through: Double(best) + 0.0301, by: 0.01).map { Float(min(max($0, 0), 1)) }
+            focusPlan = stride(from: Double(best) - 0.03, through: Double(best) + 0.0301, by: 0.015).map { Float(min(max($0, 0), 1)) }
             focusIdx = 0
             setLens(focusPlan[0])
             return
@@ -534,10 +530,10 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         applyCamera()
     }
 
-    /// Доступные шаги: ночью от 1/8 с, днём от 1/1000 с, до 60 с. Длиннее интервала - интервал растёт сам
+    /// Доступные шаги: ночью от 1/8 с, днём от 1/1000 с, до 30 с - в любом режиме и при любом интервале
     var exposureRange: [Double] {
         let lo = sceneKind == .stars ? 0.125 : 0.001
-        return Self.exposureSteps.filter { $0 >= lo - 0.0001 && $0 <= 60.0001 }
+        return Self.exposureSteps.filter { $0 >= lo - 0.0001 && $0 <= 30.0001 }
     }
     var canExposureDown: Bool { (exposureRange.first ?? 0) < exposureSeconds - 0.0001 }
     var canExposureUp: Bool { (exposureRange.last ?? 0) > exposureSeconds + 0.0001 }
@@ -2143,6 +2139,15 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         // Картинка для часов - и в простое, и во время съёмки
         if let wpb = CMSampleBufferGetImageBuffer(sampleBuffer) { WatchLink.shared.offer(wpb, portrait: vertical) }
         guard mode != .off, !suspended, let pb = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        // Подбор яркости не боится дрожи от касания - идёт уже во время задержки старта, это экономит время
+        if mode != .focus && cfg.isoAuto && calibLeft > 0 && !inPause {
+            if warmupLeft > 0 {
+                warmupLeft -= 1
+                return
+            }
+            calibrate(pb)
+            return
+        }
         // Первые 3 секунды после нажатия телефон ещё дрожит от касания - эти кадры пропускаем
         if CACurrentMediaTime() < holdUntil { return }
         if mode == .focus {
@@ -3454,7 +3459,7 @@ struct ContentView: View {
 
     private var durationWarn: String? {
         let hours = e.autoStopMin == 0 ? 8.0 : Double(e.autoStopMin) / 60
-        let gb = hours * 3600 / max(e.intervalSeconds, 1) * 0.0025
+        let gb = hours * 3600 / max(e.intervalSeconds, e.exposureSeconds, 1) * 0.0025
         if e.freeGB > 0 && gb > e.freeGB * 0.9 {
             return "Памяти может не хватить: нужно около \(Int(gb.rounded())) ГБ"
         }
@@ -3524,9 +3529,16 @@ struct ContentView: View {
                         .opacity(e.canExposureUp ? 1 : 0.35)
                 }
                 if e.expManual {
-                    Button("Авто") { e.exposureAuto() }
-                        .font(.footnote.weight(.semibold))
-                        .foregroundStyle(t.accent)
+                    // Кнопка, а не подпись: выдержка сейчас ручная, нажатие возвращает авто
+                    Button { e.exposureAuto() } label: {
+                        Text("Включить авто")
+                            .font(.footnote.weight(.semibold))
+                            .foregroundStyle(t.accent)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 6)
+                            .overlay(Capsule().stroke(t.accent.opacity(0.7)))
+                    }
+                    .buttonStyle(.plain)
                 }
             case .brightness:
                 HStack {
@@ -3730,7 +3742,8 @@ struct ContentView: View {
     }
 
     private var planLine: String {
-        let interval = max(e.intervalSeconds, 0.01)
+        // Кадр не чаще выдержки: выдержка длиннее интервала - кадры подряд
+        let interval = max(e.intervalSeconds, e.exposureSeconds, 0.01)
         let fps = Double(max(e.fps, 1))
         let videoPerHour = 3600 / interval / fps
         if e.sceneKind == .photo { return "Фото сразу в галерею" }
