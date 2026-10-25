@@ -324,6 +324,10 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         case .clouds: cap = 2
         case .photo: cap = starLimit   // днём сама станет короче, как в таймлапсе
         }
+        // Ручная выдержка длиннее интервала - интервал растёт до неё (как на GoPro), выдержку не режем
+        if expManual && exposureSeconds > intervalSeconds + 0.0001 {
+            intervalSeconds = Self.intervalSteps.first(where: { $0 >= exposureSeconds - 0.0001 }) ?? exposureSeconds
+        }
         let ex = expManual ? min(exposureSeconds, intervalSeconds) : min(intervalSeconds, cap)
         exposureSeconds = ex
         pauseSeconds = max(0, intervalSeconds - ex)
@@ -337,6 +341,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
     func intervalDown() {
         if let n = Self.intervalSteps.last(where: { $0 < intervalSeconds - 0.001 }) { intervalSeconds = n }
+        // Интервал короче ручной выдержки - выдержка становится равной интервалу
+        if expManual && exposureSeconds > intervalSeconds { exposureSeconds = intervalSeconds }
         syncExposure()
     }
 
@@ -524,14 +530,14 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         } else if let n = steps.last(where: { $0 < exposureSeconds - 0.0001 }) {
             exposureSeconds = n
         }
-        pauseSeconds = max(0, intervalSeconds - exposureSeconds)
+        syncExposure()
         applyCamera()
     }
 
-    /// Доступные шаги: ночью от 1/8 с, днём от 1/1000 с, и не длиннее интервала
+    /// Доступные шаги: ночью от 1/8 с, днём от 1/1000 с, до 60 с. Длиннее интервала - интервал растёт сам
     var exposureRange: [Double] {
         let lo = sceneKind == .stars ? 0.125 : 0.001
-        return Self.exposureSteps.filter { $0 >= lo - 0.0001 && $0 <= intervalSeconds + 0.0001 }
+        return Self.exposureSteps.filter { $0 >= lo - 0.0001 && $0 <= 60.0001 }
     }
     var canExposureDown: Bool { (exposureRange.first ?? 0) < exposureSeconds - 0.0001 }
     var canExposureUp: Bool { (exposureRange.last ?? 0) > exposureSeconds + 0.0001 }
@@ -1394,7 +1400,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             self.inPause = false
             self.suspended = false
             self.warmupLeft = c.warmup
-            self.calibLeft = c.isoAuto ? 4 : 0
+            self.calibLeft = c.isoAuto ? 6 : 0
             self.preFrames = 0
             self.calibSkip = 0
             self.setAutoGain(1)
@@ -1463,7 +1469,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             self.inPause = false
             self.suspended = false
             self.warmupLeft = c.warmup
-            self.calibLeft = c.isoAuto ? 4 : 0
+            self.calibLeft = c.isoAuto ? 6 : 0
             self.preFrames = 0
             self.calibSkip = 0
             self.setAutoGain(1)
@@ -2058,6 +2064,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         // даже когда сенсор уже на максимуме (иначе усиление всегда упиралось в один и тот же предел)
         let fAll = lightFactor(mean: m, limit: 100_000)
         calibLeft -= 1
+        Diag.event("Подбор: яркость \(Int(m)), пересвет \(Int(clipFrac * 100))%, ISO \(Int(curISO)), сенсор \(String(format: "%.3f", CMTimeGetSeconds(curDur))) с, поправка \(String(format: "%.2f", f))")
         if abs(f - 1) < 0.08 {
             calibLeft = 0
         } else {
@@ -2068,7 +2075,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
                 let rest = fAll / max(r, 0.0001)
                 setAutoGain(rest > 1.08 ? Float(pow(rest, 1 / 2.2)) : 1)
             } else {
-                calibSkip = 2
+                // Новая выдержка доходит до кадров с задержкой в 2-3 кадра - иначе меряем старую
+                calibSkip = 3
             }
         }
         if calibLeft == 0 {
@@ -2092,7 +2100,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         let f = full ? lightFactor(mean: mean, limit: 4) : pow(lightFactor(mean: mean, limit: 1.26), 0.5)
         guard abs(f - 1) > 0.02 else { return }
         // Ночью при максимуме сенсора яркость ведёт усиление в renderFrame
-        if sensorMaxed() && (f > 1 || autoGain > 1.01) { return }
+        if sensorMaxed() && (f > 1 || (autoGain > 1.01 && !full)) { return }
         if f < 1 && autoGain > 1 {
             // Слишком светло: сначала убираем цифровое усиление
             setAutoGain(autoGain * Float(pow(f, 1 / 2.2)))
@@ -2193,6 +2201,18 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             return
         }
 
+        if mode == .test, frame != nil, cfg.isoAuto, preFrames < 3 {
+            let lf = lightFactor(mean: mean, limit: 4)
+            // Тест заметно мимо нужной яркости: поправляем и снимаем заново (при максимуме сенсора - только темнее)
+            if abs(lf - 1) > 0.25 && !(sensorMaxed() && lf > 1) {
+                preFrames += 1
+                autoISOStep(mean: mean, full: true)
+                warmupLeft = max(warmupLeft, 2)
+                Diag.event("Тест: яркость \(Int(mean)), пересвет \(Int(clipFrac * 100))%, поправка, снимаю заново")
+                return
+            }
+        }
+
         if mode == .test {
             mode = .off
             DispatchQueue.main.async { self.applyCamera() }
@@ -2213,8 +2233,9 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
         pauseNow = cfg.pause + max(0, cfg.exposure - frameTarget)
         inPause = pauseNow + extraPause > 0
-        if frame != nil, outIndex == 0, cfg.isoAuto, preFrames < 3, !sensorMaxed(),
-           abs(lightFactor(mean: mean, limit: 4) - 1) > 0.08 {
+        if frame != nil, outIndex == 0, cfg.isoAuto, preFrames < 3,
+           abs(lightFactor(mean: mean, limit: 4) - 1) > 0.08,
+           !(sensorMaxed() && lightFactor(mean: mean, limit: 4) > 1) {
             // Первый кадр заметно светлее или темнее нужного: в видео не пишем, сразу поправляем
             // и снимаем заново - иначе ролик начинается со вспышки
             preFrames += 1
