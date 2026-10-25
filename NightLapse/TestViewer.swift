@@ -118,11 +118,15 @@ struct TestViewer: View {
         else { return nil }
         ctx.draw(cg, in: CGRect(x: 0, y: 0, width: 32, height: 18))
         guard let d = ctx.data?.assumingMemoryBound(to: UInt8.self) else { return nil }
-        var sum = 0
-        for i in 0..<(32 * 18) { sum += (Int(d[i * 4]) * 77 + Int(d[i * 4 + 1]) * 150 + Int(d[i * 4 + 2]) * 29) >> 8 }
+        var sum = 0, clip = 0
+        for i in 0..<(32 * 18) {
+            sum += (Int(d[i * 4]) * 77 + Int(d[i * 4 + 1]) * 150 + Int(d[i * 4 + 2]) * 29) >> 8
+            if max(d[i * 4], d[i * 4 + 1], d[i * 4 + 2]) >= 245 { clip += 1 }
+        }
         let m = sum / (32 * 18)
         if m < 10 { return ("Кадр может быть тёмным", false) }
-        if m > 150 { return ("Кадр может быть пересвечен", false) }
+        // Даже если в среднем темно: белое пятно больше 3% кадра - это пересвет (луна, облака под луной)
+        if m > 150 || clip * 100 > 32 * 18 * 3 { return ("Кадр может быть пересвечен", false) }
         return ("Яркость в норме", true)
     }
 

@@ -1969,6 +1969,9 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
     // MARK: Авто ISO (queue)
 
+    /// Доля пересвеченных точек последнего кадра (луна, фонари, облака под луной)
+    private var clipFrac = 0.0
+
     private func meanLuma(_ pb: CVPixelBuffer) -> Float {
         CVPixelBufferLockBaseAddress(pb, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
@@ -1979,17 +1982,20 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         let p = base.assumingMemoryBound(to: UInt8.self)
         var sum = 0.0
         var cnt = 0.0
+        var clip = 0.0
         var y = 0
         while y < h {
             var x = 0
             while x < w {
                 let o = y * rb + x * 4
                 sum += 0.114 * Double(p[o]) + 0.587 * Double(p[o + 1]) + 0.299 * Double(p[o + 2])
+                if max(p[o], p[o + 1], p[o + 2]) >= 250 { clip += 1 }
                 cnt += 1
                 x += 8
             }
             y += 16
         }
+        clipFrac = cnt > 0 ? clip / cnt : 0
         return cnt > 0 ? Float(sum / cnt) : 0
     }
 
@@ -2003,8 +2009,12 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             let maxDur = min(cfg.exposure, CMTimeGetSeconds(dev.activeFormat.maxExposureDuration))
             if curISO >= dev.activeFormat.maxISO * 0.95 && CMTimeGetSeconds(curDur) >= maxDur * 0.95 { base = 60 }
         }
+        // Найтлапс - ночь, даже когда луна светит ярко и сенсор не на пределе: небо тёмное, а не серое
+        if cfg.scene == LapseScene.stars.rawValue { base = 60 }
         let target = base * pow(pow(2.0, Double(cfg.ev)), 1.0 / 2.2)
-        let f = pow(target / max(Double(mean), 1.0), 2.2)
+        var f = pow(target / max(Double(mean), 1.0), 2.2)
+        // Светлое пятно пересвечено (больше 2% кадра) - не светлее, а темнее, даже если в среднем кадр тёмный
+        if clipFrac > 0.02 { f = min(f, 0.8) }
         return min(max(f, 1.0 / limit), limit)
     }
 
