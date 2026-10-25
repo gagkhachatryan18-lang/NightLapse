@@ -2294,7 +2294,10 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             subtractBlack(div: div)
             let m = channelLevel(1, div: div)
             let target = Float(68 * pow(pow(2.0, Double(cfg.ev)), 1.0 / 2.2))
-            let want = min(max(target / max(m, 0.5), 1), maxAutoGain)
+            var want = min(max(target / max(m, 0.5), 1), maxAutoGain)
+            // Не дальше, чем пока светлые места (луна, облака под ней) не упрутся в белое
+            let hiL = highLevel(div: div)
+            if hiL > 1 { want = min(want, max(1, 235 / hiL)) }
             // В видео усиление меняется плавно, чтобы кадры не мигали
             setAutoGain(mode == .test || outIndex == 0 ? want : autoGain * 0.7 + want * 0.3)
             g = autoGain
@@ -2304,6 +2307,10 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             // поднимает его вместе с картинкой и ночное небо выходит серо-фиолетовым.
             // Если включено «оставлять самое яркое» из подкадров - ночью шум от этого
             // поднимает фон, поэтому фон тоже опускаем
+            if g > 1.01 {
+                let hiL = highLevel(div: div)
+                if hiL > 1 { g = min(g, max(1, 235 / hiL)) }
+            }
             if g > 1.01 || (cfg.lighten && n > 1 && night) { subtractBlack(div: div) }
             if g > 1.01 && night { neutralizeSky(div: div) }
         }
@@ -2376,6 +2383,31 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
     /// Яркость фона по каналу (0 - синий, 1 - зелёный, 2 - красный): 60% точек темнее.
     /// Не середина, чтобы тёмные деревья и горы внизу кадра не тянули усиление вверх
+    /// Яркость самых светлых точек (99.5%, по самому яркому каналу). Нужна, чтобы усиление не пересвечивало
+    /// луну и облака под ней, когда большая часть кадра - тёмные тучи
+    private func highLevel(div: Float) -> Float {
+        let px = acc.count / 4
+        guard px > 1000 else { return 0 }
+        var hist = [Int](repeating: 0, count: 1024)
+        var total = 0
+        acc.withUnsafeBufferPointer { a in
+            var i = 0
+            while i < px {
+                let v = max(a[i * 4], a[i * 4 + 1], a[i * 4 + 2]) / div
+                hist[Int(min(1023, max(0, v * 4)))] += 1
+                total += 1
+                i += 37
+            }
+        }
+        var sum = 0, v = 1023
+        while v > 0 {
+            sum += hist[v]
+            if sum * 1000 >= total * 5 { break }
+            v -= 1
+        }
+        return Float(v) / 4
+    }
+
     private func channelLevel(_ c: Int, div: Float) -> Float {
         let px = acc.count / 4
         guard px > 1000 else { return 1 }
