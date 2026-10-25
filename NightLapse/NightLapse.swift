@@ -1395,6 +1395,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             self.suspended = false
             self.warmupLeft = c.warmup
             self.calibLeft = c.isoAuto ? 4 : 0
+            self.preFrames = 0
             self.calibSkip = 0
             self.setAutoGain(1)
             self.setFrameTarget(c.exposure)
@@ -1463,6 +1464,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             self.suspended = false
             self.warmupLeft = c.warmup
             self.calibLeft = c.isoAuto ? 4 : 0
+            self.preFrames = 0
             self.calibSkip = 0
             self.setAutoGain(1)
             self.setFrameTarget(c.exposure)
@@ -2070,11 +2072,14 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     }
 
     /// После каждого кадра: плавная подстройка, не больше 1/3 EV за кадр, чтобы не было скачков яркости
-    private func autoISOStep(mean: Float) {
+    /// Сколько пробных кадров перед первым настоящим (не больше 3)
+    private var preFrames = 0
+
+    private func autoISOStep(mean: Float, full: Bool = false) {
         defer { updateFrameTarget() }
         // Половина поправки за кадр: новая выдержка доходит до кадра с задержкой, полная поправка раскачивала яркость
         // (на рассвете первые кадры прыгали 70 -> 86 -> 59 -> 89)
-        let f = pow(lightFactor(mean: mean, limit: 1.26), 0.5)
+        let f = full ? lightFactor(mean: mean, limit: 4) : pow(lightFactor(mean: mean, limit: 1.26), 0.5)
         guard abs(f - 1) > 0.02 else { return }
         // Ночью при максимуме сенсора яркость ведёт усиление в renderFrame
         if sensorMaxed() && (f > 1 || autoGain > 1.01) { return }
@@ -2198,7 +2203,14 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
         pauseNow = cfg.pause + max(0, cfg.exposure - frameTarget)
         inPause = pauseNow + extraPause > 0
-        if let f = frame {
+        if frame != nil, outIndex == 0, cfg.isoAuto, preFrames < 3, !sensorMaxed(),
+           abs(lightFactor(mean: mean, limit: 4) - 1) > 0.08 {
+            // Первый кадр заметно светлее или темнее нужного: в видео не пишем, сразу поправляем
+            // и снимаем заново - иначе ролик начинается со вспышки
+            preFrames += 1
+            autoISOStep(mean: mean, full: true)
+            Diag.event("Первый кадр: яркость \(Int(mean)), поправка, снимаю заново")
+        } else if let f = frame {
             writeFrame(f)
             if cfg.isoAuto { autoISOStep(mean: mean) }
         } else {
