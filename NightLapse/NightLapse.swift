@@ -830,6 +830,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     /// Свет кадра (ISO × выдержка снимка), подбирается по готовым снимкам. 0 - ещё не знаем
     private var plL: Double = 0
     /// Пробные снимки перед первым кадром: попасть в яркость сразу
+    private var plSetLight: Double = 0
+    private var plSetDur: Double = 0
     private var plMetering = false
     private var plMeterLeft = 0
 
@@ -854,6 +856,9 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         plISO = 0
         plMetering = true
         plMeterLeft = 4
+        plSetLight = 0
+        plSetDur = 0
+        plL = 0
         Diag.event(test ? "Тест кадром-фото" : "Съёмка кадрами-фото")
         queue.asyncAfter(deadline: .now() + Double(hold)) { self.plFrame() }
     }
@@ -927,10 +932,16 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         // Пробный снимок - один, только чтобы попасть в яркость
         if plMetering { count = 1 }
         iso = min(max(iso, fmt.minISO), fmt.maxISO)
-        if (try? dev.lockForConfiguration()) != nil {
+        // Выдержка меняется не мгновенно: фото сразу после смены уходило со старой (пробные снимки врали, первый кадр
+        // выходил светлее остальных). Если свет изменился - ждём, пока новая встанет
+        let want = Double(iso) * dur
+        let changed = plSetLight <= 0 || abs(log2(want / plSetLight)) > 0.04 || abs(dur - plSetDur) > 0.01
+        if changed, (try? dev.lockForConfiguration()) != nil {
             dev.setExposureModeCustom(duration: CMTime(seconds: dur, preferredTimescale: 1_000_000), iso: iso, completionHandler: nil)
             dev.unlockForConfiguration()
         }
+        plSetLight = want
+        plSetDur = dur
         plIsoUsed = iso
         curISO = iso
         curDur = CMTime(seconds: dur, preferredTimescale: 1_000_000)
@@ -942,8 +953,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             self.subTotal = count
             self.subDone = 0
         }
-        // Выдержке - встать
-        queue.asyncAfter(deadline: .now() + 0.5) { self.plCapture() }
+        // Выдержке - встать: 1.2 с после смены (сменили - кадры в конвейере ещё старые)
+        queue.asyncAfter(deadline: .now() + (changed ? 1.2 : 0.1)) { self.plCapture() }
     }
 
     /// Яркость среднего снимков: середина, 99.5% светлых точек и доля белого
