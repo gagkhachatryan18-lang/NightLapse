@@ -824,6 +824,11 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     private var plFrameAt: CFTimeInterval = 0
     private var plLeft = 0
     private var plCount = 0
+    /// Свет кадра (ISO × выдержка снимка), подбирается по готовым снимкам. 0 - ещё не знаем
+    private var plL: Double = 0
+    /// Пробные снимки перед первым кадром: попасть в яркость сразу
+    private var plMetering = false
+    private var plMeterLeft = 0
 
     /// queue: подключить фото-выход и начать кадры после задержки «не трогай телефон»
     private func plBegin(test: Bool, manual: Bool, hold: Int, angle: CGFloat) {
@@ -844,6 +849,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         plManual = manual
         plGain = 0
         plISO = 0
+        plMetering = true
+        plMeterLeft = 4
         Diag.event(test ? "Тест кадром-фото" : "Съёмка кадрами-фото")
         queue.asyncAfter(deadline: .now() + Double(hold)) { self.plFrame() }
     }
@@ -865,6 +872,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             return
         }
         plFrameAt = CACurrentMediaTime()
+        // Свет уже подобран по прошлым снимкам - сразу снимаем
+        if plL > 0 { return plShoot() }
         if (try? dev.lockForConfiguration()) != nil {
             if dev.isExposureModeSupported(.continuousAutoExposure) { dev.exposureMode = .continuousAutoExposure }
             dev.setExposureTargetBias(min(max(cfg.ev, dev.minExposureTargetBias), dev.maxExposureTargetBias), completionHandler: nil)
@@ -873,40 +882,51 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         queue.asyncAfter(deadline: .now() + 0.8) { self.plShoot() }
     }
 
-    /// queue: выбрать способ кадра и начать снимки
+    /// Целевая яркость неба (0...255): ночью темнее, днём средне-серый, сдвиг по ☀︎
+    private var plTarget: Float {
+        Float((plNight ? 75.0 : 118.0) * pow(2.0, Double(cfg.ev) / 2.2))
+    }
+
+    /// queue: выдержка и ISO снимков из подобранного света, начать снимки
     private func plShoot() {
         guard plActive, let dev = device else { return }
         let fmt = dev.activeFormat
-        let aeDur = CMTimeGetSeconds(dev.exposureDuration)
-        let light = Double(dev.iso) * aeDur
-        let aeMax = dev.iso >= fmt.maxISO * 0.9 && aeDur >= CMTimeGetSeconds(dev.activeMaxExposureDuration) * 0.9
-        plNight = isNightLight(light) || aeMax
+        let lo = CMTimeGetSeconds(fmt.minExposureDuration)
         let dmax = min(1.0, CMTimeGetSeconds(fmt.maxExposureDuration))
-        if plISO == 0 { plISO = fmt.maxISO }
+        if plL <= 0 {
+            // Первая прикидка по автоэкспозиции, дальше подправят пробные снимки
+            plL = max(Double(dev.iso) * CMTimeGetSeconds(dev.exposureDuration), 1)
+        }
+        plL = min(max(plL, Double(fmt.minISO) * lo), Double(fmt.maxISO) * dmax)
+        plNight = isNightLight(plL)
         var count = 1
-        var dur = aeDur
-        var iso = dev.iso
-        var auto = false
+        var dur: Double
+        var iso: Float
         if plManual {
             // Выдержка руками: снимки до 1 с, вместе - вся выдержка
             count = min(60, max(1, Int((cfg.exposure / dmax - 0.001).rounded(.up))))
-            dur = max(cfg.exposure / Double(count), CMTimeGetSeconds(fmt.minExposureDuration))
-            iso = plNight ? (cfg.isoAuto ? plISO : cfg.iso) : Float(light / dur)
+            dur = max(cfg.exposure / Double(count), lo)
+            iso = cfg.isoAuto ? Float(plL / dur) : cfg.iso
+        } else if !cfg.isoAuto {
+            iso = cfg.iso
+            dur = min(dmax, max(lo, plL / Double(iso)))
+            if plNight { count = max(1, min(30, Int(cfg.exposure / (dmax + 0.4)))) }
         } else if plNight {
             // Ночь: снимки по 1 с и их среднее - чем длиннее интервал, тем больше снимков и чище кадр
-            count = max(1, min(30, Int(cfg.exposure / (dmax + 0.4))))
             dur = dmax
-            iso = cfg.isoAuto ? plISO : cfg.iso
+            iso = Float(plL / dur)
+            count = max(1, min(30, Int(cfg.exposure / (dmax + 0.4))))
         } else {
-            // День: один снимок с автоэкспозицией, как в Камере
-            auto = true
+            // День: один снимок, ISO как можно ниже
+            dur = min(dmax, max(lo, plL / Double(fmt.minISO)))
+            iso = Float(plL / dur)
         }
-        if !auto {
-            iso = min(max(iso, fmt.minISO), fmt.maxISO)
-            if (try? dev.lockForConfiguration()) != nil {
-                dev.setExposureModeCustom(duration: CMTime(seconds: dur, preferredTimescale: 1_000_000), iso: iso, completionHandler: nil)
-                dev.unlockForConfiguration()
-            }
+        // Пробный снимок - один, только чтобы попасть в яркость
+        if plMetering { count = 1 }
+        iso = min(max(iso, fmt.minISO), fmt.maxISO)
+        if (try? dev.lockForConfiguration()) != nil {
+            dev.setExposureModeCustom(duration: CMTime(seconds: dur, preferredTimescale: 1_000_000), iso: iso, completionHandler: nil)
+            dev.unlockForConfiguration()
         }
         plIsoUsed = iso
         curISO = iso
@@ -919,8 +939,36 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             self.subTotal = count
             self.subDone = 0
         }
-        // Своей выдержке - встать
-        queue.asyncAfter(deadline: .now() + (auto ? 0 : 0.5)) { self.plCapture() }
+        // Выдержке - встать
+        queue.asyncAfter(deadline: .now() + 0.5) { self.plCapture() }
+    }
+
+    /// Яркость среднего снимков: середина, 99.5% светлых точек и доля белого
+    private func plStats() -> (median: Float, hi: Float, clip: Double) {
+        let div = Float(max(seriesN, 1)) * 257
+        var hist = [Int](repeating: 0, count: 256)
+        var i = 0
+        while i + 2 < seriesAcc.count {
+            let l = (Float(seriesAcc[i]) * 0.3 + Float(seriesAcc[i + 1]) * 0.59 + Float(seriesAcc[i + 2]) * 0.11) / div
+            hist[min(max(Int(l), 0), 255)] += 1
+            i += 4 * 7
+        }
+        let all = max(hist.reduce(0, +), 1)
+        func pct(_ p: Double) -> Float {
+            let need = Int(Double(all) * p)
+            var acc = 0
+            for (v, c) in hist.enumerated() { acc += c; if acc >= need { return Float(max(v, 1)) } }
+            return 255
+        }
+        return (pct(0.5), pct(0.995), Double(hist[250...].reduce(0, +)) / Double(all))
+    }
+
+    /// Во сколько раз изменить свет, чтобы небо пришло к нужной яркости (в линейном свете, гамма 2.2)
+    private func plFactor(_ st: (median: Float, hi: Float, clip: Double), limit: Double) -> Double {
+        var f = pow(Double(plTarget) / Double(max(st.median, 0.5)), 2.2)
+        // Пересвечено больше 1% кадра - только темнее
+        if st.clip > 0.01 { f = min(f, 0.7) }
+        return min(max(f, 1 / limit), limit)
     }
 
     private func plCapture() {
@@ -947,10 +995,31 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             DispatchQueue.main.async { self.subDone = done }
             if self.plLeft > 0 && !self.suspended {
                 self.plCapture()
+            } else if self.plMetering {
+                self.plMeter()
             } else {
                 self.plEmit()
             }
         }
+    }
+
+    /// queue: пробный снимок - поправить свет; попали (или 4 попытки) - снимаем настоящий кадр
+    private func plMeter() {
+        let st = plStats()
+        let f = seriesN > 0 ? plFactor(st, limit: 16) : 1
+        plMeterLeft -= 1
+        let mx = device.map { Double($0.activeFormat.maxISO) * min(1.0, CMTimeGetSeconds($0.activeFormat.maxExposureDuration)) } ?? 1
+        let maxed = plL >= mx * 0.99 && f > 1
+        Diag.event("Подбор: яркость \(Int(st.median)), белого \(Int(st.clip * 100))%, свет \(Int(plL)), поправка \(String(format: "%.2f", f))")
+        if abs(f - 1) > 0.3 && plMeterLeft > 0 && !maxed {
+            plL *= f
+        } else {
+            plL *= f
+            plMetering = false
+        }
+        seriesAcc = []
+        seriesN = 0
+        plShoot()
     }
 
     /// queue: среднее снимков -> кадр видео (или тест)
@@ -962,43 +1031,19 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             if plTest { return plTestDone(nil) }
             return plNext()
         }
-        // Гистограмма яркости среднего (0...255)
         let div = Float(n) * 257
-        var hist = [Int](repeating: 0, count: 256)
-        var i = 0
-        while i < seriesAcc.count {
-            let l = (Float(seriesAcc[i]) * 0.3 + Float(seriesAcc[i + 1]) * 0.59 + Float(seriesAcc[i + 2]) * 0.11) / div
-            hist[min(max(Int(l), 0), 255)] += 1
-            i += 4 * 7
-        }
-        let all = max(hist.reduce(0, +), 1)
-        func pct(_ p: Double) -> Float {
-            let need = Int(Double(all) * p)
-            var acc = 0
-            for (v, c) in hist.enumerated() { acc += c; if acc >= need { return Float(max(v, 1)) } }
-            return 255
-        }
-        let median = pct(0.5), hi = pct(0.995)
-        let srcClip = Double(hist[250...].reduce(0, +)) / Double(all)
-        var g: Float = 1
-        if plNight {
-            // Небо как на ночном снимке iPhone, светлее или темнее по ☀︎. Светлые места (луна, облака под ней) не в белое
-            let ev = Float(pow(2, Double(cfg.ev) + 0.5))
-            var want = min(max(45 * ev / median, 0.5), 8)
-            want = min(want, max(0.5, 240 / hi))
-            // В видео яркость меняется плавно, чтобы кадры не мигали
-            plGain = (plGain == 0 || plTest) ? want : plGain * 0.7 + want * 0.3
-            g = plGain
-            // Следующий кадр: пересвечено - ISO ниже, темно и запас есть - выше
-            if cfg.isoAuto, let dev = device {
-                let fmt = dev.activeFormat
-                if srcClip > 0.01 { plISO = max(fmt.minISO, plIsoUsed * 0.7) }
-                else if srcClip < 0.002 && hi < 150 && plIsoUsed < fmt.maxISO { plISO = min(fmt.maxISO, plIsoUsed * 1.3) }
-                else { plISO = plIsoUsed }
-            }
-        } else {
-            plGain = 0
-        }
+        let st = plStats()
+        let median = st.median, hi = st.hi
+        // Следующий кадр: свет плавно к нужной яркости (не больше 40% за кадр, чтобы не мигало)
+        let f = plFactor(st, limit: 16)
+        if !plManual || cfg.isoAuto { plL *= min(max(pow(f, 0.5), 0.7), 1.4) }
+        // Сенсор на пределе, а темно - добираем усилением; светлые места (луна, облака под ней) не в белое
+        let dev = device
+        let maxed = dev.map { plIsoUsed >= $0.activeFormat.maxISO * 0.99 } ?? false
+        var want = min(max(plTarget / median, 0.8), maxed ? 8 : 1.25)
+        want = min(want, max(0.5, 240 / hi))
+        plGain = (plGain == 0 || plTest) ? want : plGain * 0.7 + want * 0.3
+        let g = plGain
         // 8 бит + лёгкий шум против полос на гладком небе
         let k = g / div
         var out = [UInt8](repeating: 255, count: w * h * 4)
