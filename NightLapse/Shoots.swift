@@ -498,9 +498,11 @@ extension Frame {
 /// Как экспортировать: куда, размер, частота кадров, качество. Готовые наборы под площадки
 struct ExportOpts: Equatable {
     enum Res: Int, CaseIterable, Identifiable {
-        case p720 = 720, p1080 = 1080, p1440 = 1440, full = 0
+        case p720 = 720, p1080 = 1080, p1440 = 1440, p2160 = 2160, full = 0
         var id: Int { rawValue }
-        var title: String { self == .full ? "Оригинал" : "\(rawValue)p" }
+        var title: String { self == .p2160 || self == .full ? "4K" : "\(rawValue)p" }
+        /// Что показывать в выборе размера (оригинал - это 4K, меньше исходника кадр не растягивается)
+        static var choices: [Res] { [.p720, .p1080, .p1440, .p2160] }
     }
     enum Quality: Int, CaseIterable, Identifiable {
         case normal, high, max
@@ -533,7 +535,7 @@ struct ExportOpts: Equatable {
     }
 
     var toPhotos = true
-    var res: Res = .full
+    var res: Res = .p2160
     /// 0 - как в настройках съёмки
     var fps = 0
     var quality: Quality = .high
@@ -556,7 +558,7 @@ struct ExportOpts: Equatable {
         switch p {
         case .original: break
         case .instagram: o.res = .p1080; o.fps = 30; o.quality = .high; o.h264 = true
-        case .youtube: o.res = .full; o.fps = 30; o.quality = .max
+        case .youtube: o.res = .p2160; o.fps = 30; o.quality = .max
         case .telegram: o.res = .p1080; o.fps = 30; o.quality = .normal; o.h264 = true
         case .whatsapp: o.res = .p720; o.fps = 30; o.quality = .normal; o.h264 = true
         }
@@ -565,7 +567,7 @@ struct ExportOpts: Equatable {
 
     /// Размер кадра на выходе: короткая сторона не больше выбранной, чётные стороны
     func fit(_ w: Int, _ h: Int) -> (Int, Int) {
-        guard res != .full else { return (w, h) }
+        guard res != .full, res != .p2160 else { return (w, h) }
         let k = min(1, Double(res.rawValue) / Double(min(w, h)))
         return (max(2, Int(Double(w) * k) & ~1), max(2, Int(Double(h) * k) & ~1))
     }
@@ -976,7 +978,7 @@ final class Renderer: ObservableObject {
             if let ready = ShootStore.liveURL(shoot.dir, look, trail), FileManager.default.fileExists(atPath: ready.path),
                !(denoise && look.isVideo), !GapFill.needed(shoot.dir), grade.isNeutral,
                !(deflicker && look.isVideo), FramePlan.excluded(shoot.dir).isEmpty,
-               self.opts.res == .full, self.opts.fps == 0, !self.opts.h264, self.opts.mark == 0, !self.opts.autoColor {
+               (self.opts.res == .full || self.opts.res == .p2160), self.opts.fps == 0, !self.opts.h264, self.opts.mark == 0, !self.opts.autoColor {
                 r = self.saveReady(ready, isVideo: look.isVideo)
             } else if look == .startrail {
                 r = self.renderPhoto(shoot, grade)
@@ -3003,14 +3005,16 @@ struct ExportSheet: View {
                     }
                     section("Размер") {
                         Picker("Размер", selection: custom(\.res)) {
-                            ForEach(ExportOpts.Res.allCases) { Text($0.title).tag($0) }
+                            ForEach(ExportOpts.Res.choices) { Text($0.title).tag($0) }
                         }
                         .pickerStyle(.segmented)
                     }
                     if isVideo {
                         section("Кадров в секунду") {
-                            Picker("Кадров в секунду", selection: custom(\.fps)) {
-                                Text("Как снято").tag(0)
+                            Picker("Кадров в секунду", selection: Binding(get: { opts.fps == 0 ? fps : opts.fps }, set: { v in
+                                opts.fps = v == fps ? 0 : v
+                                preset = nil
+                            })) {
                                 Text("24").tag(24)
                                 Text("25").tag(25)
                                 Text("30").tag(30)
