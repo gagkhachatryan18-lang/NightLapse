@@ -3315,10 +3315,13 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         if let d = dir { ShootStore.markDone(d) }
         Diag.event("Стоп: \(frames) кадров")
         Diag.endShoot()
-        func end(_ m: String) {
+        func end(_ m: String, archive: Bool = false) {
             DispatchQueue.main.async {
                 self.finished(m)
-                if let d = dir { self.lastShoot = d }
+                if var d = dir {
+                    if archive && !UserDefaults.standard.bool(forKey: "keepFrames") { d = ShootStore.toCache(d) }
+                    self.lastShoot = d
+                }
             }
         }
         guard let w = writer, let url = videoURL, videoIndex > 0 else {
@@ -3344,7 +3347,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
                 PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
             }) { ok, _ in
                 if ok { try? FileManager.default.removeItem(at: url) }
-                end(ok ? "Видео сохранено в галерее телефона" : "Нет доступа к галерее телефона. Видео лежит в Файлы → NightLapse")
+                end(ok ? "Видео сохранено в галерее телефона" : "Нет доступа к галерее телефона. Видео лежит в Файлы → NightLapse", archive: ok)
             }
         }
     }
@@ -4554,6 +4557,7 @@ struct SettingsSheet: View {
     @AppStorage("guideSeen") private var guideSeen = false
     @AppStorage("dimAfter") private var dimAfter = 60
     @AppStorage("polish") private var polish = true
+    @AppStorage("keepFrames") private var keepFrames = false
 
     var body: some View {
         NavigationStack {
@@ -4599,10 +4603,11 @@ struct SettingsSheet: View {
                         Text("60").tag(60)
                     }
                     .pickerStyle(.segmented)
+                    Toggle("Хранить исходные кадры в Файлах", isOn: $keepFrames)
                 } header: {
                     Text("Сохранение")
                 } footer: {
-                    Text("Исходные кадры всегда сохраняются в Файлы → На iPhone → NightLapse. Удалить их можно только вручную")
+                    Text(keepFrames ? "Исходные кадры остаются в Файлы → На iPhone → NightLapse. Удалить их можно только вручную" : "После сохранения видео исходные кадры уходят в кеш: их можно монтировать в приложении, пока iOS не очистит кеш сама. В Файлах их не будет")
                 }
 
                 Section {

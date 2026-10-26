@@ -73,9 +73,30 @@ enum ShootStore {
                      scene: (info["scene"] as? String) ?? "")
     }
 
+    /// Кеш: сюда уезжают исходные кадры после съёмки, если их не нужно хранить в «Файлах». iOS чистит его сама
+    static func cacheRoot() -> URL {
+        let u = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("Shoots", isDirectory: true)
+        try? FileManager.default.createDirectory(at: u, withIntermediateDirectories: true)
+        return u
+    }
+
+    /// Переносит папку съёмки из «Файлов» в кеш. Если не вышло - остаётся на месте
+    static func toCache(_ dir: URL) -> URL {
+        let to = cacheRoot().appendingPathComponent(dir.lastPathComponent, isDirectory: true)
+        try? FileManager.default.removeItem(at: to)
+        do {
+            try FileManager.default.moveItem(at: dir, to: to)
+            return to
+        } catch {
+            return dir
+        }
+    }
+
     static func list() -> [Shoot] {
         let fm = FileManager.default
-        let all = (try? fm.contentsOfDirectory(at: docs(), includingPropertiesForKeys: [.isDirectoryKey])) ?? []
+        let keys: [URLResourceKey] = [.isDirectoryKey]
+        let all = ((try? fm.contentsOfDirectory(at: docs(), includingPropertiesForKeys: keys)) ?? [])
+            + ((try? fm.contentsOfDirectory(at: cacheRoot(), includingPropertiesForKeys: keys)) ?? [])
         return all.filter { $0.lastPathComponent.hasSuffix("_frames") && $0.hasDirectoryPath }
             .map { load($0) }
             .filter { $0.frames > 0 }
