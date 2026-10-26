@@ -297,7 +297,7 @@ struct Grade: Equatable {
         var id: String { rawValue }
         var title: String {
             switch self {
-            case .original: return "Как снято"
+            case .original: return "Оригинал"
             case .wide: return "16:9"
             case .vertical: return "9:16"
             case .square: return "1:1"
@@ -479,7 +479,7 @@ struct ExportOpts: Equatable {
     enum Res: Int, CaseIterable, Identifiable {
         case p720 = 720, p1080 = 1080, p1440 = 1440, full = 0
         var id: Int { rawValue }
-        var title: String { self == .full ? "Как снято" : "\(rawValue)p" }
+        var title: String { self == .full ? "Оригинал" : "\(rawValue)p" }
     }
     enum Quality: Int, CaseIterable, Identifiable {
         case normal, high, max
@@ -493,7 +493,7 @@ struct ExportOpts: Equatable {
         var id: String { rawValue }
         var title: String {
             switch self {
-            case .original: return "Как снято"
+            case .original: return "Оригинал"
             case .instagram: return "Instagram"
             case .youtube: return "YouTube"
             case .telegram: return "Telegram"
@@ -1783,6 +1783,13 @@ struct ShootEditor: View {
     @Environment(\.dismiss) private var dismiss
     @StateObject private var r = Renderer()
     @State private var look: Look = .starlapse
+    /// Видео, Следы или Звёзды: Starlapse и Таймлапс - одно видео, стиль выбирается при экспорте
+    private var kind: Binding<Look> {
+        Binding(get: { look.isVideo ? .timelapse : look },
+                set: { n in
+                    if n == .timelapse { if !look.isVideo { look = .timelapse } } else { look = n }
+                })
+    }
     /// Видео 3 в 1: вертикально, сверху как снято, ниже средний и длинный след
     @State private var stack3 = false
     @State private var askExport = false
@@ -1937,18 +1944,12 @@ struct ShootEditor: View {
                     Text("\(durationText) · \(shoot.frames) кадров").font(.subheadline).foregroundStyle(.secondary)
                 }
                 if !day {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("Видео").font(.footnote).foregroundStyle(.secondary)
-                        Picker("Видео", selection: $look) {
-                            ForEach([Look.starlapse, .timelapse]) { Text($0.title).tag($0) }
-                        }
-                        .pickerStyle(.segmented)
-                        Text("Фото").font(.footnote).foregroundStyle(.secondary)
-                        Picker("Фото", selection: $look) {
-                            ForEach([Look.startrail, .deep]) { Text($0.title).tag($0) }
-                        }
-                        .pickerStyle(.segmented)
+                    Picker("Что получить", selection: kind) {
+                        Text("Видео").tag(Look.timelapse)
+                        Text("Следы").tag(Look.startrail)
+                        Text("Звёзды").tag(Look.deep)
                     }
+                    .pickerStyle(.segmented)
                     .disabled(r.busy)
                 }
                 Button { askExport = true } label: {
@@ -2024,14 +2025,10 @@ struct ShootEditor: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
                 if !day {
-                    Text("Видео").font(.footnote).foregroundStyle(.secondary)
-                    Picker("Видео", selection: $look) {
-                        ForEach([Look.starlapse, .timelapse]) { Text($0.title).tag($0) }
-                    }
-                    .pickerStyle(.segmented)
-                    Text("Фото").font(.footnote).foregroundStyle(.secondary)
-                    Picker("Фото", selection: $look) {
-                        ForEach([Look.startrail, .deep]) { Text($0.title).tag($0) }
+                    Picker("Что получить", selection: kind) {
+                        Text("Видео").tag(Look.timelapse)
+                        Text("Следы").tag(Look.startrail)
+                        Text("Звёзды").tag(Look.deep)
                     }
                     .pickerStyle(.segmented)
                 }
@@ -2192,7 +2189,8 @@ struct ShootEditor: View {
             }
         }
         .sheet(isPresented: $askExport) {
-            ExportSheet(isVideo: eff.isVideo, frames: shoot.frames, fps: shoot.fps, src: srcSize, opts: $exportOpts) {
+            ExportSheet(isVideo: eff.isVideo, frames: shoot.frames, fps: shoot.fps, src: srcSize, opts: $exportOpts,
+                        styleLook: (day || !look.isVideo) ? nil : $look, styleTrail: $trail) {
                 askExport = false
                 r.run(shoot, eff, trail, denoise: denoise, grade: grade, deflicker: deflicker, opts: exportOpts)
             }
@@ -2926,6 +2924,9 @@ struct ExportSheet: View {
     var fps = 30
     var src = (3840, 2160)
     @Binding var opts: ExportOpts
+    /// Стиль видео: звёзды точками или с хвостами. Только для видео ночной съёмки
+    var styleLook: Binding<Look>?
+    var styleTrail: Binding<Trail>?
     @AppStorage("denoise") private var denoise = true
     @AppStorage("deflicker") private var deflicker = true
     let onExport: () -> Void
@@ -2955,6 +2956,21 @@ struct ExportSheet: View {
                                             .background(on ? pal.accent : Color.secondary.opacity(0.15), in: Capsule())
                                     }
                                 }
+                            }
+                        }
+                    }
+                    if isVideo, let sl = styleLook {
+                        section("Звёзды в видео") {
+                            Picker("Звёзды в видео", selection: sl) {
+                                Text("Точками").tag(Look.timelapse)
+                                Text("С хвостами").tag(Look.starlapse)
+                            }
+                            .pickerStyle(.segmented)
+                            if sl.wrappedValue == .starlapse, let st = styleTrail {
+                                Picker("Длина хвоста", selection: st) {
+                                    ForEach(Trail.allCases) { Text($0.title).tag($0) }
+                                }
+                                .pickerStyle(.segmented)
                             }
                         }
                     }

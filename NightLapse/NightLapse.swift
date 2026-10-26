@@ -145,7 +145,7 @@ enum LapseScene: String, CaseIterable, Identifiable {
     /// Снимок каждые N секунд по умолчанию
     var interval: Double {
         switch self {
-        case .stars: return 8
+        case .stars: return 0   // подряд, как Night Lapse у GoPro
         case .clouds: return 5
         case .photo: return 30   // у фото интервала нет: это потолок выдержки
         }
@@ -161,6 +161,9 @@ enum LapseScene: String, CaseIterable, Identifiable {
 }
 
 /// 1/8 с, 0.5 с, 17 с
+/// Интервал: 0 - кадры подряд, без пауз
+func intervalText(_ v: Double) -> String { v < 0.001 ? "Подряд" : expText(v) }
+
 func expText(_ v: Double) -> String {
     // 0 и мусор не делим: 1/0 давало вылет, когда выдержка равна интервалу и пауза 0
     guard v.isFinite, v > 0.00005 else { return "0 с" }
@@ -235,7 +238,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     @Published var exposureSeconds: Double
     /// Снимок каждые N секунд. Выдержка и пауза считаются из него сами
     @Published var intervalSeconds: Double { didSet { ud.set(intervalSeconds, forKey: "interval") } }
-    static let intervalSteps: [Double] = [1, 2, 3, 4, 5, 6, 8, 10, 12, 15, 20, 25, 30, 40, 50, 60, 90, 120]
+    static let intervalSteps: [Double] = [0, 1, 2, 3, 4, 5, 6, 8, 10, 12, 15, 20, 25, 30, 40, 50, 60, 90, 120]
 
     // Остальные настройки запоминаются между запусками
     @Published var pauseSeconds: Double { didSet { ud.set(pauseSeconds, forKey: "pause") } }
@@ -320,12 +323,12 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         let sc = sceneKind
         let cap: Double
         switch sc {
-        case .stars: cap = intervalSeconds   // без скрытых ограничений: кадр на весь интервал, что выйдет - покажет тест
-        case .clouds: cap = 2
+        case .stars: cap = intervalSeconds > 0 ? intervalSeconds : starLimit   // подряд: выдержка авто - как для звёзд, что выйдет - покажет тест
+        case .clouds: cap = intervalSeconds > 0 ? min(intervalSeconds, 2) : 2
         case .photo: cap = starLimit   // днём сама станет короче, как в таймлапсе
         }
         // Ручная выдержка ни от чего не зависит. Длиннее интервала - кадры идут подряд, без паузы
-        let ex = expManual ? exposureSeconds : min(intervalSeconds, cap)
+        let ex = expManual ? exposureSeconds : (sc == .stars ? cap : min(intervalSeconds > 0 ? intervalSeconds : cap, cap))
         exposureSeconds = ex
         pauseSeconds = max(0, intervalSeconds - ex)
         lighten = sc.lighten
@@ -2120,7 +2123,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             cooling = false
             setExtra(0)
             Diag.event("Остыл")
-            if phase == .recording { status = "Остыл, пауза снова \(Int(pauseSeconds)) с" }
+            if phase == .recording { status = "Остыл, продолжаю" }
         }
     }
 
@@ -2845,7 +2848,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
                 let dir = Self.docs().appendingPathComponent(cfg.name + "_frames", isDirectory: true)
                 try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
                 framesDir = dir
-                ShootStore.writeInfo(dir, ["fps": Int(cfg.fps), "scene": cfg.scene, "interval": cfg.interval,
+                ShootStore.writeInfo(dir, ["fps": Int(cfg.fps), "scene": cfg.scene, "interval": cfg.interval > 0 ? cfg.interval : max(cfg.exposure, 1) * 1.2,
                                            "created": Date().timeIntervalSince1970, "done": false,
                                            "exposure": cfg.exposure, "pause": cfg.pause, "ev": Double(cfg.ev),
                                            "device": Diag.model(), "camera": Diag.device,
@@ -3194,9 +3197,7 @@ struct Pal {
 
 struct ContentView: View {
     var onSwitch: () -> Void = {}
-    /// Красный ночной интерфейс: 0 - сам, когда темно; 1 - всегда; 2 - никогда
-    @AppStorage("redUI") private var redUI = 0
-    private var t: Pal { Pal(night: redUI == 1 || (redUI == 0 && e.isDark)) }
+    private var t: Pal { Pal(night: false) }
     @StateObject private var e = LapseEngine()
     @State private var dark = false
     @State private var showFocusMenu = false
@@ -3325,23 +3326,23 @@ struct ContentView: View {
 
     private var topBar: some View {
         HStack(spacing: 10) {
-            infoChip
+            if lowResources { infoChip }
             Spacer(minLength: 0)
             if shooting { recTimer }
             Spacer(minLength: 0)
             if shooting {
                 roundIcon("moon") { dark = true }
-                    .accessibilityLabel("Погасить экран")
+                    .accessibilityLabel("Экран выкл.")
             } else {
                 summaryPill
             }
         }
         .padding(.top, 4)
         .confirmationDialog("Фокус", isPresented: $showFocusMenu, titleVisibility: .visible) {
-            Button("Вручную") {
+            Button("MF - вручную") {
                 withAnimation(.easeOut(duration: 0.15)) { openParam = .focus }
             }
-            Button("Авто") {
+            Button("AF - авто") {
                 // Ручная настройка закрывается, увеличение плавно уходит назад
                 withAnimation(.easeOut(duration: 0.2)) { if openParam == .focus { openParam = nil } }
                 e.resetFocusAuto()
@@ -3385,9 +3386,9 @@ struct ContentView: View {
         if e.sceneKind == .photo {
             return Text(Image(systemName: "stopwatch")) + Text(" \(expShort)")
         }
-        return Text(Image(systemName: "timer")) + Text(" \(expText(e.intervalSeconds))   ")
-            + Text(Image(systemName: "stopwatch")) + Text(" \(expShort)   ")
-            + Text(Image(systemName: "hourglass")) + Text(e.autoStopMin == 0 ? " ∞" : " " + durText(Double(e.autoStopMin) * 60))
+        return Text("Инт. \(intervalText(e.intervalSeconds))  ·  ")
+            + Text("Выд. \(expShort)  ·  ")
+            + Text(Image(systemName: "hourglass")) + Text(e.autoStopMin == 0 ? " Без лимита" : " " + durText(Double(e.autoStopMin) * 60))
     }
 
     /// Значки смотрят вверх, как ни держи телефон. Лицом вверх или вниз - оставляем как было
@@ -3417,6 +3418,11 @@ struct ContentView: View {
     private var charging: Bool {
         let st = UIDevice.current.batteryState
         return st == .charging || st == .full
+    }
+
+    /// Заряд и память видны, только когда их мало или телефон греется
+    private var lowResources: Bool {
+        (0..<20).contains(e.battery) || (e.freeGB > 0 && e.freeGB < 10) || e.hot
     }
 
     private var infoChip: some View {
@@ -3484,7 +3490,7 @@ struct ContentView: View {
                         .padding(.vertical, 4)
                         .background(Color.black.opacity(0.55), in: Capsule())
                 }
-                if idle && e.sceneKind == .stars {
+                if idle && e.sceneKind == .stars && pole.on {
                     PolePill(p: pole, pal: t)
                 }
                 Spacer()
@@ -3570,7 +3576,7 @@ struct ContentView: View {
         let cool = e.cooling && (e.phase == .recording || e.phase == .paused)
         if cool { s += " · нагрев: пауза +\(Int(e.coolExtra)) с" }
         if e.phase == .recording && e.effExposure > 0 && e.effExposure < e.exposureSeconds - 0.01 {
-            s += " · выдержка \(expText(e.effExposure))"
+            s += " · сейчас \(expText(e.effExposure))"
         }
         if e.hot && !cool { s += " · телефон перегрет" }
         return s
@@ -3581,20 +3587,6 @@ struct ContentView: View {
     private var bottomControls: some View {
         VStack(spacing: 10) {
             if idle {
-                if !focusHintSeen && e.needsStarFocus {
-                    HStack(spacing: 8) {
-                        Image(systemName: "viewfinder")
-                        Text("Фокус по звёздам - сам, ~15 с")
-                        Button { focusHintSeen = true } label: { Image(systemName: "xmark") }
-                            .accessibilityLabel("Понятно")
-                    }
-                    .font(.footnote)
-                    .foregroundStyle(t.accent)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                    .background(t.accent.opacity(0.14), in: RoundedRectangle(cornerRadius: 10))
-                    .padding(.horizontal, 16)
-                }
                 modeCarousel
             } else if e.phase == .recording || e.phase == .paused {
                 dashboard
@@ -3679,17 +3671,23 @@ struct ContentView: View {
                                 e.expManual ? expText(e.exposureSeconds) : "Авто",
                                 warn: false)
                     if e.sceneKind != .photo {
-                        paramCircle(.interval, "timer", expText(e.intervalSeconds), warn: intervalWarn != nil)
+                        paramCircle(.interval, "timer", intervalText(e.intervalSeconds), warn: intervalWarn != nil)
                         paramCircle(.duration, "hourglass",
-                                    e.autoStopMin == 0 ? "Пока не остановлю" : durText(Double(e.autoStopMin) * 60),
+                                    e.autoStopMin == 0 ? "Без ограничений" : durText(Double(e.autoStopMin) * 60),
                                     warn: durationWarn != nil)
                     }
                     circleButton("viewfinder", "Фокус", focusShort, on: e.starFocused || openParam == .focus, warn: false) {
                         showFocusMenu = true
                     }
-                    circleButton("moon", "Погасить", "экран", on: false, warn: false) {
+                    circleButton("moon", "Экран", "выкл.", on: false, warn: false) {
                         panel = false
                         dark = true
+                    }
+                    if e.sceneKind == .stars {
+                        circleButton("location.north.circle", "Полярная", pole.on ? "вкл." : "где она?", on: pole.on, warn: false) {
+                            pole.toggle()
+                            if pole.on { withAnimation(.spring(duration: 0.3)) { panel = false; openParam = nil } }
+                        }
                     }
                     circleButton("gearshape", "Настройки", "", on: false, warn: false) {
                         showSettings = true
@@ -3703,18 +3701,19 @@ struct ContentView: View {
             }
         }
         .padding(14)
-        .background(RoundedRectangle(cornerRadius: 28).fill(t.night ? Color.black.opacity(0.88) : Color(white: 0.1).opacity(0.86)))
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 28))
+        .background(RoundedRectangle(cornerRadius: 28).fill(Color.black.opacity(0.35)))
         .overlay(RoundedRectangle(cornerRadius: 28).stroke(t.fill, lineWidth: 1))
         .transition(.move(edge: .bottom).combined(with: .opacity))
     }
 
     private func paramTitle(_ p: Param) -> String {
         switch p {
-        case .brightness: return "Яркость"
+        case .brightness: return "Экспозиция"
         case .exposure: return "Выдержка"
         case .interval: return "Интервал"
         case .duration: return "Длительность"
-        case .focus: return "Фокус вручную"
+        case .focus: return "MF"
         }
     }
 
@@ -3736,9 +3735,9 @@ struct ContentView: View {
     }
 
     private var focusShort: String {
-        if e.starFocused { return "наведён" }
-        if e.focusAuto || e.needsStarFocus { return "авто" }
-        return e.focus >= 0.99 ? "вдаль" : "вручную"
+        if e.starFocused { return "AF ✓" }
+        if e.focusAuto || e.needsStarFocus { return "AF" }
+        return "MF"
     }
 
     private func paramCircle(_ p: Param, _ icon: String, _ value: String, warn: Bool) -> some View {
@@ -3778,9 +3777,9 @@ struct ContentView: View {
 
     private var paramRow: some View {
         HStack(spacing: 8) {
-            paramChip(.brightness, "Яркость", String(format: "%+.1f", e.evComp), warn: evWarn != nil)
-            paramChip(.interval, "Интервал", expText(e.intervalSeconds), warn: intervalWarn != nil)
-            paramChip(.duration, "Длительность", e.autoStopMin == 0 ? "Пока не остановлю" : durText(Double(e.autoStopMin) * 60), warn: durationWarn != nil)
+            paramChip(.brightness, "Экспозиция", String(format: "%+.1f", e.evComp), warn: evWarn != nil)
+            paramChip(.interval, "Интервал", intervalText(e.intervalSeconds), warn: intervalWarn != nil)
+            paramChip(.duration, "Длительность", e.autoStopMin == 0 ? "Без ограничений" : durText(Double(e.autoStopMin) * 60), warn: durationWarn != nil)
         }
     }
 
@@ -3883,13 +3882,13 @@ struct ContentView: View {
                         .tint(t.accent)
                     Image(systemName: "sun.max")
                 }
-                Text("Яркость \(String(format: "%+.1f", e.evComp))")
+                Text("Экспозиция \(String(format: "%+.1f", e.evComp))")
                     .font(.footnote)
                     .foregroundStyle(t.dim)
             case .interval:
                 HStack(spacing: 16) {
                     stepButton("minus") { e.intervalDown() }
-                    Text(expText(e.intervalSeconds))
+                    Text(intervalText(e.intervalSeconds))
                         .font(.subheadline.weight(.semibold))
                         .monospacedDigit()
                         .frame(minWidth: 170)
@@ -3912,7 +3911,7 @@ struct ContentView: View {
                         ForEach([0, 30, 60, 120, 240, 480], id: \.self) { m in
                             let sel = e.autoStopMin == m
                             Button { e.autoStopMin = m } label: {
-                                Text(m == 0 ? "Пока не остановлю" : durText(Double(m) * 60))
+                                Text(m == 0 ? "Без ограничений" : durText(Double(m) * 60))
                                     .font(.footnote.weight(.semibold))
                                     .foregroundStyle(sel ? t.onAccent : t.text)
                                     .padding(.horizontal, 10)
@@ -4061,14 +4060,14 @@ struct ContentView: View {
         .overlay(alignment: .topTrailing) {
             // Сколько пробных кадров сохранено - касание открывает их
             if savedTests > 0 && idle {
-                Text("\(savedTests)")
-                    .font(.system(size: 11, weight: .bold).monospacedDigit())
+                Image(systemName: "photo.stack")
+                    .font(.system(size: 11, weight: .bold))
                     .foregroundStyle(t.onAccent)
-                    .frame(minWidth: 20, minHeight: 20)
-                    .background(t.accent, in: Capsule())
+                    .frame(width: 22, height: 22)
+                    .background(t.accent, in: Circle())
                     .offset(x: 4, y: -4)
                     .onTapGesture { showTest = true }
-                    .accessibilityLabel("Прошлые тесты: \(savedTests)")
+                    .accessibilityLabel("Прошлые тесты")
             }
         }
         .onTapGesture { if idle { e.testFrame() } }
@@ -4083,10 +4082,7 @@ struct ContentView: View {
         let fps = Double(max(e.fps, 1))
         let videoPerHour = 3600 / interval / fps
         if e.sceneKind == .photo { return "Фото сразу в галерею" }
-        var s = "\(e.sceneKind.hint) · 1 час = \(String(format: "%.0f", videoPerHour)) с видео"
-        if e.autoStopMin > 0 {
-            s += ", за \(durText(Double(e.autoStopMin) * 60)) - \(String(format: "%.1f", videoPerHour * Double(e.autoStopMin) / 60)) с"
-        }
+        let s = "1 ч = \(String(format: "%.0f", videoPerHour)) с видео"
         return s
     }
 
@@ -4143,7 +4139,7 @@ struct GuideView: View {
         Page(icon: "record.circle", title: "Старт, тест и экспорт",
              text: "Красная кнопка - старт и стоп. «Тест» - пробный кадр, долгое нажатие на него - все прошлые тесты с увеличением. После «Стоп» откроется редактор: видео и фото, «Экспорт» с размером и качеством, склейка оборванной съёмки"),
         Page(icon: "moon", title: "Ночью",
-             text: "Интерфейс сам становится красным, чтобы не слепить. Луна вверху гасит экран. «Где Полярная звезда?» на кадре подскажет, куда навести, чтобы следы стали кругами. Приложение следит за зарядом и памятью и остановится заранее, всё сохранив")
+             text: "Луна вверху гасит экран. «Полярная» в шторке подскажет, куда навести, чтобы следы стали кругами. Приложение следит за зарядом и памятью и остановится заранее, всё сохранив")
     ]
 
     var body: some View {
@@ -4249,23 +4245,10 @@ struct SettingsSheet: View {
     @Environment(\.dismiss) private var dismiss
     @AppStorage("guideSeen") private var guideSeen = false
     @AppStorage("autoDark") private var autoDark = true
-    @AppStorage("redUI") private var redUI = 0
 
     var body: some View {
         NavigationStack {
             Form {
-                Section {
-                    Picker("Красный интерфейс", selection: $redUI) {
-                        Text("Авто").tag(0)
-                        Text("Всегда").tag(1)
-                        Text("Никогда").tag(2)
-                    }
-                } header: {
-                    Text("Ночью")
-                } footer: {
-                    Text("Красный свет меньше всего сбивает глаза, привыкшие к темноте")
-                }
-
                 Section {
                     Toggle("Снимать в 4K", isOn: $e.uhd)
                     VStack(alignment: .leading, spacing: 8) {
@@ -4304,8 +4287,8 @@ struct SettingsSheet: View {
                 }
 
                 Section {
-                    Picker("Задержка старта", selection: $e.startDelayMin) {
-                        Text("Нет").tag(0)
+                    Picker("Запланировать", selection: $e.startDelayMin) {
+                        Text("Сразу").tag(0)
                         Text("1 мин").tag(1)
                         Text("5 мин").tag(5)
                         Text("15 мин").tag(15)
