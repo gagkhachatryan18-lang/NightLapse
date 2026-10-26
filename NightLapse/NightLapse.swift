@@ -1001,8 +1001,28 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         queue.asyncAfter(deadline: .now() + Double(hold)) { self.plFrame() }
     }
 
+    /// Баланс белого зафиксирован на съёмку: авто не прыгает от кадра к кадру
+    private var wbHeld = false
+
+    /// queue: после подбора света замораживаем баланс белого, как делают в профессиональных таймлапсах
+    private func plHoldWB() {
+        guard !wbHeld, currentSettingsQueue.wbAuto, let dev = device,
+              dev.isLockingWhiteBalanceWithCustomDeviceGainsSupported else { return }
+        guard (try? dev.lockForConfiguration()) != nil else { return }
+        var g = dev.deviceWhiteBalanceGains
+        let m = dev.maxWhiteBalanceGain
+        g.redGain = min(max(g.redGain, 1), m)
+        g.greenGain = min(max(g.greenGain, 1), m)
+        g.blueGain = min(max(g.blueGain, 1), m)
+        dev.setWhiteBalanceModeLocked(with: g, completionHandler: nil)
+        dev.unlockForConfiguration()
+        wbHeld = true
+        Diag.event(String(format: "Баланс белого зафиксирован: R %.2f G %.2f B %.2f", g.redGain, g.greenGain, g.blueGain))
+    }
+
     /// queue: убрать фото-выход
     private func plStop() {
+        wbHeld = false
         plActive = false
         seriesAcc = []
         session.beginConfiguration()
@@ -1170,6 +1190,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         } else {
             plL *= f
             plMetering = false
+            plHoldWB()
         }
         seriesAcc = []
         seriesN = 0
@@ -1191,13 +1212,14 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         let median = st.median, hi = st.hi
         // Следующий кадр: свет плавно к нужной яркости (не больше 40% за кадр, чтобы не мигало)
         let f = plFactor(st, limit: 16)
-        if !plManual || cfg.isoAuto { plL *= min(max(pow(f, 0.5), 0.7), 1.4) }
+        // Мелкие колебания (облако, шум замера) игнорируем, большие отрабатываем плавно: не мерцает
+        if !plManual || cfg.isoAuto, abs(f - 1) > 0.05 { plL *= min(max(pow(f, 0.4), 0.9), 1.12) }
         // Сенсор на пределе, а темно - добираем усилением; светлые места (луна, облака под ней) не в белое
         let dev = device
         let maxed = dev.map { plIsoUsed >= $0.activeFormat.maxISO * 0.99 } ?? false
         var want = min(max(plTarget / median, 0.8), maxed ? 8 : 1.25)
         want = min(want, max(0.5, 240 / hi))
-        plGain = (plGain == 0 || plTest) ? want : plGain * 0.7 + want * 0.3
+        plGain = (plGain == 0 || plTest) ? want : plGain * 0.85 + want * 0.15
         let g = plGain
         // 8 бит + лёгкий шум против полос на гладком небе
         let k = g / div
@@ -2556,6 +2578,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         }
 
         if s.wbAuto {
+            if wbHeld { return }
             if dev.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
                 dev.whiteBalanceMode = .continuousAutoWhiteBalance
             }
