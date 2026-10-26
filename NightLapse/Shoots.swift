@@ -2025,12 +2025,18 @@ struct ShootEditor: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
                 if !day {
-                    Picker("Что получить", selection: kind) {
-                        Text("Видео").tag(Look.timelapse)
+                    // Видео - главное, его не выбирают: здесь только фото из этой съёмки
+                    Picker("Фото", selection: kind) {
                         Text("Следы").tag(Look.startrail)
                         Text("Звёзды").tag(Look.deep)
                     }
                     .pickerStyle(.segmented)
+                    if !look.isVideo {
+                        Button { look = .timelapse } label: {
+                            Label("Вернуться к видео", systemImage: "film")
+                                .font(.footnote.weight(.semibold))
+                        }
+                    }
                 }
                 if look == .starlapse {
                     Text("Длина следа").font(.footnote).foregroundStyle(.secondary)
