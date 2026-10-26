@@ -3654,8 +3654,9 @@ struct ContentView: View {
         if e.sceneKind == .photo {
             return Text(Image(systemName: "stopwatch")) + Text(" \(expShort)")
         }
-        return Text("Инт. \(intervalText(e.intervalSeconds))  ·  ")
-            + Text("Выд. \(expShort)  ·  ")
+        // Порядок как в шторке: выдержка, интервал, длительность
+        return Text("Выд. \(expShort)  ·  ")
+            + Text("Инт. \(intervalText(e.intervalSeconds))  ·  ")
             + Text(Image(systemName: "hourglass")) + Text(e.autoStopMin == 0 ? " Без лимита" : " " + durText(Double(e.autoStopMin) * 60))
     }
 
