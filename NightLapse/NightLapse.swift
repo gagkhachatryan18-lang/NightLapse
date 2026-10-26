@@ -379,7 +379,6 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     @Published var startDelayMin: Int { didSet { ud.set(startDelayMin, forKey: "delay") } }
     @Published var autoStopMin: Int { didSet { ud.set(autoStopMin, forKey: "autostop") } }
     /// Пауза для охлаждения, если телефон сильно нагрелся
-    @Published var coolBreaks: Bool { didSet { ud.set(coolBreaks, forKey: "coolBreaks") } }
     @Published var cooling = false
     @Published var coolCount = 0
     /// Сколько секунд сейчас добавлено к паузе из-за нагрева
@@ -475,7 +474,31 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     }
 
     /// Таймер после нажатия «Тест», «Старт» и ∞: 3 с для крепкого штатива, 10 с для лёгкого
-    @Published var startHold: Int = 3 { didSet { UserDefaults.standard.set(startHold, forKey: "startHold") } }
+    var startHold: Int { 1 }
+
+    /// Таймер как в Камере iPhone: 0 - выкл, 3 или 10 секунд до начала. Идёт обратный отсчёт на экране
+    @Published var selfTimer: Int = UserDefaults.standard.integer(forKey: "selfTimer") { didSet { UserDefaults.standard.set(selfTimer, forKey: "selfTimer") } }
+    @Published var preTimer = 0
+    private var preTimerItem: DispatchWorkItem?
+
+    private func runTimed(_ action: @escaping () -> Void) {
+        guard selfTimer > 0 else { action(); return }
+        func step(_ left: Int) {
+            if left <= 0 { preTimer = 0; action(); return }
+            preTimer = left
+            Haptic.heavy()
+            let w = DispatchWorkItem { step(left - 1) }
+            preTimerItem = w
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: w)
+        }
+        step(selfTimer)
+    }
+
+    func cancelPreTimer() {
+        preTimerItem?.cancel()
+        preTimerItem = nil
+        preTimer = 0
+    }
 
     /// Резкость по звёздам найдена для текущего объектива (запоминается между запусками)
     /// Вернуть обычный автофокус
@@ -754,13 +777,11 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         uhd = d.flag("uhd", true)
         startDelayMin = d.num("delay", 0)
         autoStopMin = d.num("autostop", 0)
-        coolBreaks = d.flag("coolBreaks", true)
         // Яркость всегда авто (один ползунок), умная выдержка всегда включена, фокус - бесконечность или по касанию
         isoAuto = true
         autoShutter = true
         wbAuto = d.flag("wbAuto", false)
         starFocused = d.flag("starFocused", false)
-        startHold = d.num("startHold", 3)
         focusAuto = false
         evComp = d.dbl("ev", -1)
         scene = LapseScene(rawValue: d.string(forKey: "scene") ?? "")?.rawValue ?? LapseScene.stars.rawValue
@@ -1391,7 +1412,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         phase = .test
         subDone = 0
         subTotal = list.reduce(0) { $0 + $1.count }
-        status = "Не трогай телефон \(hold) с..."
+        status = "Готовлюсь..."
         UIApplication.shared.isIdleTimerDisabled = true
         let angle = captureAngle()
         let ev = evComp
@@ -1968,13 +1989,17 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     private var photoPending = false
 
     func takePhoto() {
-        photoSeries()
+        runTimed { self.photoSeries() }
     }
 
     func testFrame() {
+        runTimed { self.testFrameNow() }
+    }
+
+    private func testFrameNow() {
         guard phase == .idle else { return }
         if needsStarFocus {
-            afterFocus = { [weak self] in self?.testFrame() }
+            afterFocus = { [weak self] in self?.testFrameNow() }
             starFocus()
             return
         }
@@ -1982,7 +2007,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         phase = .test
         subTotal = c.subNeeded
         subDone = 0
-        status = "Не трогай телефон \(startHold) с..."
+        status = "Готовлюсь..."
         let hold = startHold
         UIApplication.shared.isIdleTimerDisabled = true
         let s = currentSettings()
@@ -2011,9 +2036,14 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
     func start() {
         guard phase == .idle else { return }
+        runTimed { self.startNow() }
+    }
+
+    private func startNow() {
+        guard phase == .idle else { return }
         guard saveVideo || saveFrames else { status = "Включи сохранение видео или кадров"; return }
         if needsStarFocus {
-            afterFocus = { [weak self] in self?.start() }
+            afterFocus = { [weak self] in self?.startNow() }
             starFocus()
             return
         }
@@ -2049,7 +2079,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         resumeUntil = nil
         resumeOf = nil
         phase = .recording
-        status = "Не трогай телефон \(startHold) с..."
+        status = "Готовлюсь..."
         let hold = startHold
         LiveStatus.shared.start(mode: sceneKind.title, battery: battery)
         batStart = nil
@@ -2366,7 +2396,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     /// Сильный нагрев: к паузе между кадрами добавляется время, пока телефон не остынет.
     /// Камера при этом не выключается, кадры просто не обрабатываются. Остыл - пауза снова твоя
     private func checkCooling(_ state: ProcessInfo.ThermalState, _ now: Date) {
-        guard coolBreaks, phase == .recording || phase == .paused else {
+        guard phase == .recording || phase == .paused else {
             if cooling {
                 cooling = false
                 setExtra(0)
@@ -3472,7 +3502,7 @@ struct ContentView: View {
     /// Один раз ночью: подсказка, что фокус наведётся сам
     @AppStorage("focusHintSeen") private var focusHintSeen = false
     /// Экономия батареи: через 30 с после старта экран сам гаснет
-    @AppStorage("autoDark") private var autoDark = true
+    @AppStorage("dimAfter") private var dimAfter = 60
     @State private var showTest = false
     /// Сколько пробных кадров сохранено
     @State private var savedTests = 0
@@ -3501,6 +3531,14 @@ struct ContentView: View {
             let landscape = geo.size.width > geo.size.height
             ZStack {
                 Color.black.ignoresSafeArea()
+                if e.preTimer > 0 {
+                    Text("\(e.preTimer)")
+                        .font(.system(size: 120, weight: .thin).monospacedDigit())
+                        .foregroundStyle(.white)
+                        .shadow(radius: 8)
+                        .zIndex(5)
+                        .allowsHitTesting(false)
+                }
                 // Один и тот же кадр камеры в обеих ориентациях: при повороте он только двигается,
                 // а не создаётся заново - поэтому экран не пропадает на несколько секунд
                 CameraLayout(landscape: landscape) {
@@ -3549,8 +3587,8 @@ struct ContentView: View {
         .onChange(of: e.evComp) { e.applyCamera() }
         .onChange(of: e.phase) {
             if e.phase != .idle { openParam = nil; panel = false }
-            if e.phase == .recording && autoDark {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 30) {
+            if e.phase == .recording && dimAfter > 0 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + Double(dimAfter)) {
                     if e.phase == .recording { dark = true }
                 }
             }
@@ -4285,6 +4323,7 @@ struct ContentView: View {
         Button {
             switch e.phase {
             case .idle:
+                if e.preTimer > 0 { e.cancelPreTimer(); break }
                 if e.sceneKind == .photo { e.takePhoto() } else { e.start() }
             case .recording, .paused: e.stop()
             case .test, .waiting: e.cancel()
@@ -4513,14 +4552,13 @@ struct SettingsSheet: View {
     @ObservedObject var e: LapseEngine
     @Environment(\.dismiss) private var dismiss
     @AppStorage("guideSeen") private var guideSeen = false
-    @AppStorage("autoDark") private var autoDark = true
+    @AppStorage("dimAfter") private var dimAfter = 60
     @AppStorage("polish") private var polish = true
 
     var body: some View {
         NavigationStack {
             Form {
                 Section {
-                    Toggle("Снимать в 4K", isOn: $e.uhd)
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
                             Text("Баланс белого")
@@ -4541,19 +4579,30 @@ struct SettingsSheet: View {
                 } header: {
                     Text("Камера")
                 } footer: {
-                    Text("Без 4K - Full HD 1080p: меньше места и заряда. Видео будет горизонтальным или вертикальным - как держишь телефон в момент старта")
+                    Text("HD - Full HD 1080p: меньше места и заряда. Видео будет горизонтальным или вертикальным - как держишь телефон в момент старта")
                 }
 
-                Section("Сохранение") {
-                    Toggle("Сразу экспортировать видео в галерею телефона", isOn: $e.saveVideo)
+                Section {
+                    Picker("Сохранять в", selection: $e.saveVideo) {
+                        Text("Телефон и приложение").tag(true)
+                        Text("Только приложение").tag(false)
+                    }
+                    Picker("Разрешение", selection: $e.uhd) {
+                        Text("HD").tag(false)
+                        Text("4K").tag(true)
+                    }
+                    .pickerStyle(.segmented)
                     Picker("Кадров в секунду", selection: $e.fps) {
                         Text("24").tag(24)
                         Text("25").tag(25)
                         Text("30").tag(30)
+                        Text("60").tag(60)
                     }
+                    .pickerStyle(.segmented)
+                } header: {
+                    Text("Сохранение")
+                } footer: {
                     Text("Исходные кадры всегда сохраняются в Файлы → На iPhone → NightLapse. Удалить их можно только вручную")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
                 }
 
                 Section {
@@ -4565,16 +4614,20 @@ struct SettingsSheet: View {
                         Text("30 мин").tag(30)
                         Text("1 ч").tag(60)
                     }
-                    Toggle("Длиннее пауза при перегреве", isOn: $e.coolBreaks)
-                    Toggle("Гасить экран через 30 с после старта", isOn: $autoDark)
-                    Picker("Таймер перед кадрами", selection: $e.startHold) {
-                        Text("3 с - крепкий штатив").tag(3)
-                        Text("10 с - лёгкий штатив, ветер").tag(10)
+                    Picker("Таймер", selection: $e.selfTimer) {
+                        Text("Выкл").tag(0)
+                        Text("3 с").tag(3)
+                        Text("10 с").tag(10)
+                    }
+                    Picker("Гасить экран через", selection: $dimAfter) {
+                        Text("Не гасить").tag(0)
+                        Text("15 с").tag(15)
+                        Text("1 мин").tag(60)
+                        Text("15 мин").tag(900)
+                        Text("1 ч").tag(3600)
                     }
                 } header: {
                     Text("Съёмка")
-                } footer: {
-                    Text("Если телефон сильно нагреется, к паузе между кадрами добавится время, пока не остынет. Съёмка не прерывается")
                 }
 
                 Section {
