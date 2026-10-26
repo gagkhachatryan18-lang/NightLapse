@@ -9,6 +9,7 @@ import Accelerate
 import Photos
 import CoreImage
 import ImageIO
+import CoreMotion
 
 enum AppMode: String { case night, daily }
 
@@ -171,6 +172,120 @@ func expText(_ v: Double) -> String {
     let d = (1 / v).rounded()
     if abs(1 / d - v) < 0.0005 { return "1/\(Int(d)) с" }
     return String(format: "%.2f с", v)
+}
+
+/// Выравнивание кадров серии: когда телефон в руках, каждый следующий снимок смещён. Ищем сдвиг в три прохода
+/// (маленькая картинка, средняя, кусок в полном размере) и считаем его для рисования в сумму
+final class Aligner {
+    private let w: Int, h: Int
+    private let w0 = 256, w1 = 1024
+    private let h0: Int, h1: Int
+    private let sq: Int
+    private let l0: [Float], l1: [Float], l2: [Float]
+
+    init?(_ cg: CGImage) {
+        let iw = cg.width, ih = cg.height
+        guard iw >= 512, ih >= 512 else { return nil }
+        let ih0 = max(1, ih * 256 / iw), ih1 = max(1, ih * 1024 / iw)
+        let isq = min(1024, min(iw, ih))
+        w = iw
+        h = ih
+        h0 = ih0
+        h1 = ih1
+        sq = isq
+        l0 = Aligner.gray(cg, 256, ih0, CGRect(x: 0, y: 0, width: 256, height: ih0))
+        l1 = Aligner.gray(cg, 1024, ih1, CGRect(x: 0, y: 0, width: 1024, height: ih1))
+        l2 = Aligner.gray(cg, isq, isq, CGRect(x: -CGFloat(iw - isq) / 2, y: -CGFloat(ih - isq) / 2,
+                                               width: CGFloat(iw), height: CGFloat(ih)))
+    }
+
+    /// Серый кадр без среднего и с единичным разбросом: сравнивать можно кадры любой яркости
+    private static func gray(_ cg: CGImage, _ ow: Int, _ oh: Int, _ rect: CGRect) -> [Float] {
+        var px = [UInt16](repeating: 0, count: ow * oh * 4)
+        let ok: Bool = px.withUnsafeMutableBytes { b in
+            guard let ctx = CGContext(data: b.baseAddress, width: ow, height: oh, bitsPerComponent: 16, bytesPerRow: ow * 8,
+                                      space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue | CGBitmapInfo.byteOrder16Little.rawValue) else { return false }
+            ctx.interpolationQuality = .high
+            ctx.draw(cg, in: rect)
+            return true
+        }
+        var g = [Float](repeating: 0, count: ow * oh)
+        guard ok else { return g }
+        var sum: Double = 0
+        for i in 0..<(ow * oh) {
+            let v = Float(px[i * 4]) * 0.3 + Float(px[i * 4 + 1]) * 0.59 + Float(px[i * 4 + 2]) * 0.11
+            g[i] = v
+            sum += Double(v)
+        }
+        let mean = Float(sum / Double(max(1, ow * oh)))
+        var var2: Double = 0
+        for i in 0..<g.count {
+            g[i] -= mean
+            var2 += Double(g[i] * g[i])
+        }
+        let sd = Float((var2 / Double(max(1, g.count))).squareRoot())
+        if sd < 1e-3 { return g }
+        for i in 0..<g.count { g[i] /= sd }
+        return g
+    }
+
+    private static func best(_ a: [Float], _ b: [Float], _ w: Int, _ h: Int, cx: Int, cy: Int, range: Int, step st: Int) -> (Int, Int, Float) {
+        var bd = Float.greatestFiniteMagnitude
+        var bx = cx, by = cy
+        a.withUnsafeBufferPointer { ap in
+            b.withUnsafeBufferPointer { bp in
+                for dy in (cy - range)...(cy + range) {
+                    for dx in (cx - range)...(cx + range) {
+                        let r0 = max(0, -dy), r1 = min(h, h - dy), c0 = max(0, -dx), c1 = min(w, w - dx)
+                        if r1 - r0 < h / 2 || c1 - c0 < w / 2 { continue }
+                        var s: Float = 0
+                        var n = 0
+                        var r = r0
+                        while r < r1 {
+                            let ro = r * w
+                            let to = (r + dy) * w + dx
+                            var c = c0
+                            while c < c1 {
+                                let d = bp[to + c] - ap[ro + c]
+                                s += d * d
+                                n += 1
+                                c += st
+                            }
+                            r += st
+                        }
+                        let m = s / Float(max(n, 1))
+                        if m < bd {
+                            bd = m
+                            bx = dx
+                            by = dy
+                        }
+                    }
+                }
+            }
+        }
+        return (bx, by, bd)
+    }
+
+    /// На сколько пикселей (вправо, вверх) сдвинуть кадр при рисовании, чтобы он лёг на первый. nil - не нашли
+    func shift(of cg: CGImage) -> (Int, Int)? {
+        guard cg.width == w, cg.height == h else { return nil }
+        let t0 = Aligner.gray(cg, w0, h0, CGRect(x: 0, y: 0, width: w0, height: h0))
+        let a = Aligner.best(l0, t0, w0, h0, cx: 0, cy: 0, range: 12, step: 1)
+        let f1 = w1 / w0
+        let t1 = Aligner.gray(cg, w1, h1, CGRect(x: 0, y: 0, width: w1, height: h1))
+        let b = Aligner.best(l1, t1, w1, h1, cx: a.0 * f1, cy: a.1 * f1, range: 5, step: 2)
+        // Совсем непохоже (темнота без деталей, всё сдвинулось) - не трогаем кадр
+        guard b.2 < 1.3 else { return nil }
+        let f2 = Double(w) / Double(w1)
+        let t2 = Aligner.gray(cg, sq, sq, CGRect(x: -CGFloat(w - sq) / 2, y: -CGFloat(h - sq) / 2, width: CGFloat(w), height: CGFloat(h)))
+        let c = Aligner.best(l2, t2, sq, sq, cx: Int((Double(b.0) * f2).rounded()), cy: Int((Double(b.1) * f2).rounded()), range: 5, step: 2)
+        guard c.2 < 1.3, abs(c.0) < w / 4, abs(c.1) < h / 4 else { return nil }
+        // Дрожание меньше пикселя на глаз не видно
+        if abs(c.0) <= 1 && abs(c.1) <= 1 { return (0, 0) }
+        // Строки идут сверху вниз, а рисуем снизу вверх: по вертикали знак другой
+        return (-c.0, c.1)
+    }
 }
 
 struct LapseConfig {
@@ -850,6 +965,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         }
         if let c = photoOut.connection(with: .video), c.isVideoRotationAngleSupported(angle) { c.videoRotationAngle = angle }
         plActive = true
+        seriesWantTrim = true
+        seriesAlign = false
         plTest = test
         plManual = manual
         plGain = 0
@@ -947,6 +1064,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         curDur = CMTime(seconds: dur, preferredTimescale: 1_000_000)
         seriesAcc = []
         seriesN = 0
+        seriesTrim = false
+        seriesWantTrim = count >= 5
         plLeft = count
         plCount = count
         DispatchQueue.main.async {
@@ -959,7 +1078,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
     /// Яркость среднего снимков: середина, 99.5% светлых точек и доля белого
     private func plStats() -> (median: Float, hi: Float, clip: Double) {
-        let div = Float(max(seriesN, 1)) * 257
+        let div = Float(seriesEffN) * 257
         var hist = [Int](repeating: 0, count: 256)
         var i = 0
         while i + 2 < seriesAcc.count {
@@ -1038,9 +1157,10 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
     /// queue: среднее снимков -> кадр видео (или тест)
     private func plEmit() {
-        let n = seriesN, w = seriesW, h = seriesH
+        trimSeries()
+        let n = seriesEffN, w = seriesW, h = seriesH
         let t0 = CACurrentMediaTime()
-        guard n > 0, w > 0, h > 0 else {
+        guard seriesN > 0, w > 0, h > 0 else {
             Diag.event("Кадр \(outIndex + 1) не собрался")
             if plTest { return plTestDone(nil) }
             return plNext()
@@ -1115,7 +1235,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         img = img.transformed(by: CGAffineTransform(scaleX: s, y: s))
         let e = img.extent
         let x0 = (e.midX - CGFloat(W) / 2).rounded(), y0 = (e.midY - CGFloat(H) / 2).rounded()
-        img = img.transformed(by: CGAffineTransform(translationX: -x0, y: -y0))
+        img = img.transformed(by: CGAffineTransform(translationX: -x0, y: -y0)).cropped(to: CGRect(x: 0, y: 0, width: W, height: H))
+        img = polishCI(img, night: plNight)
         var pbOut: CVPixelBuffer?
         let attrs = [kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any]()] as CFDictionary
         CVPixelBufferCreate(kCFAllocatorDefault, W, H, kCVPixelFormatType_32BGRA, attrs, &pbOut)
@@ -1160,6 +1281,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         var count = 1
         var normalize = false
         var fast = false            // без тяжёлой обработки iPhone - сравнить, что она даёт
+        var balanced = false        // чуть быстрее снимок: для съёмки из рук
+        var align = false           // выровнять снимки друг по другу (из рук)
         var checkpoints: [Int] = []  // после скольких снимков сохранять промежуточное среднее (для сравнения)
         var looks: [Look] = []       // какие обработки сохранять в каждой точке
     }
@@ -1175,6 +1298,16 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     private var seriesW = 0
     private var seriesH = 0
     private var seriesN = 0
+    /// Отсев выбросов: самое тёмное и самое светлое значение каждой точки не берём (самолёты, спутники, горячие точки)
+    private var seriesWantTrim = false
+    private var seriesTrim = false
+    private var seriesMin: [UInt16] = []
+    private var seriesMax: [UInt16] = []
+    private var seriesAlign = false
+    private var seriesAligner: Aligner?
+    /// Сколько с краёв кадра осталось пустым после сдвигов (px): влево, вправо, сверху, снизу
+    private var seriesMargin = (l: 0, r: 0, t: 0, b: 0)
+    private var seriesEffN: Int { seriesTrim ? max(seriesN - 2, 1) : max(seriesN, 1) }
     private var seriesLeft = 0
     private var seriesTotal = 0
     private var seriesEV = 0.0
@@ -1183,14 +1316,48 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
     /// Режим «Фото». Днём - один снимок с автоэкспозицией, как в Камере. Ночью или с выдержкой, выставленной руками, -
     /// серия снимков до 1 с и их среднее: чем длиннее выдержка, тем больше снимков и тем чище кадр
+    private let motionMgr = CMMotionManager()
+    private var photoSampling = false
+
+    /// Телефон в руках или на штативе: полсекунды смотрим, как он дрожит
+    private func sampleShake(_ done: @escaping (Bool) -> Void) {
+        guard motionMgr.isDeviceMotionAvailable else { return done(false) }
+        var sum = 0.0
+        var n = 0
+        motionMgr.deviceMotionUpdateInterval = 1.0 / 50
+        motionMgr.startDeviceMotionUpdates(to: .main) { m, _ in
+            guard let r = m?.rotationRate else { return }
+            sum += r.x * r.x + r.y * r.y + r.z * r.z
+            n += 1
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+            self.motionMgr.stopDeviceMotionUpdates()
+            let rms = n > 5 ? (sum / Double(n)).squareRoot() : 0
+            Diag.event("Дрожание: \(String(format: "%.3f", rms)) рад/с")
+            done(rms > 0.015)
+        }
+    }
+
     func photoSeries() {
+        guard phase == .idle, !photoSampling, device != nil else { return }
+        photoSampling = true
+        status = "Снимаю..."
+        sampleShake { shaky in
+            self.photoSampling = false
+            self.photoSeriesRun(handheld: shaky)
+        }
+    }
+
+    private func photoSeriesRun(handheld: Bool) {
         guard phase == .idle, let dev = device else { return }
         let fmt = dev.activeFormat
         var j = PhotoJob(label: "Фото")
         if isDark || expManual {
-            let dmax = min(1.0, CMTimeGetSeconds(fmt.maxExposureDuration))
-            j.count = min(60, max(1, Int((exposureSeconds / dmax - 0.001).rounded(.up))))
+            // Из рук снимки короткие (не смазаны), их больше, и они выравниваются друг по другу
+            let dmax = handheld ? min(0.3, CMTimeGetSeconds(fmt.maxExposureDuration)) : min(1.0, CMTimeGetSeconds(fmt.maxExposureDuration))
+            j.count = min(handheld ? 16 : 60, max(1, Int((exposureSeconds / dmax - 0.001).rounded(.up))))
             j.dur = max(exposureSeconds / Double(j.count), CMTimeGetSeconds(fmt.minExposureDuration))
+            if handheld { j.dur = min(j.dur, dmax); j.balanced = true; j.align = true }
             if !isDark {
                 // Яркость как в превью: то же количество света, только другой выдержкой
                 j.iso = Float(Double(dev.iso) * CMTimeGetSeconds(dev.exposureDuration) / j.dur)
@@ -1200,8 +1367,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             j.auto = true
         }
         j.checkpoints = [j.count]
-        j.looks = [j.normalize ? .night(45) : .asIs]
-        runJobs([j], toGallery: true)
+        j.looks = [j.normalize ? .night(75) : .asIs]
+        runJobs([j], toGallery: true, hold: handheld ? 0 : nil)
     }
 
     /// Эксперимент: несколько способов подряд, все кадры - в «Тесты», чтобы сравнить и выбрать лучший
@@ -1218,9 +1385,9 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         ], toGallery: false)
     }
 
-    private func runJobs(_ list: [PhotoJob], toGallery: Bool) {
+    private func runJobs(_ list: [PhotoJob], toGallery: Bool, hold holdOverride: Int? = nil) {
         guard phase == .idle else { return }
-        let hold = startHold
+        let hold = holdOverride ?? startHold
         phase = .test
         subDone = 0
         subTotal = list.reduce(0) { $0 + $1.count }
@@ -1279,6 +1446,9 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         seriesW = 0
         seriesH = 0
         seriesN = 0
+        seriesTrim = false
+        seriesWantTrim = jobsToGallery && j.count >= 5
+        seriesAlign = j.align
         seriesLeft = j.count
         seriesTotal = j.count
         let label = j.label
@@ -1292,7 +1462,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     private func shootSeries() {
         guard seriesActive else { return }
         let st = AVCapturePhotoSettings()
-        st.photoQualityPrioritization = jobIdx < jobs.count && jobs[jobIdx].fast ? .speed : .quality
+        st.photoQualityPrioritization = jobIdx < jobs.count && jobs[jobIdx].fast ? .speed : (jobIdx < jobs.count && jobs[jobIdx].balanced ? .balanced : .quality)
         st.maxPhotoDimensions = photoOut.maxPhotoDimensions
         photoOut.capturePhoto(with: st, delegate: self)
     }
@@ -1332,14 +1502,36 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             seriesW = cg.width
             seriesH = cg.height
             seriesAcc = [UInt32](repeating: 0, count: seriesW * seriesH * 4)
+            seriesTrim = false
+            seriesMargin = (0, 0, 0, 0)
+            seriesAligner = nil
+            if seriesWantTrim {
+                seriesMin = [UInt16](repeating: 0xFFFF, count: seriesAcc.count)
+                seriesMax = [UInt16](repeating: 0, count: seriesAcc.count)
+            } else {
+                seriesMin = []
+                seriesMax = []
+            }
+            if seriesAlign { seriesAligner = Aligner(cg) }
         }
         let w = seriesW, h = seriesH
+        // Из рук: ищем, на сколько сдвинулся снимок относительно первого, и рисуем его со сдвигом
+        var tx = 0, ty = 0
+        if seriesN > 0, let al = seriesAligner, let sft = al.shift(of: cg) {
+            tx = sft.0
+            ty = sft.1
+            seriesMargin.l = max(seriesMargin.l, tx)
+            seriesMargin.r = max(seriesMargin.r, -tx)
+            seriesMargin.b = max(seriesMargin.b, ty)
+            seriesMargin.t = max(seriesMargin.t, -ty)
+        }
+        let drawRect = CGRect(x: tx, y: ty, width: w, height: h)
         var px = [UInt16](repeating: 0, count: w * h * 4)
         var ok: Bool = px.withUnsafeMutableBytes { b in
             guard let ctx = CGContext(data: b.baseAddress, width: w, height: h, bitsPerComponent: 16, bytesPerRow: w * 8,
                                       space: CGColorSpaceCreateDeviceRGB(),
                                       bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue | CGBitmapInfo.byteOrder16Little.rawValue) else { return false }
-            ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+            ctx.draw(cg, in: drawRect)
             return true
         }
         if !ok {
@@ -1349,25 +1541,87 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
                 guard let ctx = CGContext(data: b.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
                                           space: CGColorSpaceCreateDeviceRGB(),
                                           bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return false }
-                ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+                ctx.draw(cg, in: drawRect)
                 return true
             }
             if ok { for i in 0..<px.count { px[i] = UInt16(p8[i]) * 257 } }
         }
         guard ok else { return }
-        seriesAcc.withUnsafeMutableBufferPointer { a in
-            px.withUnsafeBufferPointer { p in
-                for i in 0..<a.count { a[i] &+= UInt32(p[i]) }
+        if seriesWantTrim && seriesMin.count == seriesAcc.count {
+            seriesAcc.withUnsafeMutableBufferPointer { a in
+                px.withUnsafeBufferPointer { p in
+                    seriesMin.withUnsafeMutableBufferPointer { lo in
+                        seriesMax.withUnsafeMutableBufferPointer { hi in
+                            for i in 0..<a.count {
+                                let v = p[i]
+                                a[i] &+= UInt32(v)
+                                if v < lo[i] { lo[i] = v }
+                                if v > hi[i] { hi[i] = v }
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            seriesAcc.withUnsafeMutableBufferPointer { a in
+                px.withUnsafeBufferPointer { p in
+                    for i in 0..<a.count { a[i] &+= UInt32(p[i]) }
+                }
             }
         }
         seriesN += 1
     }
 
+    /// От 5 снимков: убрать из суммы самое тёмное и самое светлое значение каждой точки
+    private func trimSeries() {
+        guard !seriesTrim, seriesN >= 5, seriesMin.count == seriesAcc.count else { return }
+        let lo = seriesMin, hi = seriesMax
+        seriesAcc.withUnsafeMutableBufferPointer { a in
+            lo.withUnsafeBufferPointer { l in
+                hi.withUnsafeBufferPointer { h in
+                    for i in 0..<a.count { a[i] = a[i] &- UInt32(l[i]) &- UInt32(h[i]) }
+                }
+            }
+        }
+        seriesTrim = true
+        seriesMin = []
+        seriesMax = []
+    }
+
+    /// Рамка без пустых краёв после сдвигов (в координатах картинки сверху вниз)
+    private func seriesCropRect() -> CGRect? {
+        let m = seriesMargin
+        guard m.l + m.r + m.t + m.b > 0 else { return nil }
+        let w = seriesW - m.l - m.r, h = seriesH - m.t - m.b
+        guard w > 100, h > 100 else { return nil }
+        return CGRect(x: m.l, y: m.t, width: w, height: h)
+    }
+
+    /// Мягкое шумоподавление и подъём теней - как в ночном режиме iPhone: тени светлее, небо остаётся тёмным
+    private func polishCI(_ img: CIImage, night: Bool) -> CIImage {
+        guard UserDefaults.standard.object(forKey: "polish") as? Bool ?? true else { return img }
+        var o = img
+        if let f = CIFilter(name: "CINoiseReduction") {
+            f.setValue(o, forKey: kCIInputImageKey)
+            f.setValue(0.012, forKey: "inputNoiseLevel")
+            f.setValue(0.4, forKey: "inputSharpness")
+            if let r = f.outputImage { o = r.cropped(to: img.extent) }
+        }
+        if night, let f = CIFilter(name: "CIHighlightShadowAdjust") {
+            f.setValue(o, forKey: kCIInputImageKey)
+            f.setValue(0.35, forKey: "inputShadowAmount")
+            f.setValue(1.0, forKey: "inputHighlightAmount")
+            if let r = f.outputImage { o = r.cropped(to: img.extent) }
+        }
+        return o
+    }
+
     /// queue: текущее среднее способа во всех нужных обработках -> в галерею (режим «Фото») или в «Тесты» (сравнение)
     private func emitJob() {
         let j = jobs[jobIdx]
-        let n = seriesN, w = seriesW, h = seriesH
-        guard n > 0 else { return }
+        guard seriesN > 0 else { return }
+        if jobsToGallery { trimSeries() }
+        let n = seriesEffN, w = seriesW, h = seriesH
         // Гистограмма яркости среднего (0...255): середина (небо) и 1% самых тёмных (чёрная точка)
         let div = Float(n) * 257
         var hist = [Int](repeating: 0, count: 256)
@@ -1418,7 +1672,10 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
                                    space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
                                    provider: prov, decode: nil, shouldInterpolate: false, intent: .defaultIntent) else { continue }
             if jobsToGallery {
-                guard let jpg = ShootStore.jpeg(cg) else { continue }
+                var fin = cg
+                if let r = seriesCropRect(), let c = fin.cropping(to: r) { fin = c }
+                if !j.auto, let pc = ci.createCGImage(polishCI(CIImage(cgImage: fin), night: j.normalize), from: CGRect(x: 0, y: 0, width: fin.width, height: fin.height)) { fin = pc }
+                guard let jpg = ShootStore.jpeg(fin) else { continue }
                 seriesThumb = ShootStore.thumbData(jpg, maxPixel: 600)
                 let sem = DispatchSemaphore(value: 0)
                 PHPhotoLibrary.shared().performChanges({
@@ -4256,6 +4513,7 @@ struct SettingsSheet: View {
     @Environment(\.dismiss) private var dismiss
     @AppStorage("guideSeen") private var guideSeen = false
     @AppStorage("autoDark") private var autoDark = true
+    @AppStorage("polish") private var polish = true
 
     var body: some View {
         NavigationStack {
@@ -4328,6 +4586,7 @@ struct SettingsSheet: View {
 
                 Section {
                     Toggle("Кадры как Фото", isOn: $e.photoFrames)
+                    Toggle("Шумодав и подъём теней", isOn: $polish)
                     Button("Сравнить способы съёмки") {
                         dismiss()
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { e.compareTest() }
