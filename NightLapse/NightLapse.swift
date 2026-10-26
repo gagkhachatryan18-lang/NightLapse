@@ -806,6 +806,289 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         }
     }
 
+    // MARK: Найтлапс и таймлапс кадрами-фото: каждый кадр снимается так же, как в режиме «Фото»
+
+    /// Новый способ: кадры через фото-обработку iPhone (чище, без полос). Выключено - старый способ, из видеопотока
+    @Published var photoFrames: Bool = UserDefaults.standard.object(forKey: "photoFrames") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(photoFrames, forKey: "photoFrames") }
+    }
+
+    // Только queue
+    private var plActive = false
+    private var plTest = false
+    private var plManual = false
+    private var plNight = false
+    private var plGain: Float = 0
+    private var plISO: Float = 0
+    private var plIsoUsed: Float = 0
+    private var plFrameAt: CFTimeInterval = 0
+    private var plLeft = 0
+    private var plCount = 0
+
+    /// queue: подключить фото-выход и начать кадры после задержки «не трогай телефон»
+    private func plBegin(test: Bool, manual: Bool, hold: Int, angle: CGFloat) {
+        session.beginConfiguration()
+        if !session.outputs.contains(photoOut), session.canAddOutput(photoOut) { session.addOutput(photoOut) }
+        session.commitConfiguration()
+        photoOut.maxPhotoQualityPrioritization = .quality
+        if let dev = device {
+            // Самый маленький размер фото, который не меньше видео: меньше памяти и быстрее
+            let vd = CMVideoFormatDescriptionGetDimensions(dev.activeFormat.formatDescription)
+            let need = Int(max(vd.width, vd.height))
+            let dims = dev.activeFormat.supportedMaxPhotoDimensions.sorted { Int($0.width) * Int($0.height) < Int($1.width) * Int($1.height) }
+            if let d = dims.first(where: { Int(max($0.width, $0.height)) >= need }) ?? dims.last { photoOut.maxPhotoDimensions = d }
+        }
+        if let c = photoOut.connection(with: .video), c.isVideoRotationAngleSupported(angle) { c.videoRotationAngle = angle }
+        plActive = true
+        plTest = test
+        plManual = manual
+        plGain = 0
+        plISO = 0
+        Diag.event(test ? "Тест кадром-фото" : "Съёмка кадрами-фото")
+        queue.asyncAfter(deadline: .now() + Double(hold)) { self.plFrame() }
+    }
+
+    /// queue: убрать фото-выход
+    private func plStop() {
+        plActive = false
+        seriesAcc = []
+        session.beginConfiguration()
+        if session.outputs.contains(photoOut) { session.removeOutput(photoOut) }
+        session.commitConfiguration()
+    }
+
+    /// queue: замер света, как в Камере - автоэкспозиция показывает, светло или темно
+    private func plFrame() {
+        guard plActive, let dev = device else { return }
+        if suspended || !session.isRunning {
+            queue.asyncAfter(deadline: .now() + 0.5) { self.plFrame() }
+            return
+        }
+        plFrameAt = CACurrentMediaTime()
+        if (try? dev.lockForConfiguration()) != nil {
+            if dev.isExposureModeSupported(.continuousAutoExposure) { dev.exposureMode = .continuousAutoExposure }
+            dev.setExposureTargetBias(min(max(cfg.ev, dev.minExposureTargetBias), dev.maxExposureTargetBias), completionHandler: nil)
+            dev.unlockForConfiguration()
+        }
+        queue.asyncAfter(deadline: .now() + 0.8) { self.plShoot() }
+    }
+
+    /// queue: выбрать способ кадра и начать снимки
+    private func plShoot() {
+        guard plActive, let dev = device else { return }
+        let fmt = dev.activeFormat
+        let aeDur = CMTimeGetSeconds(dev.exposureDuration)
+        let light = Double(dev.iso) * aeDur
+        let aeMax = dev.iso >= fmt.maxISO * 0.9 && aeDur >= CMTimeGetSeconds(dev.activeMaxExposureDuration) * 0.9
+        plNight = isNightLight(light) || aeMax
+        let dmax = min(1.0, CMTimeGetSeconds(fmt.maxExposureDuration))
+        if plISO == 0 { plISO = fmt.maxISO }
+        var count = 1
+        var dur = aeDur
+        var iso = dev.iso
+        var auto = false
+        if plManual {
+            // Выдержка руками: снимки до 1 с, вместе - вся выдержка
+            count = min(60, max(1, Int((cfg.exposure / dmax - 0.001).rounded(.up))))
+            dur = max(cfg.exposure / Double(count), CMTimeGetSeconds(fmt.minExposureDuration))
+            iso = plNight ? (cfg.isoAuto ? plISO : cfg.iso) : Float(light / dur)
+        } else if plNight {
+            // Ночь: снимки по 1 с и их среднее - чем длиннее интервал, тем больше снимков и чище кадр
+            count = max(1, min(30, Int(cfg.exposure / (dmax + 0.4))))
+            dur = dmax
+            iso = cfg.isoAuto ? plISO : cfg.iso
+        } else {
+            // День: один снимок с автоэкспозицией, как в Камере
+            auto = true
+        }
+        if !auto {
+            iso = min(max(iso, fmt.minISO), fmt.maxISO)
+            if (try? dev.lockForConfiguration()) != nil {
+                dev.setExposureModeCustom(duration: CMTime(seconds: dur, preferredTimescale: 1_000_000), iso: iso, completionHandler: nil)
+                dev.unlockForConfiguration()
+            }
+        }
+        plIsoUsed = iso
+        curISO = iso
+        curDur = CMTime(seconds: dur, preferredTimescale: 1_000_000)
+        seriesAcc = []
+        seriesN = 0
+        plLeft = count
+        plCount = count
+        DispatchQueue.main.async {
+            self.subTotal = count
+            self.subDone = 0
+        }
+        // Своей выдержке - встать
+        queue.asyncAfter(deadline: .now() + (auto ? 0 : 0.5)) { self.plCapture() }
+    }
+
+    private func plCapture() {
+        guard plActive else { return }
+        let st = AVCapturePhotoSettings()
+        st.photoQualityPrioritization = .quality
+        st.maxPhotoDimensions = photoOut.maxPhotoDimensions
+        photoOut.capturePhoto(with: st, delegate: self)
+    }
+
+    fileprivate func plShot(_ data: Data?) {
+        queue.async {
+            guard self.plActive else { return }
+            if let d = data, let src = CGImageSourceCreateWithData(d as CFData, nil),
+               let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, [
+                   kCGImageSourceCreateThumbnailFromImageAlways: true,
+                   kCGImageSourceCreateThumbnailWithTransform: true,
+                   kCGImageSourceThumbnailMaxPixelSize: 12000,
+               ] as CFDictionary) {
+                self.seriesAdd(cg)
+            }
+            self.plLeft -= 1
+            let done = self.plCount - self.plLeft
+            DispatchQueue.main.async { self.subDone = done }
+            if self.plLeft > 0 && !self.suspended {
+                self.plCapture()
+            } else {
+                self.plEmit()
+            }
+        }
+    }
+
+    /// queue: среднее снимков -> кадр видео (или тест)
+    private func plEmit() {
+        let n = seriesN, w = seriesW, h = seriesH
+        let t0 = CACurrentMediaTime()
+        guard n > 0, w > 0, h > 0 else {
+            Diag.event("Кадр \(outIndex + 1) не собрался")
+            if plTest { return plTestDone(nil) }
+            return plNext()
+        }
+        // Гистограмма яркости среднего (0...255)
+        let div = Float(n) * 257
+        var hist = [Int](repeating: 0, count: 256)
+        var i = 0
+        while i < seriesAcc.count {
+            let l = (Float(seriesAcc[i]) * 0.3 + Float(seriesAcc[i + 1]) * 0.59 + Float(seriesAcc[i + 2]) * 0.11) / div
+            hist[min(max(Int(l), 0), 255)] += 1
+            i += 4 * 7
+        }
+        let all = max(hist.reduce(0, +), 1)
+        func pct(_ p: Double) -> Float {
+            let need = Int(Double(all) * p)
+            var acc = 0
+            for (v, c) in hist.enumerated() { acc += c; if acc >= need { return Float(max(v, 1)) } }
+            return 255
+        }
+        let median = pct(0.5), hi = pct(0.995)
+        let srcClip = Double(hist[250...].reduce(0, +)) / Double(all)
+        var g: Float = 1
+        if plNight {
+            // Небо как на ночном снимке iPhone, светлее или темнее по ☀︎. Светлые места (луна, облака под ней) не в белое
+            let ev = Float(pow(2, Double(cfg.ev) + 0.5))
+            var want = min(max(45 * ev / median, 0.5), 8)
+            want = min(want, max(0.5, 240 / hi))
+            // В видео яркость меняется плавно, чтобы кадры не мигали
+            plGain = (plGain == 0 || plTest) ? want : plGain * 0.7 + want * 0.3
+            g = plGain
+            // Следующий кадр: пересвечено - ISO ниже, темно и запас есть - выше
+            if cfg.isoAuto, let dev = device {
+                let fmt = dev.activeFormat
+                if srcClip > 0.01 { plISO = max(fmt.minISO, plIsoUsed * 0.7) }
+                else if srcClip < 0.002 && hi < 150 && plIsoUsed < fmt.maxISO { plISO = min(fmt.maxISO, plIsoUsed * 1.3) }
+                else { plISO = plIsoUsed }
+            }
+        } else {
+            plGain = 0
+        }
+        // 8 бит + лёгкий шум против полос на гладком небе
+        let k = g / div
+        var out = [UInt8](repeating: 255, count: w * h * 4)
+        seriesAcc.withUnsafeBufferPointer { a in
+            out.withUnsafeMutableBufferPointer { o in
+                var seed: UInt32 = 12345
+                for j in 0..<a.count where j % 4 != 3 {
+                    seed = seed &* 1664525 &+ 1013904223
+                    let dither = Float(seed >> 24) / 256 - 0.5
+                    o[j] = UInt8(min(255, max(0, Float(a[j]) * k + 0.5 + dither)))
+                }
+            }
+        }
+        seriesAcc = []
+        guard let prov = CGDataProvider(data: Data(out) as CFData),
+              let cg = CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: w * 4,
+                               space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
+                               provider: prov, decode: nil, shouldInterpolate: false, intent: .defaultIntent),
+              let pb = plVideoFrame(cg) else {
+            Diag.event("Кадр \(outIndex + 1) не собрался")
+            if plTest { return plTestDone(nil) }
+            return plNext()
+        }
+        let mean = median * g
+        if plTest { return plTestDone(pb, mean: mean, n: n) }
+        width = CVPixelBufferGetWidth(pb)
+        height = CVPixelBufferGetHeight(pb)
+        writeFrame(pb)
+        if outIndex == 1 { DispatchQueue.main.async { if self.phase == .recording { self.status = "Съёмка" } } }
+        let ms = (CACurrentMediaTime() - t0) * 1000
+        let since = recStartQ.map { Date().timeIntervalSince($0) } ?? 0
+        Diag.frame([String(format: "%.1f", since), "\(outIndex)", "\(n)", String(format: "%.5f", CMTimeGetSeconds(curDur)),
+                    "\(Int(curISO))", String(format: "%.2f", g), String(format: "%.3f", CMTimeGetSeconds(curDur) * Double(n)),
+                    String(format: "%.1f", mean), "0", "0",
+                    String(format: "%.0f", ms), Diag.thermal(), "\(battery)", String(format: "%.1f", freeGB)])
+        plNext()
+    }
+
+    /// queue: следующий кадр - через интервал от начала этого (если кадр длиннее интервала - сразу)
+    private func plNext() {
+        guard plActive else { return }
+        let wait = max(0, plFrameAt + cfg.interval - CACurrentMediaTime())
+        queue.asyncAfter(deadline: .now() + wait) { self.plFrame() }
+    }
+
+    /// Кадр размером с видео: середина фото, обрезанная до пропорций видео
+    private func plVideoFrame(_ cg: CGImage) -> CVPixelBuffer? {
+        guard let dev = device else { return nil }
+        let vd = CMVideoFormatDescriptionGetDimensions(dev.activeFormat.formatDescription)
+        var W = Int(max(vd.width, vd.height)), H = Int(min(vd.width, vd.height))
+        if cg.height > cg.width { swap(&W, &H) }
+        guard W > 0, H > 0 else { return nil }
+        var img = CIImage(cgImage: cg)
+        let s = max(CGFloat(W) / img.extent.width, CGFloat(H) / img.extent.height)
+        img = img.transformed(by: CGAffineTransform(scaleX: s, y: s))
+        let e = img.extent
+        let x0 = (e.midX - CGFloat(W) / 2).rounded(), y0 = (e.midY - CGFloat(H) / 2).rounded()
+        img = img.transformed(by: CGAffineTransform(translationX: -x0, y: -y0))
+        var pbOut: CVPixelBuffer?
+        let attrs = [kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any]()] as CFDictionary
+        CVPixelBufferCreate(kCFAllocatorDefault, W, H, kCVPixelFormatType_32BGRA, attrs, &pbOut)
+        guard let pb = pbOut else { return nil }
+        ci.render(img, to: pb, bounds: CGRect(x: 0, y: 0, width: W, height: H), colorSpace: CGColorSpace(name: CGColorSpace.sRGB))
+        return pb
+    }
+
+    /// queue: тест кадром-фото готов
+    private func plTestDone(_ pb: CVPixelBuffer?, mean: Float = 0, n: Int = 0) {
+        plStop()
+        mode = .off
+        DispatchQueue.main.async { self.applyCamera() }
+        guard let pb = pb else {
+            DispatchQueue.main.async {
+                self.subDone = 0
+                self.finished("Тест не получился")
+            }
+            return
+        }
+        let img = makeThumb(pb, maxSide: 2000)
+        if let cg = makeThumb(pb, maxSide: 4000)?.cgImage { TestStore.save(cg) }
+        Diag.event("Тест: снимков \(n) по \(String(format: "%.2f", CMTimeGetSeconds(curDur))) с, ISO \(Int(curISO)), "
+            + "усиление \(String(format: "%.2f", plGain == 0 ? 1 : plGain)), яркость \(String(format: "%.0f", mean)), \(plNight ? "ночь" : "день")")
+        DispatchQueue.main.async {
+            self.lastImage = img
+            self.subDone = 0
+            self.testCount += 1
+            self.finished("Тест готов")
+        }
+    }
+
     // MARK: Режим «Фото» и сравнение способов: снимки через фото-обработку iPhone
 
     /// Один способ снять: авто как в Камере или своя выдержка и ISO, сколько снимков сложить, подтягивать ли яркость
@@ -1389,6 +1672,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         let s = currentSettings()
         let ff = focusAuto
         let angle = captureAngle()
+        let pf = photoFrames && sceneKind != .photo
+        let man = expManual
         queue.async {
             self.setOutputAngle(angle)
             self.cfg = c
@@ -1404,6 +1689,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             self.holdUntil = CACurrentMediaTime() + Double(hold)
             self.mode = .test
             self.beginCaptureExposure(s, forceFocus: ff)
+            if pf { self.plBegin(test: true, manual: man, hold: hold, angle: angle) }
         }
     }
 
@@ -1458,6 +1744,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         let s = currentSettings()
         let ff = focusAuto
         let angle = captureAngle()
+        let pf = photoFrames && sceneKind != .photo
+        let man = expManual
         queue.async {
             self.setOutputAngle(angle)
             self.cfg = c
@@ -1483,6 +1771,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             self.holdUntil = CACurrentMediaTime() + Double(hold)
             self.mode = .record
             self.beginCaptureExposure(s, forceFocus: ff)
+            if pf { self.plBegin(test: false, manual: man, hold: hold, angle: angle) }
         }
     }
 
@@ -1510,6 +1799,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             afterFocus = nil
             let s = currentSettings()
             queue.async {
+                if self.plActive { self.plStop() }
                 self.mode = .off
                 self.applyOnQueue(s)
             }
@@ -2138,7 +2428,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         // Картинка для часов - и в простое, и во время съёмки
         if let wpb = CMSampleBufferGetImageBuffer(sampleBuffer) { WatchLink.shared.offer(wpb, portrait: vertical) }
-        guard mode != .off, !suspended, let pb = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        guard mode != .off, !suspended, !plActive, let pb = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         // Подбор яркости не боится дрожи от касания - идёт уже во время задержки старта, это экономит время
         if mode != .focus && cfg.isoAuto && calibLeft > 0 && !inPause {
             if warmupLeft > 0 {
@@ -2668,6 +2958,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     }
 
     private func finishOnQueue() {
+        if plActive { plStop() }
         mode = .off
         DispatchQueue.main.async { self.applyCamera() }
         suspended = false
@@ -3997,6 +4288,7 @@ struct SettingsSheet: View {
                 }
 
                 Section {
+                    Toggle("Кадры как Фото", isOn: $e.photoFrames)
                     Button("Сравнить способы съёмки") {
                         dismiss()
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { e.compareTest() }
@@ -4008,7 +4300,7 @@ struct SettingsSheet: View {
                 } header: {
                     Text("Эксперимент")
                 } footer: {
-                    Text("Сравнение - около 3 минут на штативе, больше 25 вариантов в «Тестах». RAW - в Файлы → NightLapse → RAW")
+                    Text("Кадры как Фото - новый способ: каждый кадр найтлапса и таймлапса снимается как в режиме «Фото», чище и без полос. Выключи, чтобы снимать старым способом. Сравнение - около 3 минут на штативе, больше 25 вариантов в «Тестах». RAW - в Файлы → NightLapse → RAW")
                 }
 
                 Section("Подсказки") {
@@ -4070,6 +4362,10 @@ struct CameraLayout: Layout {
 
 extension LapseEngine: AVCapturePhotoCaptureDelegate {
     func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
+        if plActive {
+            plShot(error == nil ? photo.fileDataRepresentation() : nil)
+            return
+        }
         if seriesActive {
             seriesShot(error == nil ? photo.fileDataRepresentation() : nil)
             return
