@@ -3636,10 +3636,10 @@ struct ContentView: View {
     private var topBar: some View {
         HStack(spacing: 10) {
             if lowResources { infoChip }
-            Spacer(minLength: 0)
-            if shooting { recTimer }
-            Spacer(minLength: 0)
             if shooting {
+                Spacer(minLength: 0)
+                recTimer
+                Spacer(minLength: 0)
                 roundIcon("moon") { dark = true }
                     .accessibilityLabel("Экран выкл.")
             } else {
@@ -3660,46 +3660,90 @@ struct ContentView: View {
         }
     }
 
-    /// Сводка сверху: интервал, яркость, длительность. Касание - шторка с настройками. Точка - есть предупреждение
-    private var summaryPill: some View {
-        Button {
-            withAnimation(.spring(duration: 0.3)) {
+    /// Как в Камере iPhone: слева две величины с маленькими подписями, справа значки и «···». Точка - есть предупреждение
+    private func openPanel(_ p: Param?) {
+        withAnimation(.spring(duration: 0.3)) {
+            if let p {
+                panel = true
+                openParam = p
+            } else {
                 panel.toggle()
                 if !panel { openParam = nil }
             }
-        } label: {
-            HStack(spacing: 7) {
-                summaryText.monospacedDigit()
-                Image(systemName: panel ? "xmark" : "ellipsis")
-            }
-            .font(.system(size: 13, weight: .semibold))
-            .padding(.horizontal, 12)
-            .frame(height: 34)
-            .foregroundStyle(panel ? t.accent : t.text)
-            .background(t.fill, in: Capsule())
-            .overlay(alignment: .topTrailing) {
-                if firstWarning != nil && !panel {
-                    Circle().fill(t.warn).frame(width: 9, height: 9).offset(x: 2, y: -2)
+        }
+    }
+
+    private func valueLabel(_ value: String, _ label: String) -> Text {
+        Text(value).font(.system(size: 20, weight: .regular).monospacedDigit())
+            + Text(" " + label).font(.system(size: 10, weight: .semibold)).baselineOffset(8)
+    }
+
+    private var summaryPill: some View {
+        HStack(spacing: 0) {
+            if e.sceneKind == .photo { photoLeftPill } else { shootLeftPill }
+            Spacer(minLength: 8)
+            rightPill
+        }
+    }
+
+    private var photoLeftPill: some View {
+        Button { openPanel(.exposure) } label: {
+            valueLabel(expShort, "ВЫД")
+                .padding(.horizontal, 14)
+                .frame(height: 40)
+                .foregroundStyle(t.text)
+                .background(t.fill, in: Capsule())
+        }
+        .disabled(!idle)
+    }
+
+    private var shootLeftPill: some View {
+        HStack(spacing: 14) {
+            Button { openPanel(.exposure) } label: { valueLabel(expShort, "ВЫД") }
+            Button { openPanel(.interval) } label: { valueLabel(intervalText(e.intervalSeconds), "ИНТ") }
+        }
+        .padding(.horizontal, 14)
+        .frame(height: 40)
+        .foregroundStyle(t.text)
+        .background(t.fill, in: Capsule())
+        .disabled(!idle)
+    }
+
+    private var rightPill: some View {
+        HStack(spacing: 14) {
+            if e.sceneKind != .photo {
+                Button { openPanel(.duration) } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "hourglass")
+                        if e.autoStopMin > 0 { Text(durText(Double(e.autoStopMin) * 60)).font(.system(size: 13, weight: .semibold).monospacedDigit()) }
+                    }
+                    .rotationEffect(devAngle)
                 }
+                .accessibilityLabel("Длительность")
+            }
+            Button { openPanel(nil) } label: {
+                Image(systemName: panel ? "xmark" : "ellipsis")
+                    .foregroundStyle(panel ? t.accent : t.text)
+                    .frame(width: 24)
+            }
+            .accessibilityLabel("Настройки съёмки")
+        }
+        .font(.system(size: 17, weight: .regular))
+        .padding(.horizontal, 14)
+        .frame(height: 40)
+        .foregroundStyle(t.text)
+        .background(t.fill, in: Capsule())
+        .overlay(alignment: .topTrailing) {
+            if firstWarning != nil && !panel {
+                Circle().fill(t.warn).frame(width: 9, height: 9).offset(x: 2, y: -2)
             }
         }
         .disabled(!idle)
-        .accessibilityLabel("Настройки съёмки")
     }
 
     /// Интервал, выдержка, длительность - значками, как в шторке
     /// Выдержка одним словом: «Авто» или число - не оба сразу
     private var expShort: String { e.expManual ? expText(e.exposureSeconds) : "Авто" }
-
-    private var summaryText: Text {
-        if e.sceneKind == .photo {
-            return Text(Image(systemName: "stopwatch")) + Text(" \(expShort)")
-        }
-        // Порядок как в шторке: выдержка, интервал, длительность
-        return Text("Выд. \(expShort)  ·  ")
-            + Text("Инт. \(intervalText(e.intervalSeconds))  ·  ")
-            + Text(Image(systemName: "hourglass")) + Text(e.autoStopMin == 0 ? " Без лимита" : " " + durText(Double(e.autoStopMin) * 60))
-    }
 
     /// Значки смотрят вверх, как ни держи телефон. Лицом вверх или вниз - оставляем как было
     private func turnIcons() {
