@@ -568,7 +568,7 @@ final class PanoStitcher {
                 let w = Double(c) / 1000
                 A[i][i] += w; A[j][j] += w; A[i][j] -= w; A[j][i] -= w
                 for ch in 0..<3 {
-                    let r = log(max(si[ch], 1) / max(sj[ch], 1)) // g_j - g_i = log(mean_i / mean_j)... gj*mj = gi*mi
+                    let r = Foundation.log(max(si[ch], 1) / max(sj[ch], 1)) // g_j - g_i = log(mean_i / mean_j)... gj*mj = gi*mi
                     bs[ch][j] += w * r
                     bs[ch][i] -= w * r
                 }
