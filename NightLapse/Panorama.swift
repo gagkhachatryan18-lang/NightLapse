@@ -131,6 +131,13 @@ final class PanoSession: ObservableObject {
     @Published var result: PanoStitcher.Result?
     @Published var resultURLs: (a: URL?, b: URL?) = (nil, nil)
     @Published var fovDeg = 0.0
+    /// Вариант C: свободная съёмка как в Starlink - сфера точек привязана к миру, снятые места гаснут
+    @Published var free = false
+    @Published var shots = 0
+    @Published var coverage = 0.0
+    var dots: [[Double]] = []
+    var covered: [Bool] = []
+    private var lastShot = Date.distantPast
 
     var targets: [(yaw: Double, pitch: Double)] = []
     private var heading0 = 0.0
@@ -183,11 +190,15 @@ final class PanoSession: ObservableObject {
         } else {
             heading0 = atan2(m[3], m[4])
         }
-        targets = PanoMath.targets(fovLong: fovDeg * Double.pi / 180)
+        targets = free ? [] : PanoMath.targets(fovLong: fovDeg * Double.pi / 180)
+        dots = free ? PanoSession.sphereDots(700) : []
+        covered = Array(repeating: false, count: dots.count)
+        coverage = 0
+        shots = 0
         done = []
         poses = []
         shotTargets = []
-        name = PanoStore.newName()
+        name = PanoStore.newName() + (free ? "_C" : "")
         dir = PanoStore.root().appendingPathComponent(name, isDirectory: true)
         cacheDir = PanoStore.cacheRoot().appendingPathComponent(name, isDirectory: true)
         let fm = FileManager.default
@@ -212,12 +223,61 @@ final class PanoSession: ObservableObject {
     }
 
     var forwardWorld: [Double] { PanoMath.forward(M) }
+    var heading0Value: Double { heading0 }
     var headingRel: Double { atan2(forwardWorld[0], forwardWorld[1]) - heading0 }
     func targetYawPitch(_ i: Int) -> (Double, Double) { (targets[i].yaw, targets[i].pitch) }
+
+    /// Равномерные точки на сфере (спираль Фибоначчи)
+    static func sphereDots(_ n: Int) -> [[Double]] {
+        let ga = Double.pi * (3 - sqrt(5.0))
+        return (0..<n).map { i in
+            let z = 1 - 2 * (Double(i) + 0.5) / Double(n)
+            let r = sqrt(max(0, 1 - z * z))
+            let a = ga * Double(i)
+            return [r * cos(a), r * sin(a), z]
+        }
+    }
+
+    /// Попадает ли направление d (мир) в кадр с позой m, k - доля от половины кадра
+    func inFrame(_ m: [Double], _ d: [Double], k: Double) -> Bool {
+        let v0 = m[0] * d[0] + m[1] * d[1] + m[2] * d[2]
+        let v1 = m[3] * d[0] + m[4] * d[1] + m[5] * d[2]
+        let v2 = m[6] * d[0] + m[7] * d[1] + m[8] * d[2]
+        let f = -v2
+        guard f > 0.05 else { return false }
+        let fl = max(fovDeg, 30) * Double.pi / 180
+        let fs = PanoMath.fovShort(fl, aspect: 0.75)
+        return abs(v0 / f) < tan(fs / 2) * k && abs(v1 / f) < tan(fl / 2) * k
+    }
+
+    private func freeTick(rate: Double) {
+        guard rate < 0.25, Date().timeIntervalSince(lastShot) > 0.6 else { stableSince = nil; return }
+        var n = 0, u = 0
+        for (i, d) in dots.enumerated() where inFrame(M, d, k: 0.85) {
+            n += 1
+            if !covered[i] { u += 1 }
+        }
+        guard n > 0, Double(u) / Double(n) >= 0.35 else { stableSince = nil; return }
+        if stableSince == nil { stableSince = Date() }
+        if Date().timeIntervalSince(stableSince!) > 0.25 { shoot(-1) }
+    }
+
+    private func markCovered(_ m: [Double]) {
+        var c = 0
+        for i in 0..<dots.count {
+            if !covered[i] && inFrame(m, dots[i], k: 0.75) { covered[i] = true }
+            if covered[i] { c += 1 }
+        }
+        coverage = dots.isEmpty ? 0 : Double(c) / Double(dots.count)
+    }
 
     private func tick() {
         guard let cur = motion.current() else { return }
         M = worldM(cur.R)
+        if free {
+            if stage == .shooting && !busy { freeTick(rate: cur.rate) }
+            return
+        }
         guard stage == .shooting, !busy, !targets.isEmpty else { return }
         let f = PanoMath.forward(M)
         // Ближайшая нетронутая цель
@@ -251,7 +311,9 @@ final class PanoSession: ObservableObject {
     }
 
     func shootNow() {
-        guard stage == .shooting, !busy, let c = current else { return }
+        guard stage == .shooting, !busy else { return }
+        if free { shoot(-1); return }
+        guard let c = current else { return }
         shoot(c)
     }
 
@@ -274,11 +336,16 @@ final class PanoSession: ObservableObject {
             if let cg = ShootStore.thumb(url, maxPixel: 1000), let d = ShootStore.jpeg(cg) { try? d.write(to: smallURL) }
             self.poses.append(PanoPose(file: url, R: R))
             self.shotTargets.append(idx)
-            self.done.insert(idx)
+            if idx >= 0 { self.done.insert(idx) }
+            self.shots = self.poses.count
+            self.lastShot = Date()
+            if self.free { self.markCovered(self.worldM(R)) }
             self.message = ""
             Haptic.tap()
             self.busy = false
-            if self.done.count >= self.targets.count { self.finish() }
+            if self.free {
+                if self.coverage >= 0.97 { self.finish() }
+            } else if self.done.count >= self.targets.count { self.finish() }
         }
     }
 
@@ -346,10 +413,14 @@ final class PanoSession: ObservableObject {
     private func writePoses(_ ps: [PanoPose], targets tg: [Int], dir d: URL, conv: Int, fov: Double) {
         var shots: [[String: Any]] = []
         for (k, p) in ps.enumerated() {
-            shots.append(["file": p.file.lastPathComponent, "R": p.R, "target": tg[k],
-                          "yaw": self.targets[tg[k]].yaw, "pitch": self.targets[tg[k]].pitch])
+            var row: [String: Any] = ["file": p.file.lastPathComponent, "R": p.R, "target": tg[k]]
+            if tg[k] >= 0 && tg[k] < self.targets.count {
+                row["yaw"] = self.targets[tg[k]].yaw
+                row["pitch"] = self.targets[tg[k]].pitch
+            }
+            shots.append(row)
         }
-        let info: [String: Any] = ["fovLongDeg": fov, "liveConv": conv, "heading0": heading0, "shots": shots,
+        let info: [String: Any] = ["mode": free ? "C свободно" : "по точкам", "coverage": coverage, "fovLongDeg": fov, "liveConv": conv, "heading0": heading0, "shots": shots,
                                    "count": ps.count, "targets": targets.count,
                                    "memoryGB": Double(ProcessInfo.processInfo.physicalMemory) / 1e9]
         if let data = try? JSONSerialization.data(withJSONObject: info, options: [.prettyPrinted]) {
@@ -390,7 +461,15 @@ struct PanoOverlay: View {
                 .font(.system(size: 44, weight: .light))
             Text("Панорама 360°")
                 .font(.title2.weight(.semibold))
-            Text("Держи телефон вертикально и вращайся на месте, лучше вокруг камеры телефона. Ориентируйся по кружку: он показывает, куда повернуть. Снимок делается сам, когда кружок в центре и ты держишь ровно. Свет и баланс белого фиксируются, пока идёт съёмка. Лучше 1x или 0.5x.")
+            Picker("", selection: $s.free) {
+                Text("По точкам").tag(false)
+                Text("Свободно").tag(true)
+            }
+            .pickerStyle(.segmented)
+            .frame(maxWidth: 260)
+            Text(s.free
+                 ? "Вокруг тебя сфера из точек. Води телефоном куда угодно и закрашивай небо и землю: снятые места гаснут. Снимок делается сам, когда в кадре много нового и ты держишь ровно. Вращайся на месте, вокруг камеры телефона."
+                 : "Держи телефон вертикально и вращайся на месте, лучше вокруг камеры телефона. Ориентируйся по кружку: он показывает, куда повернуть. Снимок делается сам, когда кружок в центре и ты держишь ровно. Свет и баланс белого фиксируются, пока идёт съёмка. Лучше 1x или 0.5x.")
                 .font(.callout)
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
@@ -422,7 +501,9 @@ struct PanoOverlay: View {
             Circle().stroke(Color.white.opacity(0.9), lineWidth: 2).frame(width: 34, height: 34)
             Circle().fill(Color.white).frame(width: 4, height: 4)
             // Цель
-            if let c = s.current, c < s.targets.count {
+            if s.free {
+                dotsLayer
+            } else if let c = s.current, c < s.targets.count {
                 marker(for: c, size: size)
             }
             VStack {
@@ -432,7 +513,7 @@ struct PanoOverlay: View {
                             .frame(width: 40, height: 40).background(.ultraThinMaterial, in: Circle())
                     }
                     Spacer()
-                    Text("\(s.done.count) из \(s.targets.count)")
+                    Text(s.free ? "\(Int(s.coverage * 100))% · \(s.shots)" : "\(s.done.count) из \(s.targets.count)")
                         .font(.subheadline.monospacedDigit().weight(.semibold))
                         .padding(.horizontal, 12).frame(height: 34)
                         .background(.ultraThinMaterial, in: Capsule())
@@ -453,10 +534,10 @@ struct PanoOverlay: View {
                     Button { s.finish() } label: {
                         Text("Готово").font(.subheadline.weight(.semibold))
                             .padding(.horizontal, 22).frame(height: 44)
-                            .background(Capsule().fill(s.done.count >= 3 ? Color.white : Color.gray.opacity(0.4)))
+                            .background(Capsule().fill(s.shots >= 3 ? Color.white : Color.gray.opacity(0.4)))
                             .foregroundStyle(.black)
                     }
-                    .disabled(s.done.count < 3)
+                    .disabled(s.shots < 3)
                 }
                 .padding(.bottom, 24)
             }
@@ -498,6 +579,28 @@ struct PanoOverlay: View {
         .position(p)
     }
 
+    /// Точки сферы, ещё не снятые - привязаны к миру
+    private var dotsLayer: some View {
+        Canvas { ctx, size in
+            let M = s.M
+            let fovL = max(s.fovDeg, 30) * Double.pi / 180
+            let scale = (size.height / 2) / CGFloat(tan(fovL / 2))
+            let cx = size.width / 2, cy = size.height / 2
+            for (i, d) in s.dots.enumerated() where !s.covered[i] {
+                let v0 = M[0] * d[0] + M[1] * d[1] + M[2] * d[2]
+                let v1 = M[3] * d[0] + M[4] * d[1] + M[5] * d[2]
+                let f = -(M[6] * d[0] + M[7] * d[1] + M[8] * d[2])
+                guard f > 0.1 else { continue }
+                let x = cx + CGFloat(v0 / f) * scale
+                let y = cy - CGFloat(v1 / f) * scale
+                guard x > -10, x < size.width + 10, y > -10, y < size.height + 10 else { continue }
+                let r: CGFloat = 3.5
+                ctx.fill(Path(ellipseIn: CGRect(x: x - r, y: y - r, width: 2 * r, height: 2 * r)), with: .color(.white.opacity(0.9)))
+            }
+        }
+        .allowsHitTesting(false)
+    }
+
     private var minimap: some View {
         Canvas { ctx, size in
             ctx.stroke(Path(CGRect(origin: .zero, size: size)), with: .color(.white.opacity(0.6)), lineWidth: 1)
@@ -505,6 +608,11 @@ struct PanoOverlay: View {
                 var y = yaw.truncatingRemainder(dividingBy: 2 * Double.pi)
                 if y < 0 { y += 2 * Double.pi }
                 return CGPoint(x: y / (2 * Double.pi) * size.width, y: (0.5 - pitch / Double.pi) * size.height)
+            }
+            for (i, d) in s.dots.enumerated() where i % 2 == 0 {
+                let c = pt(atan2(d[0], d[1]) - s.heading0Value, asin(max(-1, min(1, d[2]))))
+                ctx.fill(Path(ellipseIn: CGRect(x: c.x - 1.5, y: c.y - 1.5, width: 3, height: 3)),
+                         with: .color(s.covered[i] ? .green.opacity(0.8) : .white.opacity(0.35)))
             }
             for (i, t) in s.targets.enumerated() {
                 let c = pt(t.yaw, t.pitch)
