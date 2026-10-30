@@ -854,6 +854,70 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     private var rawSaved = 0
     private var rawFormat: OSType = 0
 
+    // MARK: Панорама 360
+
+    /// Панорама открыта: экран камеры занят её подсказками
+    @Published var panoActive = false
+    /// queue: пока идёт панорама, свет, баланс и фокус заморожены и настройки не перезаписываются
+    private var panoHold = false
+    fileprivate var panoDone: ((Data?, Double) -> Void)?
+
+    /// Подготовка: фото-выход, портретная ориентация, свет, баланс белого и фокус замораживаются как есть.
+    /// Возвращает угол обзора по длинной стороне кадра (градусы)
+    func panoPrepare(_ done: @escaping (_ fovLong: Double, _ ok: Bool) -> Void) {
+        queue.async {
+            guard let dev = self.device else {
+                DispatchQueue.main.async { done(0, false) }
+                return
+            }
+            self.panoHold = true
+            self.session.beginConfiguration()
+            if !self.session.outputs.contains(self.photoOut), self.session.canAddOutput(self.photoOut) {
+                self.session.addOutput(self.photoOut)
+            }
+            self.session.commitConfiguration()
+            self.photoOut.maxPhotoQualityPrioritization = .balanced
+            let dims = dev.activeFormat.supportedMaxPhotoDimensions
+                .sorted { Int($0.width) * Int($0.height) < Int($1.width) * Int($1.height) }
+            if let d = dims.first(where: { Int($0.width) * Int($0.height) >= 11_000_000 }) ?? dims.last {
+                self.photoOut.maxPhotoDimensions = d
+            }
+            if let c = self.photoOut.connection(with: .video), c.isVideoRotationAngleSupported(90) {
+                c.videoRotationAngle = 90
+            }
+            if (try? dev.lockForConfiguration()) != nil {
+                if dev.isExposureModeSupported(.locked) { dev.exposureMode = .locked }
+                if dev.isWhiteBalanceModeSupported(.locked) { dev.whiteBalanceMode = .locked }
+                if dev.isFocusModeSupported(.locked) { dev.focusMode = .locked }
+                dev.unlockForConfiguration()
+            }
+            let fov = Double(dev.activeFormat.videoFieldOfView)
+            DispatchQueue.main.async { done(fov, true) }
+        }
+    }
+
+    /// Один снимок для панорамы: JPEG и время съёмки (часы устройства, как у датчиков движения)
+    func panoCapture(_ done: @escaping (Data?, Double) -> Void) {
+        queue.async {
+            self.panoDone = done
+            let st = AVCapturePhotoSettings()
+            st.photoQualityPrioritization = .balanced
+            st.maxPhotoDimensions = self.photoOut.maxPhotoDimensions
+            self.photoOut.capturePhoto(with: st, delegate: self)
+        }
+    }
+
+    func panoEnd() {
+        queue.async {
+            self.panoHold = false
+            self.panoDone = nil
+            self.session.beginConfiguration()
+            if self.session.outputs.contains(self.photoOut) { self.session.removeOutput(self.photoOut) }
+            self.session.commitConfiguration()
+            self.applyOnQueue(self.currentSettingsQueue)
+        }
+    }
+
     /// Серия RAW (DNG) по 1 с на максимальном ISO - сравнить с нашим кадром в Lightroom.
     /// Камера на время переключается в фото-формат, потом возвращается обратно
     func rawTest(count: Int = 5) {
@@ -2530,6 +2594,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
     /// Ручная выдержка (максимум сенсора), ISO, фокус и баланс белого (ручной или авто)
     private func applyOnQueue(_ s: CamSettings, forceFocus: Bool = false) {
+        if panoHold { return }
         guard let dev = device, (try? dev.lockForConfiguration()) != nil else { return }
         defer { dev.unlockForConfiguration() }
         let fmt = dev.activeFormat
@@ -2598,7 +2663,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     private var nightPreview = false
 
     func checkNightPreview() {
-        guard mode == .off, let dev = device else { return }
+        guard mode == .off, !panoHold, let dev = device else { return }
         let fmt = dev.activeFormat
         if nightPreview {
             if dev.exposureMode != .custom {
@@ -3571,12 +3636,17 @@ struct ContentView: View {
                     topBar
                         .padding(.horizontal, landscape ? 8 : 16)
                         .padding(.bottom, landscape ? 0 : 6)
+                        .opacity(e.panoActive ? 0 : 1)
+                        .allowsHitTesting(!e.panoActive)
                     preview
                     bottomControls
                         .padding(.top, landscape ? 0 : 8)
                         .padding(.horizontal, landscape ? 8 : 0)
                         .clipped()
+                        .opacity(e.panoActive ? 0 : 1)
+                        .allowsHitTesting(!e.panoActive)
                 }
+                if e.panoActive { PanoOverlay(e: e).zIndex(10) }
                 if dark { darkOverlay }
                 if !guideSeen { GuideView { guideSeen = true } }
             }
@@ -4059,6 +4129,13 @@ struct ContentView: View {
                     circleButton("moon", "Экран", "выкл.", on: false, warn: false) {
                         panel = false
                         dark = true
+                    }
+                    if e.sceneKind == .photo {
+                        circleButton("pano", "Панорама", "360°", on: false, warn: false) {
+                            panel = false
+                            openParam = nil
+                            e.panoActive = true
+                        }
                     }
                     if e.sceneKind == .stars {
                         circleButton("location.north.circle", "Полярная", pole.on ? "вкл." : "где она?", on: pole.on, warn: false) {
@@ -4625,6 +4702,8 @@ struct SettingsSheet: View {
     @AppStorage("dimAfter") private var dimAfter = 60
     @AppStorage("polish") private var polish = true
     @AppStorage("keepFrames") private var keepFrames = false
+    @State private var panoTest = ""
+    @State private var panoBusy = false
 
     var body: some View {
         NavigationStack {
@@ -4717,6 +4796,20 @@ struct SettingsSheet: View {
                         dismiss()
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { e.compareTest() }
                     }
+                    Button(panoBusy ? "Проверяю склейку..." : "Проверить склейку панорамы (без съёмки)") {
+                        guard !panoBusy else { return }
+                        panoBusy = true
+                        panoTest = ""
+                        DispatchQueue.global(qos: .userInitiated).async {
+                            let r = PanoSelfTest.run { text in DispatchQueue.main.async { panoTest = text } }
+                            try? r.write(to: PanoStore.root().appendingPathComponent("selftest.txt"), atomically: true, encoding: .utf8)
+                            DispatchQueue.main.async { panoTest = r; panoBusy = false }
+                        }
+                    }
+                    .disabled(panoBusy)
+                    if !panoTest.isEmpty {
+                        Text(panoTest).font(.caption2.monospaced())
+                    }
                     Button("Снять 5 RAW-кадров по 1 с") {
                         dismiss()
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { e.rawTest() }
@@ -4786,6 +4879,13 @@ struct CameraLayout: Layout {
 
 extension LapseEngine: AVCapturePhotoCaptureDelegate {
     func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
+        if let d = panoDone {
+            panoDone = nil
+            let data = error == nil ? photo.fileDataRepresentation() : nil
+            let t = CMTimeGetSeconds(photo.timestamp)
+            DispatchQueue.main.async { d(data, t) }
+            return
+        }
         if plActive {
             plShot(error == nil ? photo.fileDataRepresentation() : nil)
             return

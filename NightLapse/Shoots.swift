@@ -2427,6 +2427,8 @@ enum Diag {
                 }
             }
 
+            PanoStore.addToReport(into: tmp)
+
             // zip силами системы
             var result: URL?
             var err: NSError?
