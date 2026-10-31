@@ -2697,6 +2697,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
     /// Доля пересвеченных точек последнего кадра (луна, фонари, облака под луной)
     private var clipFrac = 0.0
+    /// Доля почти белых точек (от 236): свечение лампы или фонаря, которое ещё не выжжено, но уже теряет цвет
+    private var hiFrac = 0.0
 
     private func meanLuma(_ pb: CVPixelBuffer) -> Float {
         CVPixelBufferLockBaseAddress(pb, .readOnly)
@@ -2709,19 +2711,23 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         var sum = 0.0
         var cnt = 0.0
         var clip = 0.0
+        var hi = 0.0
         var y = 0
         while y < h {
             var x = 0
             while x < w {
                 let o = y * rb + x * 4
                 sum += 0.114 * Double(p[o]) + 0.587 * Double(p[o + 1]) + 0.299 * Double(p[o + 2])
-                if max(p[o], p[o + 1], p[o + 2]) >= 250 { clip += 1 }
+                let mxc = max(p[o], p[o + 1], p[o + 2])
+                if mxc >= 250 { clip += 1 }
+                if mxc >= 236 { hi += 1 }
                 cnt += 1
                 x += 8
             }
             y += 16
         }
         clipFrac = cnt > 0 ? clip / cnt : 0
+        hiFrac = cnt > 0 ? hi / cnt : 0
         return cnt > 0 ? Float(sum / cnt) : 0
     }
 
@@ -2741,6 +2747,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         var f = pow(target / max(Double(mean), 1.0), 2.2)
         // Светлое пятно пересвечено (больше 2% кадра) - не светлее, а темнее, даже если в среднем кадр тёмный
         if clipFrac > 0.02 { f = min(f, 0.8) }
+        // Почти белое свечение занимает больше 0.5% кадра: цвет в нём уходит в белый (лава-лампа, гирлянда). Немного темнее
+        else if hiFrac > 0.005 { f = min(f, 0.85) }
         return min(max(f, 1.0 / limit), limit)
     }
 
