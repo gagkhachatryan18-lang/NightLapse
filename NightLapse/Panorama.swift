@@ -134,6 +134,8 @@ final class PanoSession: ObservableObject {
     /// Вариант C: свободная съёмка как в Starlink - сфера точек привязана к миру, снятые места гаснут
     @Published var free = false
     @Published var shots = 0
+    /// «Готово» в режиме «Свободно»: от 92% покрытия или после 60 кадров
+    var canFinish: Bool { free ? (coverage >= 0.92 || shots >= 60) : done.count >= 3 }
     @Published var coverage = 0.0
     var dots: [[Double]] = []
     var covered: [Bool] = []
@@ -265,7 +267,7 @@ final class PanoSession: ObservableObject {
     private func markCovered(_ m: [Double]) {
         var c = 0
         for i in 0..<dots.count {
-            if !covered[i] && inFrame(m, dots[i], k: 0.75) { covered[i] = true }
+            if !covered[i] && inFrame(m, dots[i], k: 0.6) { covered[i] = true }
             if covered[i] { c += 1 }
         }
         coverage = dots.isEmpty ? 0 : Double(c) / Double(dots.count)
@@ -344,7 +346,7 @@ final class PanoSession: ObservableObject {
             Haptic.tap()
             self.busy = false
             if self.free {
-                if self.coverage >= 0.97 { self.finish() }
+                if self.coverage >= 0.95 { self.finish() }
             } else if self.done.count >= self.targets.count { self.finish() }
         }
     }
@@ -468,7 +470,7 @@ struct PanoOverlay: View {
             .pickerStyle(.segmented)
             .frame(maxWidth: 260)
             Text(s.free
-                 ? "Вокруг тебя сфера из точек. Води телефоном куда угодно и закрашивай небо и землю: снятые места гаснут. Снимок делается сам, когда в кадре много нового и ты держишь ровно. Вращайся на месте, вокруг камеры телефона."
+                 ? "Вокруг тебя сфера из точек. Води телефоном куда угодно и закрашивай небо и землю: снятые места гаснут. Снимок делается сам, когда в кадре много нового и ты держишь ровно. Стой на месте и вращай телефон вокруг объектива, а не себя вместе с рукой. Готово станет доступно от 92%."
                  : "Держи телефон вертикально и вращайся на месте, лучше вокруг камеры телефона. Ориентируйся по кружку: он показывает, куда повернуть. Снимок делается сам, когда кружок в центре и ты держишь ровно. Свет и баланс белого фиксируются, пока идёт съёмка. Лучше 1x или 0.5x.")
                 .font(.callout)
                 .multilineTextAlignment(.center)
@@ -521,7 +523,13 @@ struct PanoOverlay: View {
                 .padding(.horizontal, 16)
                 .padding(.top, 8)
                 Spacer()
-                if !s.message.isEmpty { Text(s.message).font(.footnote).padding(8).background(.ultraThinMaterial, in: Capsule()) }
+                if !s.message.isEmpty {
+                    Text(s.message).font(.footnote).padding(8).background(.ultraThinMaterial, in: Capsule())
+                } else if s.free && s.shots < 4 {
+                    Text("Стой на месте и вращай телефон вокруг объектива").font(.footnote).padding(8).background(.ultraThinMaterial, in: Capsule())
+                } else if s.free && s.coverage < 0.92 {
+                    Text("Закрась оставшиеся точки").font(.footnote).padding(8).background(.ultraThinMaterial, in: Capsule())
+                }
                 minimap
                     .frame(width: 240, height: 120)
                     .padding(.bottom, 8)
@@ -534,10 +542,10 @@ struct PanoOverlay: View {
                     Button { s.finish() } label: {
                         Text("Готово").font(.subheadline.weight(.semibold))
                             .padding(.horizontal, 22).frame(height: 44)
-                            .background(Capsule().fill(s.shots >= 3 ? Color.white : Color.gray.opacity(0.4)))
+                            .background(Capsule().fill(s.canFinish ? Color.white : Color.gray.opacity(0.4)))
                             .foregroundStyle(.black)
                     }
-                    .disabled(s.shots < 3)
+                    .disabled(!s.canFinish)
                 }
                 .padding(.bottom, 24)
             }

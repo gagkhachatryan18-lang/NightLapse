@@ -575,15 +575,15 @@ final class PanoStitcher {
                 cnt += 1
             }
         }
-        for k in 0..<n { A[k][k] += 0.5 }
+        for k in 0..<n { A[k][k] += 2.0 }
         for ch in 0..<3 { logs[ch] = PanoStitcher.gauss(A, bs[ch]) }
         var maxG = 0.0
         for k in 0..<n {
             func g(_ v: Double) -> Float { Float(exp(min(0.2, max(-0.2, v)))) }
             res[k] = (g(logs[0][k]), g(logs[1][k]), g(logs[2][k]))
-            maxG = max(maxG, abs(logs[0][k]), abs(logs[1][k]), abs(logs[2][k]))
+            maxG = max(maxG, min(0.2, abs(logs[0][k])), min(0.2, abs(logs[1][k])), min(0.2, abs(logs[2][k])))
         }
-        note(String(format: "Выравнивание яркости: пар %d, наибольшая поправка %.1f%%", cnt, (exp(maxG) - 1) * 100))
+        note(String(format: "Выравнивание яркости: пар %d, наибольшая применённая поправка %.1f%% (предел 22%%)", cnt, (exp(maxG) - 1) * 100))
         return res
     }
 
@@ -621,9 +621,18 @@ final class PanoStitcher {
                     let p = y * cur.w + x
                     let a = cur.wt[p]
                     if a >= 1 { continue }
-                    let ux = min(up.w - 1, x / 2), uy = min(up.h - 1, y / 2)
-                    let q = uy * up.w + ux
-                    for ch in 0..<3 { cur.rgb[p * 3 + ch] = cur.rgb[p * 3 + ch] * a + up.rgb[q * 3 + ch] * (1 - a) }
+                    // Билинейно из верхнего уровня: без квадратов на дырах
+                    let fx = max(0, min(Float(up.w - 1), (Float(x) + 0.5) / 2 - 0.5))
+                    let fy = max(0, min(Float(up.h - 1), (Float(y) + 0.5) / 2 - 0.5))
+                    let x0 = Int(fx), y0 = Int(fy)
+                    let x1 = min(up.w - 1, x0 + 1), y1 = min(up.h - 1, y0 + 1)
+                    let tx = fx - Float(x0), ty = fy - Float(y0)
+                    for ch in 0..<3 {
+                        let v00 = up.rgb[(y0 * up.w + x0) * 3 + ch], v10 = up.rgb[(y0 * up.w + x1) * 3 + ch]
+                        let v01 = up.rgb[(y1 * up.w + x0) * 3 + ch], v11 = up.rgb[(y1 * up.w + x1) * 3 + ch]
+                        let v = (v00 * (1 - tx) + v10 * tx) * (1 - ty) + (v01 * (1 - tx) + v11 * tx) * ty
+                        cur.rgb[p * 3 + ch] = cur.rgb[p * 3 + ch] * a + v * (1 - a)
+                    }
                     cur.wt[p] = 1
                 }
             }
@@ -695,22 +704,44 @@ final class PanoStitcher {
             PanoRender.run(img: img, N: N(k), fovLong: fovNominal * scale, W: W, H: H, offX: 0, offY: 0,
                            gain: (1, 1, 1), mode: 1, out: acc)
         }
-        // Средний цвет по строкам
-        var rowMean = [(Float, Float, Float)?](repeating: nil, count: H)
-        for j in 0..<H {
-            var sr: Float = 0, sg: Float = 0, sb: Float = 0, c: Float = 0
-            for i in stride(from: 0, to: W, by: 8) {
-                let a = acc + (j * W + i) * 4
-                if a[3] > 1e-7 { sr += a[0] / a[3]; sg += a[1] / a[3]; sb += a[2] / a[3]; c += 1 }
+        // Дыры: мягкое продолжение соседних цветов (низкое разрешение, затем плавно на весь кадр)
+        let lw = 1024, lh = 512
+        let bx = max(1, W / lw), by = max(1, H / lh)
+        var lowRGB = [Float](repeating: 0, count: lw * lh * 3), lowWt = [Float](repeating: 0, count: lw * lh)
+        for j in 0..<lh {
+            for i in 0..<lw {
+                var sr: Float = 0, sg: Float = 0, sb: Float = 0, c: Float = 0
+                for dy in stride(from: 0, to: by, by: 2) {
+                    for dx in stride(from: 0, to: bx, by: 2) {
+                        let a = acc + ((j * by + dy) * W + (i * bx + dx)) * 4
+                        if a[3] > 1e-7 { sr += a[0] / a[3]; sg += a[1] / a[3]; sb += a[2] / a[3]; c += 1 }
+                    }
+                }
+                if c > 0 {
+                    let q = j * lw + i
+                    lowRGB[q * 3] = sr / c; lowRGB[q * 3 + 1] = sg / c; lowRGB[q * 3 + 2] = sb / c
+                    lowWt[q] = 1
+                }
             }
-            if c > 0 { rowMean[j] = (sr / c, sg / c, sb / c) }
         }
-        var filled = rowMean
-        var last: (Float, Float, Float)?
-        for j in 0..<H { if let m = filled[j] { last = m } else { filled[j] = last } }
-        last = nil
-        for j in stride(from: H - 1, through: 0, by: -1) { if let m = filled[j] { last = m } else { filled[j] = last } }
-        let rgba = finalize(acc: acc, W: W, H: H) { _, j in filled[j] ?? (128, 128, 128) }
+        let filled = PanoStitcher.pullPush(rgb: lowRGB, wt: lowWt, w: lw, h: lh)
+        let rgba = finalize(acc: acc, W: W, H: H) { i, j in
+            let fx = (Float(i) + 0.5) / Float(W) * Float(lw) - 0.5
+            let fy = (Float(j) + 0.5) / Float(H) * Float(lh) - 0.5
+            let fyc = min(max(fy, 0), Float(lh - 1))
+            var x0 = Int(fx.rounded(.down)); let y0 = Int(fyc.rounded(.down))
+            let tx = fx - Float(x0), ty = fyc - Float(y0)
+            var x1 = x0 + 1
+            if x0 < 0 { x0 += lw }
+            if x1 >= lw { x1 -= lw }
+            let y1 = min(y0 + 1, lh - 1)
+            func v(_ ch: Int) -> Float {
+                let a = filled[(y0 * lw + x0) * 3 + ch], b = filled[(y0 * lw + x1) * 3 + ch]
+                let c = filled[(y1 * lw + x0) * 3 + ch], d = filled[(y1 * lw + x1) * 3 + ch]
+                return (a * (1 - tx) + b * tx) * (1 - ty) + (c * (1 - tx) + d * tx) * ty
+            }
+            return (v(0), v(1), v(2))
+        }
         return (rgba, W, H)
     }
 
