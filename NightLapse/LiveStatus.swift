@@ -39,6 +39,17 @@ final class LiveStatus {
         Task { await a.update(content) }
     }
 
+    /// main. При запуске: плашки от съёмки, которую система выгрузила или приложение закрыли, не должны висеть на экране блокировки
+    func cleanupLeftovers() {
+        for a in Activity<LapseActivityAttributes>.activities where a.id != activity?.id {
+            var s = a.content.state
+            s.state = "done"
+            s.note = "Съёмка оборвалась"
+            let content = ActivityContent(state: s, staleDate: nil)
+            Task { await a.end(content, dismissalPolicy: .immediate) }
+        }
+    }
+
     /// main
     func end(note: String) {
         guard let a = activity else { return }

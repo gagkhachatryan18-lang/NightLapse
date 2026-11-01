@@ -813,6 +813,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             Diag.event("Мало памяти")
         }
         Diag.event("Найтлапс открыт, \(Diag.model())")
+        LiveStatus.shared.cleanupLeftovers()
 
         ticker = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.tick() }
         tick()
@@ -1889,13 +1890,19 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     /// Если приложение закрылось посреди съёмки (вылет, система выгрузила), при следующем открытии
     /// в течение 15 минут съёмка продолжается сама через 10 секунд. Новая съёмка помнит, что она продолжение
     private func resumeIfInterrupted() {
-        guard phase == .idle, let last = ShootStore.list().first, !last.done,
-              let lastFrame = ShootStore.frameURLs(last.dir).last,
+        guard phase == .idle, let last = ShootStore.list().first, !last.done else { return }
+        guard let lastFrame = ShootStore.frameURLs(last.dir).last,
               let t = (try? FileManager.default.attributesOfItem(atPath: lastFrame.path))?[.modificationDate] as? Date,
-              Date().timeIntervalSince(t) < 15 * 60 else { return }
+              Date().timeIntervalSince(t) < 15 * 60 else {
+            recoverInterrupted(last.dir, id: last.id)
+            return
+        }
         let info = ShootStore.readInfo(last.dir)
         if let u = info["until"] as? Double, u > 0 {
-            guard u > Date().timeIntervalSince1970 + 60 else { return }   // время съёмки уже вышло
+            guard u > Date().timeIntervalSince1970 + 60 else {   // время съёмки уже вышло
+                recoverInterrupted(last.dir, id: last.id)
+                return
+            }
             resumeUntil = Date(timeIntervalSince1970: u)
         }
         resumeOf = last.id
@@ -1907,6 +1914,25 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         countdown = 10
         phase = .waiting
         status = "Съёмка оборвалась в \(f.string(from: t)). Продолжаю - не трогай телефон"
+    }
+
+    /// Съёмка оборвалась давно (телефон заблокировался, приложение выгрузили) и продолжать поздно:
+    /// закрываем её как законченную и кладём в Фото то, что успело записаться в Starlapse
+    private func recoverInterrupted(_ dir: URL, id: String) {
+        ShootStore.markDone(dir)
+        var saved = 0
+        for tr in Trail.allCases {
+            guard let u = ShootStore.liveURL(dir, .starlapse, tr),
+                  let sz = (try? FileManager.default.attributesOfItem(atPath: u.path))?[.size] as? Int, sz > 20_000 else { continue }
+            saved += 1
+            PHPhotoLibrary.shared().performChanges({
+                PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: u)
+            }, completionHandler: { ok, _ in
+                Diag.event("Спасённое видео \(u.lastPathComponent): \(ok ? "в Фото" : "не сохранилось")")
+            })
+        }
+        Diag.event("Съёмка \(id) оборвалась и закрыта, видео из записанного: \(saved)")
+        status = saved > 0 ? "Прошлая съёмка оборвалась: записанное видео сохранено в Фото" : "Прошлая съёмка оборвалась: кадры в Съёмках"
     }
 
     private func currentSettings() -> CamSettings {
@@ -2246,6 +2272,10 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
     private func appDidEnterBackground() {
         inBackground = true
+        // Несколько секунд на фоне: плашка на экране блокировки успеет получить «пауза», а не зависнет на «идёт»
+        var bg: UIBackgroundTaskIdentifier = .invalid
+        bg = UIApplication.shared.beginBackgroundTask { UIApplication.shared.endBackgroundTask(bg) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { UIApplication.shared.endBackgroundTask(bg) }
         switch phase {
         case .recording: pauseRecording("Пауза: приложение свёрнуто")
         case .test: cancel()

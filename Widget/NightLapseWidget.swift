@@ -23,7 +23,7 @@ struct LapseLiveActivity: Widget {
                         .font(.headline.monospacedDigit())
                 }
                 DynamicIslandExpandedRegion(.trailing) {
-                    timeText(ctx.state).font(.headline.monospacedDigit())
+                    timeText(ctx.state, stale: ctx.isStale).font(.headline.monospacedDigit())
                 }
                 DynamicIslandExpandedRegion(.bottom) {
                     statusLine(ctx.state, stale: ctx.isStale).font(.caption)
@@ -55,7 +55,7 @@ struct LapseLockView: View {
                     Image(systemName: icon(s)).foregroundStyle(color(s))
                     Text("\(s.frames) кадр.").font(.headline.monospacedDigit())
                 }
-                timeText(s).font(.caption.monospacedDigit())
+                timeText(s, stale: stale).font(.caption.monospacedDigit())
                 statusLine(s, stale: stale).font(.caption2).lineLimit(1)
             }
             .padding(6)
@@ -69,7 +69,7 @@ struct LapseLockView: View {
                     statusLine(s, stale: stale).font(.caption)
                 }
                 Spacer()
-                timeText(s).font(.title3.monospacedDigit())
+                timeText(s, stale: stale).font(.title3.monospacedDigit())
             }
             .foregroundStyle(Color.white)
             .padding()
@@ -92,8 +92,11 @@ private func color(_ s: LapseActivityAttributes.ContentState) -> Color {
 }
 
 @ViewBuilder
-private func timeText(_ s: LapseActivityAttributes.ContentState) -> some View {
-    if s.state == "rec" {
+private func timeText(_ s: LapseActivityAttributes.ContentState, stale: Bool) -> some View {
+    if stale && s.state == "rec" {
+        // Кадров нет больше 2 минут: время не идёт, чтобы не казалось, что съёмка продолжается
+        Text("стоп")
+    } else if s.state == "rec" {
         Text(s.started, style: .timer)
     } else {
         Text(s.started, style: .relative)
@@ -104,7 +107,7 @@ private func timeText(_ s: LapseActivityAttributes.ContentState) -> some View {
 private func statusLine(_ s: LapseActivityAttributes.ContentState, stale: Bool) -> some View {
     let bat = s.battery >= 0 ? "\(s.battery)%" : "-"
     if stale && s.state == "rec" {
-        Text("Нет связи с телефоном или кадров давно не было").foregroundStyle(.orange)
+        Text("Съёмка остановилась: телефон заблокирован, приложение закрыто или кадров давно нет").foregroundStyle(.orange)
     } else if !s.note.isEmpty {
         Text(s.note).foregroundStyle(s.state == "paused" ? Color.red : Color.secondary)
     } else {
