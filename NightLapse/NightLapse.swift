@@ -1248,6 +1248,62 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     }
 
     private var plExifWarned = 0
+    /// Выдержка и ISO последнего снимка по его метаданным (что камера сделала на самом деле)
+    private var plExifExp: Double = 0
+    private var plExifISO = 0
+    /// Полный тест камеры (идёт, если не nil)
+    fileprivate var ft: FullTest?
+    /// Превью включено (пишется на главном потоке, читается для журнала)
+    private var previewOn = true
+
+    /// Колонки журнала кадров: что камера сделала на самом деле и в каком она состоянии
+    private func camCols(exifExp: Double, exifISO: Int, median: Float, hi: Float) -> [String] {
+        let d = device
+        let g = d?.deviceWhiteBalanceGains
+        func mode(_ m: AVCaptureDevice.ExposureMode?) -> String {
+            switch m { case .custom?: return "custom"; case .locked?: return "locked"; case .continuousAutoExposure?: return "auto"; default: return "?" }
+        }
+        func wbm(_ m: AVCaptureDevice.WhiteBalanceMode?) -> String {
+            switch m { case .locked?: return "locked"; case .continuousAutoWhiteBalance?: return "auto"; case .autoWhiteBalance?: return "once"; default: return "?" }
+        }
+        return [String(format: "%.4f", exifExp), "\(exifISO)",
+                String(format: "%.4f", d.map { CMTimeGetSeconds($0.exposureDuration) } ?? 0), "\(si(d?.iso ?? 0))",
+                mode(d?.exposureMode), String(format: "%.3f", d?.lensPosition ?? 0),
+                String(format: "%.2f", g?.redGain ?? 0), String(format: "%.2f", g?.greenGain ?? 0), String(format: "%.2f", g?.blueGain ?? 0),
+                wbm(d?.whiteBalanceMode),
+                String(format: "%.1f", median), String(format: "%.1f", hi), String(format: "%.0f", plL),
+                String(format: "%.1f", cfg.ev),
+                (UserDefaults.standard.object(forKey: "polish") as? Bool ?? true) ? "1" : "0",
+                previewOn ? "1" : "0"]
+    }
+
+    /// Все настройки и состояние камеры для записи в тестовый снимок
+    fileprivate func metaSnapshot(_ extra: [String: Any] = [:]) -> [String: Any] {
+        var m: [String: Any] = [
+            "device": Diag.model(), "camera": Diag.device,
+            "scene": cfg.scene, "exposure_set_s": cfg.exposure, "interval_s": cfg.interval, "ev": Double(cfg.ev),
+            "iso_auto": cfg.isoAuto, "iso_set": Double(cfg.iso), "gain_set": Double(cfg.gain), "lighten": cfg.lighten,
+            "photo_frames": photoFrames, "polish": UserDefaults.standard.object(forKey: "polish") as? Bool ?? true,
+            "sensor_s": CMTimeGetSeconds(curDur), "iso": Double(curISO), "auto_gain": Double(autoGain), "pl_gain": Double(plGain),
+            "light": plL, "night": plNight, "exif_exp_s": plExifExp, "exif_iso": plExifISO,
+            "preview": previewOn, "thermal": Diag.thermal(), "battery": battery,
+        ]
+        if let d = device {
+            m["dev_exp_s"] = CMTimeGetSeconds(d.exposureDuration)
+            m["dev_iso"] = Double(d.iso)
+            m["lens"] = Double(d.lensPosition)
+            m["focus_mode"] = d.focusMode.rawValue
+            m["exp_mode"] = d.exposureMode.rawValue
+            m["wb_mode"] = d.whiteBalanceMode.rawValue
+            let g = d.deviceWhiteBalanceGains
+            m["wb_gains"] = [Double(g.redGain), Double(g.greenGain), Double(g.blueGain)]
+            let tt = d.temperatureAndTintValues(for: d.deviceWhiteBalanceGains)
+            m["wb_temp"] = Double(tt.temperature)
+            m["zoom"] = Double(d.videoZoomFactor)
+        }
+        for (k, v) in extra { m[k] = v }
+        return m
+    }
 
     /// queue: выдержка и ISO, с которыми снимок реально вышел (из метаданных): если не те, что просили, пишем в журнал
     private func plCheckExif(_ src: CGImageSource) {
@@ -1256,6 +1312,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
               let t = (ex[kCGImagePropertyExifExposureTime] as? NSNumber)?.doubleValue else { return }
         let want = CMTimeGetSeconds(curDur)
         let iso = ((ex[kCGImagePropertyExifISOSpeedRatings] as? [NSNumber])?.first)?.intValue ?? 0
+        plExifExp = t
+        plExifISO = iso
         if want > 0, abs(t - want) / want > 0.3, plExifWarned < 6 {
             plExifWarned += 1
             Diag.event(String(format: "Снимок вышел с выдержкой %.3f с, ISO %d, а просили %.3f с, ISO %d", t, iso, want, si(curISO)))
@@ -1340,7 +1398,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         Diag.frame([String(format: "%.1f", since), "\(outIndex)", "\(n)", String(format: "%.5f", CMTimeGetSeconds(curDur)),
                     "\(Int(curISO))", String(format: "%.2f", g), String(format: "%.3f", CMTimeGetSeconds(curDur) * Double(n)),
                     String(format: "%.1f", mean), "0", "0",
-                    String(format: "%.0f", ms), Diag.thermal(), "\(battery)", String(format: "%.1f", freeGB)])
+                    String(format: "%.0f", ms), Diag.thermal(), "\(battery)", String(format: "%.1f", freeGB)]
+                   + camCols(exifExp: plExifExp, exifISO: plExifISO, median: median, hi: hi))
         plNext()
     }
 
@@ -1386,7 +1445,9 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             return
         }
         let img = makeThumb(pb, maxSide: 2000)
-        if let cg = makeThumb(pb, maxSide: 4000)?.cgImage { TestStore.save(cg) }
+        if let cg = makeThumb(pb, maxSide: 4000)?.cgImage {
+            TestStore.save(cg, meta: metaSnapshot(["kind": "test_photo_frames", "shots": n, "mean": Double(mean)]))
+        }
         Diag.event("Тест: снимков \(n) по \(String(format: "%.2f", CMTimeGetSeconds(curDur))) с, ISO \(si(curISO)), "
             + "усиление \(String(format: "%.2f", plGain == 0 ? 1 : plGain)), яркость \(String(format: "%.0f", mean)), \(plNight ? "ночь" : "день")")
         DispatchQueue.main.async {
@@ -2026,6 +2087,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         // (кадры после «Гасить экран» становились в 10 раз темнее). Экран гасит чёрная накладка
         if !on && phase != .idle { return }
         previewLayer?.connection?.isEnabled = on
+        previewOn = on
     }
 
     func attachPreview(_ layer: AVCaptureVideoPreviewLayer) {
@@ -3009,7 +3071,9 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             DispatchQueue.main.async { self.applyCamera() }
             let img = frame.flatMap { makeThumb($0, maxSide: 2000) }
             // Каждый тест сохраняется: до старта можно пролистать, увеличить и экспортировать
-            if let cg = frame.flatMap({ makeThumb($0, maxSide: 4000) })?.cgImage { TestStore.save(cg) }
+            if let cg = frame.flatMap({ makeThumb($0, maxSide: 4000) })?.cgImage {
+                TestStore.save(cg, meta: metaSnapshot(["kind": "test_video_stream", "subframes": n, "mean": Double(mean)]))
+            }
             let note = cfg.isoAuto ? "Тест готов. ISO подобран: \(Int(curISO))" : "Тест готов: проверь яркость и резкость"
             Diag.event("Тест: подкадров \(n), сенсор \(String(format: "%.4f", CMTimeGetSeconds(curDur))) с, ISO \(si(curISO)), "
                 + "усиление \(String(format: "%.2f", autoGain)), яркость \(String(format: "%.0f", mean)), выдержка \(cfg.exposure) с")
@@ -3043,7 +3107,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         Diag.frame([String(format: "%.1f", since), "\(outIndex)", "\(n)", String(format: "%.5f", CMTimeGetSeconds(curDur)),
                     "\(Int(curISO))", String(format: "%.2f", autoGain), String(format: "%.3f", frameTarget),
                     String(format: "%.1f", mean), String(format: "%.1f", pauseNow), String(format: "%.0f", extraPause),
-                    String(format: "%.0f", ms), Diag.thermal(), "\(battery)", String(format: "%.1f", freeGB)])
+                    String(format: "%.0f", ms), Diag.thermal(), "\(battery)", String(format: "%.1f", freeGB)]
+                   + camCols(exifExp: 0, exifISO: 0, median: -1, hi: -1))
     }
 
     private func accumulate(_ pb: CVPixelBuffer) {
@@ -4858,6 +4923,10 @@ struct SettingsSheet: View {
                 Section {
                     Toggle("Кадры как Фото", isOn: $e.photoFrames)
                     Toggle("Шумодав и подъём теней", isOn: $polish)
+                    Button("Полный тест камеры (около 2 мин)") {
+                        dismiss()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { e.fullCameraTest() }
+                    }
                     Button("Сравнить способы съёмки") {
                         dismiss()
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { e.compareTest() }
@@ -4952,6 +5021,10 @@ extension LapseEngine: AVCapturePhotoCaptureDelegate {
             DispatchQueue.main.async { d(data, t) }
             return
         }
+        if ft != nil {
+            ftShot(error == nil ? photo.fileDataRepresentation() : nil)
+            return
+        }
         if plActive {
             plShot(error == nil ? photo.fileDataRepresentation() : nil)
             return
@@ -4961,5 +5034,369 @@ extension LapseEngine: AVCapturePhotoCaptureDelegate {
             return
         }
         rawFinished(error == nil && photo.isRawPhoto ? photo.fileDataRepresentation() : nil)
+    }
+}
+
+// MARK: - Полный тест камеры: каждая настройка по очереди, что просили и что камера сделала на самом деле
+
+struct FTStep {
+    var group: String
+    var label: String
+    var dur: Double
+    var iso: Float
+    var lens: Float
+    /// nil - баланс белого как в начале теста, 0 - авто, иначе температура в К
+    var wb: Float? = nil
+    var preview = true
+    var prio: AVCapturePhotoOutput.QualityPrioritization = .quality
+    var wait = 0.8
+}
+
+struct FTRow {
+    var step: FTStep
+    var devExp = 0.0, devISO: Float = 0, devLens: Float = 0
+    var gains: [Float] = [0, 0, 0]
+    var exifExp = 0.0, exifISO = 0
+    var m = ImgMetrics()
+    var ms = 0.0
+}
+
+struct ImgMetrics {
+    var lin = 0.0          // средний линейный свет зелёного канала (без гаммы JPEG), 0...1
+    var r = 0.0, g = 0.0, b = 0.0
+    var median = 0.0, p995 = 0.0
+    var sharp = 0.0        // насколько звёзды и мелкие детали выделяются над соседями
+    var noise = 0.0        // зерно в тёмной половине кадра
+    var clip = 0.0         // доля выбитых в белое точек
+
+    static func of(_ cg: CGImage) -> ImgMetrics {
+        let s = 1000.0 / Double(max(cg.width, cg.height))
+        let w = max(8, Int(Double(cg.width) * min(1, s))), h = max(8, Int(Double(cg.height) * min(1, s)))
+        var px = [UInt8](repeating: 0, count: w * h * 4)
+        guard let cs = CGColorSpace(name: CGColorSpace.sRGB) else { return ImgMetrics() }
+        px.withUnsafeMutableBytes { b in
+            if let ctx = CGContext(data: b.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4, space: cs,
+                                   bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) {
+                ctx.interpolationQuality = .medium
+                ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+            }
+        }
+        var lut = [Double](repeating: 0, count: 256)
+        for i in 0..<256 {
+            let v = Double(i) / 255
+            lut[i] = v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4)
+        }
+        var m = ImgMetrics()
+        var L = [Float](repeating: 0, count: w * h)
+        var hist = [Int](repeating: 0, count: 256)
+        var sr = 0.0, sg = 0.0, sb = 0.0, sl = 0.0, clip = 0
+        for i in 0..<(w * h) {
+            let r = px[i * 4], g = px[i * 4 + 1], b = px[i * 4 + 2]
+            sr += Double(r); sg += Double(g); sb += Double(b)
+            sl += lut[Int(g)]
+            let l = 0.299 * Float(r) + 0.587 * Float(g) + 0.114 * Float(b)
+            L[i] = l
+            hist[min(255, max(0, Int(l)))] += 1
+            if r >= 250 && g >= 250 && b >= 250 { clip += 1 }
+        }
+        let n = Double(w * h)
+        m.r = sr / n; m.g = sg / n; m.b = sb / n; m.lin = sl / n; m.clip = Double(clip) / n
+        func pct(_ p: Double) -> Double {
+            let need = Int(n * p)
+            var acc = 0
+            for (v, c) in hist.enumerated() { acc += c; if acc >= need { return Double(v) } }
+            return 255
+        }
+        m.median = pct(0.5)
+        m.p995 = pct(0.995)
+        // Резкость: самые сильные превышения точки над соседями на 2 точки (звёзды) - среднее верхних 0.05%
+        var peaks = [Float]()
+        peaks.reserveCapacity(w * h / 4)
+        var noiseSum = 0.0, noiseN = 0
+        let med = Float(m.median)
+        for y in 2..<(h - 2) {
+            for x in 2..<(w - 2) {
+                let i = y * w + x
+                let ring = (L[i - 2] + L[i + 2] + L[i - 2 * w] + L[i + 2 * w]) / 4
+                peaks.append(L[i] - ring)
+                if L[i] <= med { noiseSum += Double(abs(L[i] - L[i + 1])); noiseN += 1 }
+            }
+        }
+        peaks.sort(by: >)
+        let top = max(1, peaks.count / 2000)
+        m.sharp = peaks.prefix(top).reduce(0.0) { $0 + Double($1) } / Double(top)
+        m.noise = noiseN > 0 ? noiseSum / Double(noiseN) : 0
+        return m
+    }
+}
+
+final class FullTest {
+    var steps: [FTStep] = []
+    var idx = 0
+    var rows: [FTRow] = []
+    var baseGains = AVCaptureDevice.WhiteBalanceGains(redGain: 1, greenGain: 1, blueGain: 1)
+    var d0 = 1.0
+    var iso0: Float = 100
+    var lens0: Float = 1
+    var stamp = ""
+    var started = Date()
+    var shotAt = CACurrentMediaTime()
+    var info = ""
+}
+
+extension LapseEngine {
+    /// Полный тест камеры: выдержка, ISO, фокус, баланс белого, превью вкл/выкл, качество, повторяемость.
+    /// Меняется одна настройка за раз, остальные стоят. Итог - Тесты/fulltest_*.txt и снимки «ПТ ...» в Тестах
+    func fullCameraTest() {
+        guard phase == .idle else { return }
+        phase = .test
+        subDone = 0
+        status = "Полный тест: замер света..."
+        UIApplication.shared.isIdleTimerDisabled = true
+        let angle = captureAngle()
+        queue.async {
+            guard let dev = self.device else { return self.ftFinish("Камера недоступна") }
+            self.session.beginConfiguration()
+            if !self.session.outputs.contains(self.photoOut), self.session.canAddOutput(self.photoOut) {
+                self.session.addOutput(self.photoOut)
+            }
+            self.session.commitConfiguration()
+            self.photoOut.maxPhotoQualityPrioritization = .quality
+            let dims = dev.activeFormat.supportedMaxPhotoDimensions.sorted { Int($0.width) * Int($0.height) < Int($1.width) * Int($1.height) }
+            if let d = dims.first(where: { Int($0.width) * Int($0.height) >= 11_000_000 }) ?? dims.last { self.photoOut.maxPhotoDimensions = d }
+            if let c = self.photoOut.connection(with: .video), c.isVideoRotationAngleSupported(angle) { c.videoRotationAngle = angle }
+            // Свет сцены - по автоэкспозиции, как в Камере
+            if (try? dev.lockForConfiguration()) != nil {
+                if dev.isExposureModeSupported(.continuousAutoExposure) { dev.exposureMode = .continuousAutoExposure }
+                dev.setExposureTargetBias(0, completionHandler: nil)
+                if dev.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) { dev.whiteBalanceMode = .continuousAutoWhiteBalance }
+                dev.unlockForConfiguration()
+            }
+            self.queue.asyncAfter(deadline: .now() + 2.5) { self.ftPlan() }
+        }
+    }
+
+    private func ftPlan() {
+        guard let dev = device else { return ftFinish("Камера недоступна") }
+        let fmt = dev.activeFormat
+        let lo = CMTimeGetSeconds(fmt.minExposureDuration)
+        let dmax = min(1.0, CMTimeGetSeconds(fmt.maxExposureDuration))
+        let light = max(Double(dev.iso) * CMTimeGetSeconds(dev.exposureDuration), Double(fmt.minISO) * lo)
+        let t = FullTest()
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd_HH-mm-ss"
+        t.stamp = f.string(from: Date())
+        t.baseGains = dev.deviceWhiteBalanceGains
+        t.lens0 = dev.lensPosition
+        if !UserDefaults.standard.flag("focusAuto", false) { t.lens0 = Float(UserDefaults.standard.dbl("focus", Double(dev.lensPosition))) }
+        // Основная точка: при темноте 1 с и ISO по свету (не выше максимума), днём ISO около 100
+        let night = isNightLight(light)
+        let d0 = night ? dmax : min(dmax, max(lo, light / 100))
+        let iso0 = min(max(Float(light / d0), fmt.minISO), fmt.maxISO)
+        t.d0 = d0
+        t.iso0 = iso0
+        t.info = String(format: "Свет по автоэкспозиции: ISO %.0f × %.4f с = %.0f (%@). Основная точка: %.3f с, ISO %.0f, фокус %.3f. Пределы: выдержка %.5f-%.2f с, ISO %.0f-%.0f",
+                        dev.iso, CMTimeGetSeconds(dev.exposureDuration), light, night ? "ночь" : "день", d0, iso0, t.lens0, lo, dmax, fmt.minISO, fmt.maxISO)
+        func clampD(_ d: Double) -> Double { min(max(d, lo), dmax) }
+        func clampI(_ i: Float) -> Float { min(max(i, fmt.minISO), fmt.maxISO) }
+        var s: [FTStep] = []
+        let base = FTStep(group: "Основа", label: "основа", dur: d0, iso: iso0, lens: t.lens0)
+        s.append(base)
+        for k in [0.25, 0.5, 2.0] {
+            var x = base; x.group = "Выдержка"; x.dur = clampD(d0 * k); x.label = String(format: "выдержка %.3f с", x.dur); s.append(x)
+        }
+        for k: Float in [0.25, 0.5, 2.0] {
+            var x = base; x.group = "ISO"; x.iso = clampI(iso0 * k); x.label = String(format: "ISO %.0f", x.iso); s.append(x)
+        }
+        for p: Float in [0.5, 0.7, 0.8, 0.85, 0.9, 0.95, 1.0] {
+            var x = base; x.group = "Фокус"; x.lens = p; x.label = String(format: "фокус %.2f", p); x.wait = 1.0; s.append(x)
+        }
+        for tk: Float in [2800, 3800, 5000, 6500, 0] {
+            var x = base; x.group = "Баланс"; x.wb = tk; x.label = tk == 0 ? "баланс авто" : String(format: "баланс %.0f K", tk); x.wait = tk == 0 ? 2.0 : 1.0; s.append(x)
+        }
+        do {
+            var x = base; x.group = "Превью"; x.preview = false; x.label = "превью выкл"; x.wait = 1.5; s.append(x)
+            var y = base; y.group = "Превью"; y.label = "превью снова вкл"; y.wait = 1.5; s.append(y)
+        }
+        for (p, nm) in [(AVCapturePhotoOutput.QualityPrioritization.speed, "speed"), (.balanced, "balanced")] {
+            var x = base; x.group = "Качество"; x.prio = p; x.label = "качество " + nm; s.append(x)
+        }
+        for i in 1...3 {
+            var x = base; x.group = "Повтор"; x.label = "повтор \(i)"; x.wait = 6; s.append(x)
+        }
+        t.steps = s
+        ft = t
+        let n = s.count
+        DispatchQueue.main.async {
+            self.subTotal = n
+            self.status = "Полный тест: \(n) снимков, около \(n * 3 / 60 + 1) мин. Не трогай телефон"
+        }
+        Diag.event("Полный тест: " + t.info)
+        ftStep()
+    }
+
+    private func ftStep() {
+        guard let t = ft, let dev = device else { return ftFinish("Камера недоступна") }
+        if phase != .test { return ftFinish("Отменено") }
+        guard t.idx < t.steps.count else { return ftReport() }
+        let st = t.steps[t.idx]
+        // Превью: на главном потоке
+        let pv = st.preview
+        DispatchQueue.main.async {
+            self.previewLayer?.connection?.isEnabled = pv
+            self.previewOn = pv
+        }
+        if (try? dev.lockForConfiguration()) != nil {
+            let sem = DispatchSemaphore(value: 0)
+            dev.setExposureModeCustom(duration: CMTime(seconds: st.dur, preferredTimescale: 1_000_000), iso: st.iso) { _ in sem.signal() }
+            _ = sem.wait(timeout: .now() + 3)
+            if dev.isLockingFocusWithCustomLensPositionSupported {
+                let fs = DispatchSemaphore(value: 0)
+                dev.setFocusModeLocked(lensPosition: min(max(st.lens, 0), 1)) { _ in fs.signal() }
+                _ = fs.wait(timeout: .now() + 3)
+            }
+            if let wb = st.wb, wb == 0 {
+                if dev.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) { dev.whiteBalanceMode = .continuousAutoWhiteBalance }
+            } else if dev.isLockingWhiteBalanceWithCustomDeviceGainsSupported {
+                var g = t.baseGains
+                if let wb = st.wb {
+                    g = dev.deviceWhiteBalanceGains(for: AVCaptureDevice.WhiteBalanceTemperatureAndTintValues(temperature: wb, tint: 0))
+                }
+                let m = dev.maxWhiteBalanceGain
+                g.redGain = min(max(g.redGain, 1), m)
+                g.greenGain = min(max(g.greenGain, 1), m)
+                g.blueGain = min(max(g.blueGain, 1), m)
+                dev.setWhiteBalanceModeLocked(with: g, completionHandler: nil)
+            }
+            dev.unlockForConfiguration()
+        }
+        let label = st.label
+        let i = t.idx
+        DispatchQueue.main.async { self.status = "Полный тест \(i + 1)/\(t.steps.count): \(label)" }
+        queue.asyncAfter(deadline: .now() + st.wait) {
+            guard let t = self.ft, let dev = self.device else { return }
+            var row = FTRow(step: st)
+            row.devExp = CMTimeGetSeconds(dev.exposureDuration)
+            row.devISO = dev.iso
+            row.devLens = dev.lensPosition
+            let g = dev.deviceWhiteBalanceGains
+            row.gains = [g.redGain, g.greenGain, g.blueGain]
+            t.rows.append(row)
+            t.shotAt = CACurrentMediaTime()
+            let ps = AVCapturePhotoSettings()
+            ps.photoQualityPrioritization = st.prio
+            ps.maxPhotoDimensions = self.photoOut.maxPhotoDimensions
+            self.photoOut.capturePhoto(with: ps, delegate: self)
+        }
+    }
+
+    fileprivate func ftShot(_ data: Data?) {
+        queue.async {
+            guard let t = self.ft, !t.rows.isEmpty else { return }
+            var row = t.rows.removeLast()
+            row.ms = (CACurrentMediaTime() - t.shotAt) * 1000
+            if let d = data, let src = CGImageSourceCreateWithData(d as CFData, nil) {
+                if let pr = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+                   let ex = pr[kCGImagePropertyExifDictionary] as? [CFString: Any] {
+                    row.exifExp = (ex[kCGImagePropertyExifExposureTime] as? NSNumber)?.doubleValue ?? 0
+                    row.exifISO = ((ex[kCGImagePropertyExifISOSpeedRatings] as? [NSNumber])?.first)?.intValue ?? 0
+                }
+                if let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, [
+                    kCGImageSourceCreateThumbnailFromImageAlways: true,
+                    kCGImageSourceCreateThumbnailWithTransform: true,
+                    kCGImageSourceThumbnailMaxPixelSize: 2000,
+                ] as CFDictionary) {
+                    row.m = ImgMetrics.of(cg)
+                    let st = row.step
+                    TestStore.save(cg, label: "ПТ \(String(format: "%02d", t.idx + 1)) \(st.group) - \(st.label)", meta: self.metaSnapshot([
+                        "kind": "full_test", "group": st.group, "step": st.label,
+                        "req_exp_s": st.dur, "req_iso": Double(st.iso), "req_lens": Double(st.lens), "req_wb": Double(st.wb ?? -1),
+                        "req_preview": st.preview, "prio": st.prio.rawValue,
+                        "shot_exp_s": row.exifExp, "shot_iso": row.exifISO,
+                        "m_lin": row.m.lin, "m_median": row.m.median, "m_p995": row.m.p995, "m_sharp": row.m.sharp,
+                        "m_noise": row.m.noise, "m_rgb": [row.m.r, row.m.g, row.m.b], "ms": row.ms,
+                    ]))
+                    if t.idx == 0 { DispatchQueue.main.async { self.lastImage = UIImage(cgImage: cg) } }
+                }
+            }
+            t.rows.append(row)
+            t.idx += 1
+            DispatchQueue.main.async { self.subDone = t.idx }
+            self.ftStep()
+        }
+    }
+
+    private func ftReport() {
+        guard let t = ft else { return ftFinish(nil) }
+        let rows = t.rows
+        func f(_ x: Double, _ d: Int = 3) -> String { String(format: "%.\(d)f", x) }
+        var out = "Полный тест камеры \(t.stamp)\n\(Diag.model())\n\(Diag.device)\n\(t.info)\n\n"
+        out += "№;группа;шаг;просили выд;просили ISO;фокус;баланс;превью;качество;камера выд;камера ISO;линза;WB R;WB G;WB B;снимок выд;снимок ISO;свет лин;медиана;99.5%;резкость;зерно;R;G;B;белого%;мс\n"
+        for (i, r) in rows.enumerated() {
+            let s = r.step
+            out += ["\(i + 1)", s.group, s.label, f(s.dur, 4), f(Double(s.iso), 0), f(Double(s.lens)), s.wb.map { $0 == 0 ? "авто" : f(Double($0), 0) } ?? "база",
+                    s.preview ? "вкл" : "выкл", "\(s.prio.rawValue)", f(r.devExp, 4), f(Double(r.devISO), 0), f(Double(r.devLens)),
+                    f(Double(r.gains[0]), 2), f(Double(r.gains[1]), 2), f(Double(r.gains[2]), 2), f(r.exifExp, 4), "\(r.exifISO)",
+                    f(r.m.lin, 5), f(r.m.median, 0), f(r.m.p995, 0), f(r.m.sharp, 1), f(r.m.noise, 2),
+                    f(r.m.r, 1), f(r.m.g, 1), f(r.m.b, 1), f(r.m.clip * 100, 2), f(r.ms, 0)].joined(separator: ";") + "\n"
+        }
+        // Выводы: что меняется, что нет
+        var v: [String] = []
+        let base = rows.first { $0.step.group == "Основа" }
+        if let b = base, b.m.lin > 0 {
+            for r in rows where r.step.group == "Выдержка" || r.step.group == "ISO" {
+                let want = r.step.group == "Выдержка" ? r.step.dur / b.step.dur : Double(r.step.iso / b.step.iso)
+                let got = r.m.lin / b.m.lin
+                let ok = abs(log2(max(got, 1e-4) / max(want, 1e-4))) < 0.35
+                let same = abs(got - 1) < 0.08 && abs(want - 1) > 0.3
+                let exifNote = r.exifExp > 0 ? String(format: ", в снимке %.3f с ISO %d", r.exifExp, r.exifISO) : ""
+                v.append("\(r.step.label): свет x\(f(got, 2)), ждали x\(f(want, 2))\(exifNote) - " + (same ? "НЕ МЕНЯЕТСЯ" : (ok ? "ок" : "не так, как ждали")))
+            }
+            for r in rows where r.step.group == "Превью" || r.step.group == "Качество" || r.step.group == "Повтор" {
+                let got = r.m.lin / b.m.lin
+                v.append("\(r.step.label): свет x\(f(got, 2)) от основы, резкость \(f(r.m.sharp, 1)) (основа \(f(b.m.sharp, 1))), зерно \(f(r.m.noise, 2)) (основа \(f(b.m.noise, 2))), \(f(r.ms, 0)) мс"
+                         + (abs(got - 1) > 0.2 ? " - ОТЛИЧАЕТСЯ" : ""))
+            }
+        }
+        let foc = rows.filter { $0.step.group == "Фокус" }
+        if let best = foc.max(by: { $0.m.sharp < $1.m.sharp }), let worst = foc.min(by: { $0.m.sharp < $1.m.sharp }) {
+            let spread = worst.m.sharp > 0 ? best.m.sharp / worst.m.sharp : 0
+            v.append("Фокус: резче всего \(best.step.label) (резкость \(f(best.m.sharp, 1))), хуже всего \(worst.step.label) (\(f(worst.m.sharp, 1)))"
+                     + (spread < 1.1 ? " - РАЗНИЦЫ ПОЧТИ НЕТ: фокус не меняется или в кадре нет мелких деталей" : ""))
+            let lensDiff = foc.map { abs($0.devLens - $0.step.lens) }.max() ?? 0
+            if lensDiff > 0.05 { v.append("Фокус: линза встала не туда, куда просили (до \(f(Double(lensDiff), 2)))") }
+        }
+        let wbs = rows.filter { $0.step.group == "Баланс" && ($0.step.wb ?? 0) > 0 }
+        if wbs.count >= 2 {
+            let rb = wbs.map { $0.m.b > 0 ? $0.m.r / $0.m.b : 0 }
+            let spread = (rb.max() ?? 0) / max(rb.min() ?? 1, 0.01)
+            v.append("Баланс: R/B от \(f(rb.min() ?? 0, 2)) до \(f(rb.max() ?? 0, 2))" + (spread < 1.05 ? " - НЕ МЕНЯЕТСЯ" : " - меняется"))
+        }
+        let reps = rows.filter { $0.step.group == "Повтор" || $0.step.group == "Основа" }.map { $0.m.lin }
+        if let mx = reps.max(), let mn = reps.min(), mn > 0 {
+            v.append("Повторяемость: разброс света одинаковых снимков \(f((mx / mn - 1) * 100, 1))%")
+        }
+        out += "\nВыводы\n" + v.map { "- " + $0 }.joined(separator: "\n") + "\n"
+        let url = TestStore.dir.appendingPathComponent("fulltest_\(t.stamp).txt")
+        try? out.write(to: url, atomically: true, encoding: .utf8)
+        Diag.event("Полный тест готов: \(rows.count) снимков. " + v.joined(separator: " | "))
+        ftFinish(nil)
+    }
+
+    private func ftFinish(_ msg0: String?) {
+        ft = nil
+        session.beginConfiguration()
+        if session.outputs.contains(photoOut) { session.removeOutput(photoOut) }
+        session.commitConfiguration()
+        let msg = msg0 ?? "Полный тест готов: снимки «ПТ» в Тестах, итог - в отчёте"
+        if msg0 != nil { Diag.event("Полный тест: " + msg) }
+        DispatchQueue.main.async {
+            self.previewLayer?.connection?.isEnabled = true
+            self.previewOn = true
+            self.subDone = 0
+            self.applyCamera()
+            self.finished(msg)
+            if msg0 == nil { self.testCount += 1 }
+        }
     }
 }

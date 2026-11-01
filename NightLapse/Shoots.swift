@@ -2312,7 +2312,7 @@ enum Diag {
     /// Камера, формат, пределы сенсора - пишется в каждую съёмку
     static var device = ""
 
-    static let csvHeader = "t_s,frame,subframes,sensor_s,iso,gain,frame_target_s,mean_luma,pause_s,extra_pause_s,proc_ms,thermal,battery,free_gb"
+    static let csvHeader = "t_s,frame,subframes,sensor_s,iso,gain,frame_target_s,mean_luma,pause_s,extra_pause_s,proc_ms,thermal,battery,free_gb,exif_exp_s,exif_iso,dev_exp_s,dev_iso,exp_mode,lens,wb_r,wb_g,wb_b,wb_mode,median,hi,light,ev,polish,preview"
 
     static func model() -> String {
         var s = utsname()
@@ -2433,6 +2433,22 @@ enum Diag {
             }
 
             PanoStore.addToReport(into: tmp)
+
+            // Тесты: журнал с настройками каждого снимка, отчёт полного теста, уменьшенные снимки
+            let td = tmp.appendingPathComponent("tests", isDirectory: true)
+            try? fm.createDirectory(at: td, withIntermediateDirectories: true)
+            let tdir = TestStore.dir
+            let tfiles = (try? fm.contentsOfDirectory(at: tdir, includingPropertiesForKeys: nil)) ?? []
+            for u in tfiles where u.pathExtension == "txt" {
+                if u.lastPathComponent == "tests_log.txt" || u.lastPathComponent.hasPrefix("fulltest_") {
+                    try? fm.copyItem(at: u, to: td.appendingPathComponent(u.lastPathComponent))
+                }
+            }
+            for u in TestStore.list().prefix(40) {
+                if let cg = ShootStore.thumb(u, maxPixel: 1000), let d = ShootStore.jpeg(cg) {
+                    try? d.write(to: td.appendingPathComponent(u.lastPathComponent))
+                }
+            }
 
             // zip силами системы
             var result: URL?

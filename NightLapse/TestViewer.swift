@@ -1,5 +1,6 @@
 import SwiftUI
 import Photos
+import ImageIO
 
 /// Пробные кадры: сохраняются в Файлы → NightLapse → Тесты (последние 30), чтобы до старта
 /// можно было сравнить, увеличить и при желании экспортировать
@@ -16,14 +17,42 @@ enum TestStore {
         return f
     }()
 
-    static func save(_ img: CGImage, label: String = "") {
-        guard let data = ShootStore.jpeg(img) else { return }
+    static func save(_ img: CGImage, label: String = "", meta: [String: Any] = [:]) {
+        let json = meta.isEmpty ? "" : ((try? JSONSerialization.data(withJSONObject: meta, options: [.sortedKeys])).flatMap { String(data: $0, encoding: .utf8) } ?? "")
+        guard let data = jpeg(img, comment: json) else { return }
         let tail = label.isEmpty ? "" : "_" + label.replacingOccurrences(of: "_", with: " ").replacingOccurrences(of: "/", with: "-")
         let url = dir.appendingPathComponent("test_\(fmt.string(from: Date()))\(tail).jpg")
         try? data.write(to: url)
-        // Храним только последние 80 (сравнение даёт около 30 за раз)
+        // Все настройки снимка - и в самом файле (EXIF, комментарий), и строкой в журнале тестов
+        if !json.isEmpty { log(url.lastPathComponent + " " + json) }
+        // Храним только последние 150 (полный тест даёт около 30 за раз)
         let all = list()
-        if all.count > 80 { for u in all.dropFirst(80) { try? FileManager.default.removeItem(at: u) } }
+        if all.count > 150 { for u in all.dropFirst(150) { try? FileManager.default.removeItem(at: u) } }
+    }
+
+    static func log(_ line: String) {
+        let u = dir.appendingPathComponent("tests_log.txt")
+        let l = line + "\n"
+        if let h = try? FileHandle(forWritingTo: u) {
+            h.seekToEndOfFile()
+            h.write(Data(l.utf8))
+            try? h.close()
+        } else {
+            try? l.write(to: u, atomically: true, encoding: .utf8)
+        }
+    }
+
+    /// JPEG с текстом настроек в EXIF (UserComment) - его видно в любом просмотрщике метаданных
+    static func jpeg(_ img: CGImage, comment: String) -> Data? {
+        let data = NSMutableData()
+        guard let dest = CGImageDestinationCreateWithData(data as CFMutableData, "public.jpeg" as CFString, 1, nil) else { return nil }
+        var props: [CFString: Any] = [kCGImageDestinationLossyCompressionQuality: 0.95]
+        if !comment.isEmpty {
+            props[kCGImagePropertyExifDictionary] = [kCGImagePropertyExifUserComment: comment]
+            props[kCGImagePropertyTIFFDictionary] = [kCGImagePropertyTIFFImageDescription: comment, kCGImagePropertyTIFFSoftware: "NightLapse"]
+        }
+        CGImageDestinationAddImage(dest, img, props as CFDictionary)
+        return CGImageDestinationFinalize(dest) ? data as Data : nil
     }
 
     /// Подпись способа из имени файла (для сравнения), у обычного теста - пусто
