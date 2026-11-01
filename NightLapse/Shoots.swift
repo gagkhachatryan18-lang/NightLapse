@@ -2312,7 +2312,7 @@ enum Diag {
     /// Камера, формат, пределы сенсора - пишется в каждую съёмку
     static var device = ""
 
-    static let csvHeader = "t_s,frame,subframes,sensor_s,iso,gain,frame_target_s,mean_luma,pause_s,extra_pause_s,proc_ms,thermal,battery,free_gb,exif_exp_s,exif_iso,dev_exp_s,dev_iso,exp_mode,lens,wb_r,wb_g,wb_b,wb_mode,median,hi,light,ev,polish,preview"
+    static let csvHeader = "t_s,frame,subframes,sensor_s,iso,gain,frame_target_s,mean_luma,pause_s,extra_pause_s,proc_ms,thermal,battery,free_gb,exif_exp_s,exif_iso,dev_exp_s,dev_iso,exp_mode,lens,wb_r,wb_g,wb_b,wb_mode,median,hi,light,ev,polish,preview,q_stars,q_fwhm,q_elong,q_sky,q_noise"
 
     static func model() -> String {
         var s = utsname()

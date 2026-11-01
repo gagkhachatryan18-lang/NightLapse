@@ -525,6 +525,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     private var focusN = 0
     private var focusFine = false
     private var focusResults: [(Float, Double)] = []
+    private var focusLog: [String] = []
 
     func starFocus() {
         guard phase == .idle else { return }
@@ -541,6 +542,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             self.focusPlan = stride(from: 0.60, through: 1.0001, by: 0.05).map { Float(min($0, 1)) }
             self.focusFine = false
             self.focusResults = []
+            self.focusLog = []
             self.focusIdx = 0
             self.appliedFocusAuto = nil
             if (try? dev.lockForConfiguration()) != nil {
@@ -573,7 +575,10 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             focusSkip -= 1
             return
         }
-        focusAcc += starMetric(pb)
+        // Резкость по звёздам: сколько их и какого они размера (кружок не в фокусе - крупный и тусклый)
+        let q = FrameQuality.of(pb)
+        focusAcc += q.focusScore
+        focusLog.append(String(format: "%.2f:%d/%.1f", focusPlan[focusIdx], q.stars, q.fwhm))
         focusN += 1
         guard focusN >= 2 else { return }
         focusResults.append((focusPlan[focusIdx], focusAcc / Double(focusN)))
@@ -599,7 +604,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         }
         mode = .off
         Diag.event("Фокус по звёздам: \(String(format: "%.2f", best)); "
-            + focusResults.map { String(format: "%.2f=%.0f", $0.0, $0.1) }.joined(separator: " "))
+            + focusResults.map { String(format: "%.2f=%.0f", $0.0, $0.1) }.joined(separator: " ")
+            + "; звёзды/размер: " + focusLog.joined(separator: " "))
         DispatchQueue.main.async {
             self.focusAuto = false
             self.focus = best
@@ -1255,6 +1261,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     fileprivate var ft: FullTest?
     /// Превью включено (пишется на главном потоке, читается для журнала)
     private var previewOn = true
+    /// Оценка последнего кадра (каждый 5-й): звёзды, размер, вытянутость, небо, зерно
+    private var lastQ: [String] = ["", "", "", "", ""]
 
     /// Колонки журнала кадров: что камера сделала на самом деле и в каком она состоянии
     private func camCols(exifExp: Double, exifISO: Int, median: Float, hi: Float) -> [String] {
@@ -1274,7 +1282,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
                 String(format: "%.1f", median), String(format: "%.1f", hi), String(format: "%.0f", plL),
                 String(format: "%.1f", cfg.ev),
                 (UserDefaults.standard.object(forKey: "polish") as? Bool ?? true) ? "1" : "0",
-                previewOn ? "1" : "0"]
+                previewOn ? "1" : "0"] + lastQ
     }
 
     /// Все настройки и состояние камеры для записи в тестовый снимок
@@ -3386,6 +3394,13 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         outIndex += 1
         let c = outIndex
         let thumb = makeThumb(out, maxSide: 900)
+        if c == 1 || c % 5 == 0, let cg = thumb?.cgImage {
+            let q = FrameQuality.of(cg)
+            lastQ = q.csv
+            if c == 1 || c % 50 == 0 { Diag.event("Кадр \(c): " + q.verdict.map { $0.0 }.joined(separator: "; ")) }
+        } else {
+            lastQ = ["", "", "", "", ""]
+        }
         DispatchQueue.main.async {
             self.framesDone = c
             if let t = thumb { self.lastImage = t }
@@ -5058,6 +5073,7 @@ struct FTRow {
     var gains: [Float] = [0, 0, 0]
     var exifExp = 0.0, exifISO = 0
     var m = ImgMetrics()
+    var q = FrameQuality()
     var ms = 0.0
 }
 
@@ -5307,6 +5323,7 @@ extension LapseEngine {
                     kCGImageSourceThumbnailMaxPixelSize: 2000,
                 ] as CFDictionary) {
                     row.m = ImgMetrics.of(cg)
+                    row.q = FrameQuality.of(cg)
                     let st = row.step
                     TestStore.save(cg, label: "ПТ \(String(format: "%02d", t.idx + 1)) \(st.group) - \(st.label)", meta: self.metaSnapshot([
                         "kind": "full_test", "group": st.group, "step": st.label,
@@ -5331,14 +5348,15 @@ extension LapseEngine {
         let rows = t.rows
         func f(_ x: Double, _ d: Int = 3) -> String { String(format: "%.\(d)f", x) }
         var out = "Полный тест камеры \(t.stamp)\n\(Diag.model())\n\(Diag.device)\n\(t.info)\n\n"
-        out += "№;группа;шаг;просили выд;просили ISO;фокус;баланс;превью;качество;камера выд;камера ISO;линза;WB R;WB G;WB B;снимок выд;снимок ISO;свет лин;медиана;99.5%;резкость;зерно;R;G;B;белого%;мс\n"
+        out += "№;группа;шаг;просили выд;просили ISO;фокус;баланс;превью;качество;камера выд;камера ISO;линза;WB R;WB G;WB B;снимок выд;снимок ISO;свет лин;медиана;99.5%;резкость;зерно;R;G;B;белого%;мс;звёзд;размер звезды;вытянутость\n"
         for (i, r) in rows.enumerated() {
             let s = r.step
             out += ["\(i + 1)", s.group, s.label, f(s.dur, 4), f(Double(s.iso), 0), f(Double(s.lens)), s.wb.map { $0 == 0 ? "авто" : f(Double($0), 0) } ?? "база",
                     s.preview ? "вкл" : "выкл", "\(s.prio.rawValue)", f(r.devExp, 4), f(Double(r.devISO), 0), f(Double(r.devLens)),
                     f(Double(r.gains[0]), 2), f(Double(r.gains[1]), 2), f(Double(r.gains[2]), 2), f(r.exifExp, 4), "\(r.exifISO)",
                     f(r.m.lin, 5), f(r.m.median, 0), f(r.m.p995, 0), f(r.m.sharp, 1), f(r.m.noise, 2),
-                    f(r.m.r, 1), f(r.m.g, 1), f(r.m.b, 1), f(r.m.clip * 100, 2), f(r.ms, 0)].joined(separator: ";") + "\n"
+                    f(r.m.r, 1), f(r.m.g, 1), f(r.m.b, 1), f(r.m.clip * 100, 2), f(r.ms, 0),
+                    "\(r.q.stars)", f(r.q.fwhm, 2), f(r.q.elong, 2)].joined(separator: ";") + "\n"
         }
         // Выводы: что меняется, что нет
         var v: [String] = []
@@ -5359,6 +5377,11 @@ extension LapseEngine {
             }
         }
         let foc = rows.filter { $0.step.group == "Фокус" }
+        let focQ = foc.filter { $0.q.stars >= 15 && $0.q.fwhm > 0 }
+        if focQ.count >= 3, let best = focQ.min(by: { $0.q.fwhm < $1.q.fwhm }), let worst = focQ.max(by: { $0.q.fwhm < $1.q.fwhm }) {
+            v.append("Фокус по звёздам: лучший \(best.step.label) - звёзды \(f(best.q.fwhm, 1)) точки, нашлось \(best.q.stars); худший \(worst.step.label) - \(f(worst.q.fwhm, 1)) точки. "
+                     + "Сейчас в приложении фокус \(f(Double(t.lens0), 2))" + (abs(best.step.lens - t.lens0) > 0.04 ? " - СТОИТ НЕ ТАМ" : " - ок"))
+        }
         if let best = foc.max(by: { $0.m.sharp < $1.m.sharp }), let worst = foc.min(by: { $0.m.sharp < $1.m.sharp }) {
             let spread = worst.m.sharp > 0 ? best.m.sharp / worst.m.sharp : 0
             v.append("Фокус: резче всего \(best.step.label) (резкость \(f(best.m.sharp, 1))), хуже всего \(worst.step.label) (\(f(worst.m.sharp, 1)))"

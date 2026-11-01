@@ -18,7 +18,10 @@ enum TestStore {
     }()
 
     static func save(_ img: CGImage, label: String = "", meta: [String: Any] = [:]) {
-        let json = meta.isEmpty ? "" : ((try? JSONSerialization.data(withJSONObject: meta, options: [.sortedKeys])).flatMap { String(data: $0, encoding: .utf8) } ?? "")
+        // Оценка кадра (фокус, звёзды, небо) - вместе с настройками
+        var meta = meta
+        for (k, v) in FrameQuality.of(img).dict { meta[k] = v }
+        let json = (try? JSONSerialization.data(withJSONObject: meta, options: [.sortedKeys])).flatMap { String(data: $0, encoding: .utf8) } ?? ""
         guard let data = jpeg(img, comment: json) else { return }
         let tail = label.isEmpty ? "" : "_" + label.replacingOccurrences(of: "_", with: " ").replacingOccurrences(of: "/", with: "-")
         let url = dir.appendingPathComponent("test_\(fmt.string(from: Date()))\(tail).jpg")
@@ -76,8 +79,27 @@ struct TestViewer: View {
     @State private var urls: [URL] = []
     @State private var idx = 0
     @State private var message = ""
+    @State private var quality: [Int: FrameQuality] = [:]
 
     init(pal: Pal = Pal(night: false)) { self.pal = pal }
+
+    private func loadQuality(_ i: Int) {
+        guard i < urls.count, quality[i] == nil else { return }
+        let u = urls[i]
+        DispatchQueue.global(qos: .userInitiated).async {
+            let q = FrameQuality.of(url: u) ?? FrameQuality()
+            DispatchQueue.main.async { quality[i] = q }
+        }
+    }
+
+    /// Твоя оценка кадра - в журнал тестов: по ней Claude сверяет свою оценку с твоим глазом
+    private func rate(_ good: Bool) {
+        guard idx < urls.count else { return }
+        let q = quality[idx].map { String(format: " (звёзд %d, размер %.2f, вытянутость %.2f, небо %.0f)", $0.stars, $0.fwhm, $0.elong, $0.sky) } ?? ""
+        TestStore.log("ОЦЕНКА " + urls[idx].lastPathComponent + ": " + (good ? "хороший" : "плохой") + q)
+        Diag.event("Оценка теста: " + (good ? "хороший" : "плохой") + q)
+        message = good ? "Отмечен как хороший" : "Отмечен как плохой"
+    }
 
     var body: some View {
         ZStack(alignment: .top) {
@@ -119,6 +141,22 @@ struct TestViewer: View {
                         Label(v.0, systemImage: v.1 ? "checkmark.circle" : "exclamationmark.triangle")
                             .foregroundStyle(v.1 ? pal.text : pal.warn)
                     }
+                    if let q = quality[idx] {
+                        ForEach(Array(q.verdict.enumerated()), id: \.offset) { _, v in
+                            Label(v.0, systemImage: v.1 ? "checkmark.circle" : "exclamationmark.triangle")
+                                .foregroundStyle(v.1 ? pal.text : pal.warn)
+                        }
+                    } else if !urls.isEmpty {
+                        Text("Оцениваю фокус...").foregroundStyle(pal.dim)
+                    }
+                    if !urls.isEmpty {
+                        HStack(spacing: 24) {
+                            Button { rate(true) } label: { Label("Хороший", systemImage: "hand.thumbsup") }
+                            Button { rate(false) } label: { Label("Плохой", systemImage: "hand.thumbsdown") }
+                        }
+                        .foregroundStyle(pal.text)
+                        .padding(.top, 4)
+                    }
                     if !message.isEmpty { Text(message).foregroundStyle(pal.dim) }
                 }
                 .font(.footnote.weight(.semibold))
@@ -133,8 +171,12 @@ struct TestViewer: View {
         .onAppear {
             urls = TestStore.list()
             idx = 0
+            loadQuality(0)
         }
-        .onChange(of: idx) { message = "" }
+        .onChange(of: idx) {
+            message = ""
+            loadQuality(idx)
+        }
         .traceScreen("Тесты")
     }
 
