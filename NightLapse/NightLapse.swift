@@ -1054,6 +1054,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         }
         if let c = photoOut.connection(with: .video), c.isVideoRotationAngleSupported(angle) { c.videoRotationAngle = angle }
         plActive = true
+        plExifWarned = 0
         seriesWantTrim = true
         seriesAlign = false
         plTest = test
@@ -1231,6 +1232,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
                    kCGImageSourceThumbnailMaxPixelSize: 12000,
                ] as CFDictionary) {
                 self.seriesAdd(cg)
+                self.plCheckExif(src)
             }
             self.plLeft -= 1
             let done = self.plCount - self.plLeft
@@ -1242,6 +1244,21 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             } else {
                 self.plEmit()
             }
+        }
+    }
+
+    private var plExifWarned = 0
+
+    /// queue: выдержка и ISO, с которыми снимок реально вышел (из метаданных): если не те, что просили, пишем в журнал
+    private func plCheckExif(_ src: CGImageSource) {
+        guard let pr = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+              let ex = pr[kCGImagePropertyExifDictionary] as? [CFString: Any],
+              let t = (ex[kCGImagePropertyExifExposureTime] as? NSNumber)?.doubleValue else { return }
+        let want = CMTimeGetSeconds(curDur)
+        let iso = ((ex[kCGImagePropertyExifISOSpeedRatings] as? [NSNumber])?.first)?.intValue ?? 0
+        if want > 0, abs(t - want) / want > 0.3, plExifWarned < 6 {
+            plExifWarned += 1
+            Diag.event(String(format: "Снимок вышел с выдержкой %.3f с, ISO %d, а просили %.3f с, ISO %d", t, iso, want, si(curISO)))
         }
     }
 
@@ -2005,6 +2022,9 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     /// main. Экран погашен - картинку камеры на экран не выводим: меньше работы, меньше расход батареи.
     /// Съёмка от этого не зависит, кадры идут отдельно
     func setPreview(_ on: Bool) {
+        // Во время съёмки превью не отключаем: с выключенным превью iOS снимал фото с другой выдержкой
+        // (кадры после «Гасить экран» становились в 10 раз темнее). Экран гасит чёрная накладка
+        if !on && phase != .idle { return }
         previewLayer?.connection?.isEnabled = on
     }
 
