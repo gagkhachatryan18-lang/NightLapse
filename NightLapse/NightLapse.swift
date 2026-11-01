@@ -326,8 +326,11 @@ private extension UserDefaults {
     func num(_ k: String, _ d: Int) -> Int { (object(forKey: k) as? NSNumber)?.intValue ?? d }
 }
 
+func si(_ x: Double) -> Int { x.isFinite ? Int(max(-1e9, min(1e9, x))) : 0 }
+func si(_ x: Float) -> Int { si(Double(x)) }
+
 func hms(_ t: TimeInterval) -> String {
-    let s = max(0, Int(t))
+    let s = t.isFinite ? max(0, Int(min(t, 1e9))) : 0
     return String(format: "%d:%02d:%02d", s / 3600, (s % 3600) / 60, s % 60)
 }
 
@@ -1189,7 +1192,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         var i = 0
         while i + 2 < seriesAcc.count {
             let l = (Float(seriesAcc[i]) * 0.3 + Float(seriesAcc[i + 1]) * 0.59 + Float(seriesAcc[i + 2]) * 0.11) / div
-            hist[min(max(Int(l), 0), 255)] += 1
+            hist[l.isFinite ? min(max(Int(l), 0), 255) : 0] += 1
             i += 4 * 7
         }
         let all = max(hist.reduce(0, +), 1)
@@ -1249,7 +1252,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         plMeterLeft -= 1
         let mx = device.map { Double($0.activeFormat.maxISO) * min(1.0, CMTimeGetSeconds($0.activeFormat.maxExposureDuration)) } ?? 1
         let maxed = plL >= mx * 0.99 && f > 1
-        Diag.event("Подбор: яркость \(Int(st.median)), белого \(Int(st.clip * 100))%, свет \(Int(plL)), поправка \(String(format: "%.2f", f))")
+        Diag.event("Подбор: яркость \(si(st.median)), белого \(si(st.clip * 100))%, свет \(si(plL)), поправка \(String(format: "%.2f", f))")
         if abs(f - 1) > 0.3 && plMeterLeft > 0 && !maxed {
             plL *= f
         } else {
@@ -1367,7 +1370,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         }
         let img = makeThumb(pb, maxSide: 2000)
         if let cg = makeThumb(pb, maxSide: 4000)?.cgImage { TestStore.save(cg) }
-        Diag.event("Тест: снимков \(n) по \(String(format: "%.2f", CMTimeGetSeconds(curDur))) с, ISO \(Int(curISO)), "
+        Diag.event("Тест: снимков \(n) по \(String(format: "%.2f", CMTimeGetSeconds(curDur))) с, ISO \(si(curISO)), "
             + "усиление \(String(format: "%.2f", plGain == 0 ? 1 : plGain)), яркость \(String(format: "%.0f", mean)), \(plNight ? "ночь" : "день")")
         DispatchQueue.main.async {
             self.lastImage = img
@@ -1736,7 +1739,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         var i = 0
         while i < seriesAcc.count {
             let l = (Float(seriesAcc[i]) * 0.3 + Float(seriesAcc[i + 1]) * 0.59 + Float(seriesAcc[i + 2]) * 0.11) / div
-            hist[min(max(Int(l), 0), 255)] += 1
+            hist[l.isFinite ? min(max(Int(l), 0), 255) : 0] += 1
             i += 4 * 7
         }
         let all = hist.reduce(0, +)
@@ -2822,7 +2825,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         // даже когда сенсор уже на максимуме (иначе усиление всегда упиралось в один и тот же предел)
         let fAll = lightFactor(mean: m, limit: 100_000)
         calibLeft -= 1
-        Diag.event("Подбор: яркость \(Int(m)), пересвет \(Int(clipFrac * 100))%, ISO \(Int(curISO)), сенсор \(String(format: "%.3f", CMTimeGetSeconds(curDur))) с, поправка \(String(format: "%.2f", f))")
+        Diag.event("Подбор: яркость \(si(m)), пересвет \(si(clipFrac * 100))%, ISO \(si(curISO)), сенсор \(String(format: "%.3f", CMTimeGetSeconds(curDur))) с, поправка \(String(format: "%.2f", f))")
         if abs(f - 1) < 0.08 {
             calibLeft = 0
         } else {
@@ -2936,7 +2939,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         let sub = CMTimeGetSeconds(curDur)
         let got = CMTimeGetSeconds(t - accStart) + sub
         let total = cfg.subNeeded
-        let done = min(total, Int((got / max(frameTarget, 0.001) * Double(total)).rounded(.down)))
+        let rawDone = got / max(frameTarget, 0.001) * Double(total)
+        let done = rawDone.isFinite ? min(total, max(0, Int(min(rawDone, 1e9).rounded(.down)))) : 0
         DispatchQueue.main.async { self.subDone = done }
         guard got >= frameTarget - sub * 0.5 else { return }
 
@@ -2954,7 +2958,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             DispatchQueue.main.async { self.applyCamera() }
             let img = frame.flatMap { makeThumb($0, maxSide: 2000) }
             let full = frame.flatMap { makeThumb($0, maxSide: 10000) }?.cgImage
-            Diag.event("Фото: подкадров \(n), сенсор \(String(format: "%.4f", CMTimeGetSeconds(curDur))) с, ISO \(Int(curISO)), выдержка \(cfg.exposure) с")
+            Diag.event("Фото: подкадров \(n), сенсор \(String(format: "%.4f", CMTimeGetSeconds(curDur))) с, ISO \(si(curISO)), выдержка \(cfg.exposure) с")
             DispatchQueue.main.async { self.lastImage = img; self.subDone = 0 }
             guard let cg = full, let data = ShootStore.jpeg(cg) else {
                 DispatchQueue.main.async { self.finished("Фото не получилось") }
@@ -2975,7 +2979,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
                 preFrames += 1
                 autoISOStep(mean: mean, full: true)
                 warmupLeft = max(warmupLeft, 2)
-                Diag.event("Тест: яркость \(Int(mean)), пересвет \(Int(clipFrac * 100))%, поправка, снимаю заново")
+                Diag.event("Тест: яркость \(si(mean)), пересвет \(si(clipFrac * 100))%, поправка, снимаю заново")
                 return
             }
         }
@@ -2987,7 +2991,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             // Каждый тест сохраняется: до старта можно пролистать, увеличить и экспортировать
             if let cg = frame.flatMap({ makeThumb($0, maxSide: 4000) })?.cgImage { TestStore.save(cg) }
             let note = cfg.isoAuto ? "Тест готов. ISO подобран: \(Int(curISO))" : "Тест готов: проверь яркость и резкость"
-            Diag.event("Тест: подкадров \(n), сенсор \(String(format: "%.4f", CMTimeGetSeconds(curDur))) с, ISO \(Int(curISO)), "
+            Diag.event("Тест: подкадров \(n), сенсор \(String(format: "%.4f", CMTimeGetSeconds(curDur))) с, ISO \(si(curISO)), "
                 + "усиление \(String(format: "%.2f", autoGain)), яркость \(String(format: "%.0f", mean)), выдержка \(cfg.exposure) с")
             DispatchQueue.main.async {
                 self.lastImage = img
@@ -3007,7 +3011,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             // и снимаем заново - иначе ролик начинается со вспышки
             preFrames += 1
             autoISOStep(mean: mean, full: true)
-            Diag.event("Первый кадр: яркость \(Int(mean)), поправка, снимаю заново")
+            Diag.event("Первый кадр: яркость \(si(mean)), поправка, снимаю заново")
         } else if let f = frame {
             writeFrame(f)
             if cfg.isoAuto { autoISOStep(mean: mean) }

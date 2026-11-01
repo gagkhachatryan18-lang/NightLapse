@@ -1631,6 +1631,7 @@ struct ShootsView: View {
     @State private var loaded = false
     /// Съёмка, которая только что закончилась: для неё сначала простой экран «Ночь готова»
     @State private var quickID: String?
+    @State private var showPanos = false
 
     private static let fmt: DateFormatter = {
         let f = DateFormatter()
@@ -1642,6 +1643,9 @@ struct ShootsView: View {
     var body: some View {
         NavigationStack(path: $path) {
             List {
+                Button { showPanos = true } label: {
+                    Label("Панорамы 360°", systemImage: "view.3d")
+                }
                 if loaded && shoots.isEmpty {
                     VStack(spacing: 12) {
                         Image(systemName: "moon.stars")
@@ -1698,6 +1702,7 @@ struct ShootsView: View {
                 path = [s]
             }
         }
+        .fullScreenCover(isPresented: $showPanos) { PanoLibraryView() }
         .traceScreen("Съёмки")
     }
 

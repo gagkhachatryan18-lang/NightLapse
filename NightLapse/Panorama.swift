@@ -936,3 +936,105 @@ enum PanoSelfTest {
         return report
     }
 }
+
+
+// MARK: - Список готовых панорам в приложении
+
+struct PanoItem: Identifiable {
+    let id: String
+    let dir: URL
+    let files: [URL]
+    let date: Date
+}
+
+enum PanoLibrary {
+    static func list() -> [PanoItem] {
+        let fm = FileManager.default
+        let dirs = ((try? fm.contentsOfDirectory(at: PanoStore.root(), includingPropertiesForKeys: [.contentModificationDateKey])) ?? [])
+            .filter { $0.hasDirectoryPath }
+        var out: [PanoItem] = []
+        for d in dirs {
+            let fs = ((try? fm.contentsOfDirectory(at: d, includingPropertiesForKeys: nil)) ?? [])
+                .filter { $0.lastPathComponent.hasPrefix("pano_") && $0.pathExtension == "jpg" }
+                .sorted { $0.lastPathComponent < $1.lastPathComponent }
+            if fs.isEmpty { continue }
+            let dt = (try? d.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date.distantPast
+            out.append(PanoItem(id: d.lastPathComponent, dir: d, files: fs, date: dt))
+        }
+        return out.sorted { $0.date > $1.date }
+    }
+}
+
+struct PanoLibraryView: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var items: [PanoItem] = []
+    @State private var viewing: URL?
+
+    private static let fmt: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "d MMM, HH:mm"
+        f.locale = Locale(identifier: "ru_RU")
+        return f
+    }()
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if items.isEmpty {
+                    Text("Пока нет панорам").foregroundStyle(.secondary)
+                }
+                ForEach(items) { it in
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(Self.fmt.string(from: it.date)).font(.headline)
+                        HStack(spacing: 10) {
+                            ForEach(it.files, id: \.self) { f in
+                                Button { viewing = f } label: {
+                                    VStack(spacing: 4) {
+                                        PanoThumb(url: f)
+                                        Text(f.lastPathComponent.hasPrefix("pano_A") ? "Вариант A" : "Вариант B")
+                                            .font(.caption)
+                                    }
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
+                .onDelete { idx in
+                    for i in idx { try? FileManager.default.removeItem(at: items[i].dir) }
+                    items.remove(atOffsets: idx)
+                }
+            }
+            .navigationTitle("Панорамы 360°")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Готово") { dismiss() } } }
+        }
+        .onAppear { items = PanoLibrary.list() }
+        .fullScreenCover(item: Binding(get: { viewing.map { PanoURL(url: $0) } }, set: { viewing = $0?.url })) { item in
+            PanoViewerScreen(url: item.url) { viewing = nil }
+        }
+    }
+}
+
+struct PanoThumb: View {
+    let url: URL
+    @State private var img: UIImage?
+    var body: some View {
+        Color(white: 0.15)
+            .aspectRatio(2, contentMode: .fit)
+            .overlay { if let img { Image(uiImage: img).resizable().scaledToFill() } }
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .task {
+                let u = url
+                img = await Task.detached(priority: .utility) { () -> UIImage? in
+                    guard let src = CGImageSourceCreateWithURL(u as CFURL, nil) else { return nil }
+                    let o: [CFString: Any] = [kCGImageSourceCreateThumbnailFromImageAlways: true,
+                                              kCGImageSourceThumbnailMaxPixelSize: 600,
+                                              kCGImageSourceCreateThumbnailWithTransform: true]
+                    guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, o as CFDictionary) else { return nil }
+                    return UIImage(cgImage: cg)
+                }.value
+            }
+    }
+}
