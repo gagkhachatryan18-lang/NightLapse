@@ -728,7 +728,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     private var autoGain: Float = 1
     /// Последние настройки для ночного превью (только queue)
     private var currentSettingsQueue = CamSettings(dur: 1, ev: 0, iso: 100, temp: 4500, focus: 1, wbAuto: true, focusAuto: false)
-    private let maxAutoGain: Float = 16
+    private let maxAutoGain: Float = 32
     /// Сколько секунд копить кадр сейчас (при умной выдержке может быть меньше выставленной)
     private var frameTarget: Double = 1
     /// Пауза после текущего кадра: твоя пауза + время, на которое кадр вышел короче
@@ -3150,8 +3150,12 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         var total = 0
         acc.withUnsafeBufferPointer { a in
             var i = 0
-            while i < px {
-                let v = max(a[i * 4], a[i * 4 + 1], a[i * 4 + 2]) / div
+            // Среднее по 4 соседним точкам: зерно ISO 5184 в 0.5% самых ярких точек иначе держало усиление на 8,
+            // хотя настоящие звёзды (пятно в несколько точек) были тусклыми
+            while i + 3 < px {
+                var r: Float = 0, g: Float = 0, bl: Float = 0
+                for k in 0..<4 { r += a[(i + k) * 4]; g += a[(i + k) * 4 + 1]; bl += a[(i + k) * 4 + 2] }
+                let v = max(r, g, bl) / (4 * div)
                 hist[Int(min(1023, max(0, v * 4)))] += 1
                 total += 1
                 i += 37
