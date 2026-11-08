@@ -1072,7 +1072,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         plSetLight = 0
         plSetDur = 0
         plL = 0
-        Diag.event(test ? "Тест кадром-фото" : "Съёмка кадрами-фото")
+        let ang = photoOut.connection(with: .video)?.videoRotationAngle ?? -1
+        Diag.event((test ? "Тест кадром-фото" : "Съёмка кадрами-фото") + String(format: ", поворот кадра %.0f° (телефон: %d)", ang, UIDevice.current.orientation.rawValue))
         queue.asyncAfter(deadline: .now() + Double(hold)) { self.plFrame() }
     }
 
@@ -2132,6 +2133,12 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
     /// Экран всегда вертикальный (как в Камере), поэтому поворот кадра берём прямо из положения телефона
     private func captureAngle() -> CGFloat {
+        // Сначала по датчику наклона камеры (как в Камере iPhone): работает и с замком поворота экрана.
+        // UIDevice.orientation при замке всегда «вертикально» - кадр выходил боком (08.11)
+        if let c = coordinator {
+            let a = c.videoRotationAngleForHorizonLevelCapture
+            if a.isFinite { return a }
+        }
         switch UIDevice.current.orientation {
         case .portrait: return 90
         case .landscapeLeft: return 0
@@ -3397,7 +3404,10 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         if c == 1 || c % 5 == 0, let cg = thumb?.cgImage {
             let q = FrameQuality.of(cg)
             lastQ = q.csv
-            if c == 1 || c % 50 == 0 { Diag.event("Кадр \(c): " + q.verdict.map { $0.0 }.joined(separator: "; ")) }
+            // Звёзды и фокус по звёздам - только ночью (днём «звёзды» - это снег, капли, блики)
+            if (c == 1 || c % 50 == 0) && (plNight || cfg.scene == LapseScene.stars.rawValue) {
+                Diag.event("Кадр \(c): " + q.verdict.map { $0.0 }.joined(separator: "; "))
+            }
         } else {
             lastQ = ["", "", "", "", ""]
         }
