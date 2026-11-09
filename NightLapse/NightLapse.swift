@@ -1079,6 +1079,9 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
     /// Баланс белого зафиксирован на съёмку: авто не прыгает от кадра к кадру
     private var wbHeld = false
+    /// Ночной баланс подогнан по небу на настоящем кадре (при подборе света кадр ещё чёрный, по нему цвет не измерить)
+    private var wbTuned = false
+    private var wbTuneTries = 0
 
     /// queue: после подбора света замораживаем баланс белого, как делают в профессиональных таймлапсах
     private func plHoldWB() {
@@ -1087,18 +1090,6 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         guard (try? dev.lockForConfiguration()) != nil else { return }
         var g = dev.deviceWhiteBalanceGains
         let m = dev.maxWhiteBalanceGain
-        if plNight, let c = plSkyChannels() {
-            // Ночное небо должно быть холодно-синим, а не зелёным: подгоняем коэффициенты под нейтрально-синий оттенок (по эталонному небу R:G:B = 0.97:1:1.27 в кодах, в линейном свете 0.94:1:1.65)
-            let lr = pow(Double(c.r), 2.2), lg = pow(Double(c.g), 2.2), lb = pow(Double(c.b), 2.2)
-            if lr > 0.5, lg > 0.5, lb > 0.5 {
-                let kr = min(max(0.94 * lg / lr, 0.5), 2.0), kb = min(max(1.65 * lg / lb, 0.5), 2.5)
-                g.redGain = Float(Double(g.redGain) * kr)
-                g.blueGain = Float(Double(g.blueGain) * kb)
-                let lo = min(g.redGain, g.greenGain, g.blueGain)
-                if lo > 0 { g.redGain /= lo; g.greenGain /= lo; g.blueGain /= lo }
-                Diag.event(String(format: "Небо до баланса: R %.0f G %.0f B %.0f, поправка R %.2f B %.2f", c.r, c.g, c.b, kr, kb))
-            }
-        }
         g.redGain = min(max(g.redGain, 1), m)
         g.greenGain = min(max(g.greenGain, 1), m)
         g.blueGain = min(max(g.blueGain, 1), m)
@@ -1111,6 +1102,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     /// queue: убрать фото-выход
     private func plStop() {
         wbHeld = false
+        wbTuned = false
+        wbTuneTries = 0
         plActive = false
         seriesAcc = []
         seriesMin = []
@@ -1398,9 +1391,33 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         plShoot()
     }
 
+    /// queue: ночью на первых настоящих кадрах подгоняем баланс по небу к эталону (R:G:B = 0.97:1:1.27 в кодах) и замораживаем снова
+    private func plTuneWB() {
+        guard plNight, wbHeld, !wbTuned, wbTuneTries < 6, let dev = device,
+              dev.isLockingWhiteBalanceWithCustomDeviceGainsSupported, let c = plSkyChannels() else { return }
+        wbTuneTries += 1
+        // Слишком тёмное небо: каналы в шуме, пробуем на следующем кадре
+        guard c.r > 6, c.g > 6, c.b > 6 else { return }
+        let lr = pow(Double(c.r), 2.2), lg = pow(Double(c.g), 2.2), lb = pow(Double(c.b), 2.2)
+        let kr = min(max(0.94 * lg / lr, 0.6), 1.8), kb = min(max(1.65 * lg / lb, 0.6), 2.2)
+        guard (try? dev.lockForConfiguration()) != nil else { return }
+        var g = dev.deviceWhiteBalanceGains
+        let m = dev.maxWhiteBalanceGain
+        g.redGain = Float(Double(g.redGain) * kr)
+        g.blueGain = Float(Double(g.blueGain) * kb)
+        let lo = min(g.redGain, g.greenGain, g.blueGain)
+        if lo > 0 { g.redGain /= lo; g.greenGain /= lo; g.blueGain /= lo }
+        g.redGain = min(max(g.redGain, 1), m); g.greenGain = min(max(g.greenGain, 1), m); g.blueGain = min(max(g.blueGain, 1), m)
+        dev.setWhiteBalanceModeLocked(with: g, completionHandler: nil)
+        dev.unlockForConfiguration()
+        wbTuned = true
+        Diag.event(String(format: "Небо до баланса: R %.0f G %.0f B %.0f, поправка R %.2f B %.2f, баланс теперь R %.2f G %.2f B %.2f", c.r, c.g, c.b, kr, kb, g.redGain, g.greenGain, g.blueGain))
+    }
+
     /// queue: среднее снимков -> кадр видео (или тест)
     private func plEmit() {
         trimSeries()
+        plTuneWB()
         let n = seriesEffN, w = seriesW, h = seriesH
         let t0 = CACurrentMediaTime()
         guard seriesN > 0, w > 0, h > 0 else {
