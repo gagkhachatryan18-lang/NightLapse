@@ -1087,6 +1087,18 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         guard (try? dev.lockForConfiguration()) != nil else { return }
         var g = dev.deviceWhiteBalanceGains
         let m = dev.maxWhiteBalanceGain
+        if plNight, let c = plSkyChannels() {
+            // Ночное небо должно быть холодно-синим, а не зелёным: подгоняем коэффициенты под нейтрально-синий оттенок (R:G:B = 0.85:1:1.12 в линейном свете)
+            let lr = pow(Double(c.r), 2.2), lg = pow(Double(c.g), 2.2), lb = pow(Double(c.b), 2.2)
+            if lr > 0.5, lg > 0.5, lb > 0.5 {
+                let kr = min(max(0.85 * lg / lr, 0.5), 2.0), kb = min(max(1.12 * lg / lb, 0.5), 2.0)
+                g.redGain = Float(Double(g.redGain) * kr)
+                g.blueGain = Float(Double(g.blueGain) * kb)
+                let lo = min(g.redGain, g.greenGain, g.blueGain)
+                if lo > 0 { g.redGain /= lo; g.greenGain /= lo; g.blueGain /= lo }
+                Diag.event(String(format: "Небо до баланса: R %.0f G %.0f B %.0f, поправка R %.2f B %.2f", c.r, c.g, c.b, kr, kb))
+            }
+        }
         g.redGain = min(max(g.redGain, 1), m)
         g.greenGain = min(max(g.greenGain, 1), m)
         g.blueGain = min(max(g.blueGain, 1), m)
@@ -1129,7 +1141,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
     /// Целевая яркость неба (0...255): ночью темнее, днём средне-серый, сдвиг по ☀︎
     private var plTarget: Float {
-        Float((plNight ? 75.0 : 118.0) * pow(2.0, Double(cfg.ev) / 2.2))
+        Float((plNight ? 60.0 : 118.0) * pow(2.0, Double(cfg.ev) / 2.2))
     }
 
     /// queue: выдержка и ISO снимков из подобранного света, начать снимки
@@ -1197,15 +1209,46 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         queue.asyncAfter(deadline: .now() + (changed ? 1.2 : 0.1)) { self.plCapture() }
     }
 
+    /// Средние R, G, B неба (0...255) по верхним 55% кадра
+    private func plSkyChannels() -> (r: Float, g: Float, b: Float)? {
+        let w = seriesW, rows = Int(Double(seriesH) * 0.55)
+        guard w > 0, rows > 0, seriesEffN > 0 else { return nil }
+        let div = Double(seriesEffN) * 257
+        var sr = 0.0, sg = 0.0, sb = 0.0, n = 0.0
+        var y = 0
+        while y < rows {
+            var x = 0
+            while x < w {
+                let i = (y * w + x) * 4
+                if i + 2 < seriesAcc.count {
+                    sr += Double(seriesAcc[i]); sg += Double(seriesAcc[i + 1]); sb += Double(seriesAcc[i + 2]); n += 1
+                }
+                x += 7
+            }
+            y += 4
+        }
+        guard n > 0 else { return nil }
+        return (Float(sr / n / div), Float(sg / n / div), Float(sb / n / div))
+    }
+
     /// Яркость среднего снимков: середина, 99.5% светлых точек и доля белого
     private func plStats() -> (median: Float, hi: Float, clip: Double) {
         let div = Float(seriesEffN) * 257
         var hist = [Int](repeating: 0, count: 256)
-        var i = 0
-        while i + 2 < seriesAcc.count {
-            let l = (Float(seriesAcc[i]) * 0.3 + Float(seriesAcc[i + 1]) * 0.59 + Float(seriesAcc[i + 2]) * 0.11) / div
-            hist[l.isFinite ? min(max(Int(l), 0), 255) : 0] += 1
-            i += 4 * 7
+        // Ночью мерим только небо (верхние 55% кадра): чёрная земля и зарево города у горизонта не должны тянуть подбор света
+        let w = max(seriesW, 1), rows = seriesH > 0 ? (plNight ? Int(Double(seriesH) * 0.55) : seriesH) : 0
+        var y = 0
+        while y < rows {
+            var x = 0
+            while x < w {
+                let i = (y * w + x) * 4
+                if i + 2 < seriesAcc.count {
+                    let l = (Float(seriesAcc[i]) * 0.3 + Float(seriesAcc[i + 1]) * 0.59 + Float(seriesAcc[i + 2]) * 0.11) / div
+                    hist[l.isFinite ? min(max(Int(l), 0), 255) : 0] += 1
+                }
+                x += 7
+            }
+            y += 4
         }
         let all = max(hist.reduce(0, +), 1)
         func pct(_ p: Double) -> Float {
