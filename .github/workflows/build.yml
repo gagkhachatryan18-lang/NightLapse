@@ -50,6 +50,27 @@ jobs:
             build 2>&1 | tee buildw.log
           ls buildw/Release-watchos || true
 
+      - name: Symbolicate crash
+        if: always()
+        shell: bash
+        run: |
+          P=build/Build/Products/Release-iphoneos
+          B=$P/NightLapse.app/NightLapse
+          ls $P
+          echo "::warning::UUID $(dwarfdump --uuid $B | tr '\n' ' ')"
+          D=$P/NightLapse.app.dSYM
+          T=$B; [ -d "$D" ] && T=$D/Contents/Resources/DWARF/NightLapse
+          for a in 0x56890 0x561e4 0xf869c; do
+            r=$(atos -o $T -arch arm64 -l 0x100000000 $(printf '0x%x' $((0x100000000 + a))) 2>&1)
+            echo "::warning::$a => $r"
+          done
+          nm -n $B | swift demangle | awk '{print}' > syms.txt || true
+          for a in 0x56890 0x561e4 0xf869c; do
+            v=$((0x100000000 + a))
+            best=$(awk -v v=$v '{ x=strtonum("0x"$1); if (x<=v) l=$0; else {print l; exit} }' syms.txt)
+            echo "::warning::nm $a => $best"
+          done
+
       - name: Package IPA
         if: always()
         shell: bash
