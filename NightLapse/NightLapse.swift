@@ -1088,10 +1088,10 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         var g = dev.deviceWhiteBalanceGains
         let m = dev.maxWhiteBalanceGain
         if plNight, let c = plSkyChannels() {
-            // Ночное небо должно быть холодно-синим, а не зелёным: подгоняем коэффициенты под нейтрально-синий оттенок (R:G:B = 0.85:1:1.12 в линейном свете)
+            // Ночное небо должно быть холодно-синим, а не зелёным: подгоняем коэффициенты под нейтрально-синий оттенок (по эталонному небу R:G:B = 0.97:1:1.27 в кодах, в линейном свете 0.94:1:1.65)
             let lr = pow(Double(c.r), 2.2), lg = pow(Double(c.g), 2.2), lb = pow(Double(c.b), 2.2)
             if lr > 0.5, lg > 0.5, lb > 0.5 {
-                let kr = min(max(0.85 * lg / lr, 0.5), 2.0), kb = min(max(1.12 * lg / lb, 0.5), 2.0)
+                let kr = min(max(0.94 * lg / lr, 0.5), 2.0), kb = min(max(1.65 * lg / lb, 0.5), 2.5)
                 g.redGain = Float(Double(g.redGain) * kr)
                 g.blueGain = Float(Double(g.blueGain) * kb)
                 let lo = min(g.redGain, g.greenGain, g.blueGain)
