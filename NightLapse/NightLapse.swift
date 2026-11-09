@@ -1101,6 +1101,9 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         wbHeld = false
         plActive = false
         seriesAcc = []
+        seriesMin = []
+        seriesMax = []
+        seriesPx = []
         session.beginConfiguration()
         if session.outputs.contains(photoOut) { session.removeOutput(photoOut) }
         session.commitConfiguration()
@@ -1179,7 +1182,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         plIsoUsed = iso
         curISO = iso
         curDur = CMTime(seconds: dur, preferredTimescale: 1_000_000)
-        seriesAcc = []
+        // Буферы серии не освобождаем между кадрами: seriesAdd обнулит их на первом снимке.
+        // Раньше 300-500 МБ выделялись и освобождались каждый кадр - память рвалась, и через минуты съёмки был вылет (SIGABRT в seriesAdd)
         seriesN = 0
         seriesTrim = false
         seriesWantTrim = count >= 5
@@ -1232,14 +1236,17 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     fileprivate func plShot(_ data: Data?) {
         queue.async {
             guard self.plActive else { return }
-            if let d = data, let src = CGImageSourceCreateWithData(d as CFData, nil),
-               let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, [
-                   kCGImageSourceCreateThumbnailFromImageAlways: true,
-                   kCGImageSourceCreateThumbnailWithTransform: true,
-                   kCGImageSourceThumbnailMaxPixelSize: 12000,
-               ] as CFDictionary) {
-                self.seriesAdd(cg)
-                self.plCheckExif(src)
+            // Снимок 12 Мп в памяти около 50 МБ: отпускаем сразу, не дожидаясь конца кадра
+            autoreleasepool {
+                if let d = data, let src = CGImageSourceCreateWithData(d as CFData, nil),
+                   let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, [
+                       kCGImageSourceCreateThumbnailFromImageAlways: true,
+                       kCGImageSourceCreateThumbnailWithTransform: true,
+                       kCGImageSourceThumbnailMaxPixelSize: 12000,
+                   ] as CFDictionary) {
+                    self.seriesAdd(cg)
+                    self.plCheckExif(src)
+                }
             }
             self.plLeft -= 1
             let done = self.plCount - self.plLeft
@@ -1344,7 +1351,6 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             plMetering = false
             plHoldWB()
         }
-        seriesAcc = []
         seriesN = 0
         plShoot()
     }
@@ -1369,7 +1375,9 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         // Сенсор на пределе, а темно - добираем усилением; светлые места (луна, облака под ней) не в белое
         let dev = device
         let maxed = dev.map { plIsoUsed >= $0.activeFormat.maxISO * 0.99 } ?? false
-        var want = min(max(plTarget / median, 0.8), maxed ? 8 : 1.25)
+        // Ночью на пределе сенсора добираем усилением. Чем больше снимков в серии, тем меньше зерна и полос - тем больше можно
+        let gainCap = maxed ? min(20, 8 * Float(max(seriesN, 1)).squareRoot()) : 1.25
+        var want = min(max(plTarget / median, 0.8), gainCap)
         want = min(want, max(0.5, 240 / hi))
         plGain = (plGain == 0 || plTest) ? want : plGain * 0.85 + want * 0.15
         let g = plGain
@@ -1386,7 +1394,6 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
                 }
             }
         }
-        seriesAcc = []
         guard let prov = CGDataProvider(data: Data(out) as CFData),
               let cg = CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: w * 4,
                                space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
@@ -1500,6 +1507,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     private var seriesWantTrim = false
     private var seriesTrim = false
     private var seriesMin: [UInt16] = []
+    /// Снимок в 16 битах - один буфер на всю съёмку
+    private var seriesPx: [UInt16] = []
     private var seriesMax: [UInt16] = []
     private var seriesAlign = false
     private var seriesAligner: Aligner?
@@ -1699,13 +1708,26 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         if seriesN == 0 {
             seriesW = cg.width
             seriesH = cg.height
-            seriesAcc = [UInt32](repeating: 0, count: seriesW * seriesH * 4)
+            let need = seriesW * seriesH * 4
+            if seriesAcc.count != need {
+                seriesAcc = []
+                seriesAcc = [UInt32](repeating: 0, count: need)
+            } else {
+                seriesAcc.withUnsafeMutableBytes { b in if let a = b.baseAddress { _ = memset(a, 0, b.count) } }
+            }
             seriesTrim = false
             seriesMargin = (0, 0, 0, 0)
             seriesAligner = nil
             if seriesWantTrim {
-                seriesMin = [UInt16](repeating: 0xFFFF, count: seriesAcc.count)
-                seriesMax = [UInt16](repeating: 0, count: seriesAcc.count)
+                if seriesMin.count != need || seriesMax.count != need {
+                    seriesMin = []
+                    seriesMax = []
+                    seriesMin = [UInt16](repeating: 0xFFFF, count: need)
+                    seriesMax = [UInt16](repeating: 0, count: need)
+                } else {
+                    seriesMin.withUnsafeMutableBytes { b in if let a = b.baseAddress { _ = memset(a, 0xFF, b.count) } }
+                    seriesMax.withUnsafeMutableBytes { b in if let a = b.baseAddress { _ = memset(a, 0, b.count) } }
+                }
             } else {
                 seriesMin = []
                 seriesMax = []
@@ -1724,8 +1746,15 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             seriesMargin.t = max(seriesMargin.t, -ty)
         }
         let drawRect = CGRect(x: tx, y: ty, width: w, height: h)
-        var px = [UInt16](repeating: 0, count: w * h * 4)
-        var ok: Bool = px.withUnsafeMutableBytes { b in
+        // Снимок другого размера, чем первый в серии, не складываем
+        guard cg.width == w, cg.height == h, seriesAcc.count == w * h * 4 else { return }
+        if seriesPx.count != w * h * 4 {
+            seriesPx = []
+            seriesPx = [UInt16](repeating: 0, count: w * h * 4)
+        } else {
+            seriesPx.withUnsafeMutableBytes { b in if let a = b.baseAddress { _ = memset(a, 0, b.count) } }
+        }
+        var ok: Bool = seriesPx.withUnsafeMutableBytes { b in
             guard let ctx = CGContext(data: b.baseAddress, width: w, height: h, bitsPerComponent: 16, bytesPerRow: w * 8,
                                       space: CGColorSpaceCreateDeviceRGB(),
                                       bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue | CGBitmapInfo.byteOrder16Little.rawValue) else { return false }
@@ -1742,12 +1771,12 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
                 ctx.draw(cg, in: drawRect)
                 return true
             }
-            if ok { for i in 0..<px.count { px[i] = UInt16(p8[i]) * 257 } }
+            if ok { for i in 0..<seriesPx.count { seriesPx[i] = UInt16(p8[i]) * 257 } }
         }
         guard ok else { return }
         if seriesWantTrim && seriesMin.count == seriesAcc.count {
             seriesAcc.withUnsafeMutableBufferPointer { a in
-                px.withUnsafeBufferPointer { p in
+                seriesPx.withUnsafeBufferPointer { p in
                     seriesMin.withUnsafeMutableBufferPointer { lo in
                         seriesMax.withUnsafeMutableBufferPointer { hi in
                             for i in 0..<a.count {
@@ -1762,7 +1791,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             }
         } else {
             seriesAcc.withUnsafeMutableBufferPointer { a in
-                px.withUnsafeBufferPointer { p in
+                seriesPx.withUnsafeBufferPointer { p in
                     for i in 0..<a.count { a[i] &+= UInt32(p[i]) }
                 }
             }
@@ -1782,8 +1811,6 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             }
         }
         seriesTrim = true
-        seriesMin = []
-        seriesMax = []
     }
 
     /// Рамка без пустых краёв после сдвигов (в координатах картинки сверху вниз)
@@ -5216,9 +5243,10 @@ extension LapseEngine {
         t.lens0 = dev.lensPosition
         if !UserDefaults.standard.flag("focusAuto", false) { t.lens0 = Float(UserDefaults.standard.dbl("focus", Double(dev.lensPosition))) }
         // Основная точка: при темноте 1 с и ISO по свету (не выше максимума), днём ISO около 100
-        let night = isNightLight(light)
+        // Ночью автоэкспозиция превью держит короткую выдержку и ISO выше максимума фото (6480 × 1/50 с) - это ночь, а не «свет 130»
+        let night = isNightLight(light) || dev.iso >= fmt.maxISO * 0.9
         let d0 = night ? dmax : min(dmax, max(lo, light / 100))
-        let iso0 = min(max(Float(light / d0), fmt.minISO), fmt.maxISO)
+        let iso0 = night ? fmt.maxISO : min(max(Float(light / d0), fmt.minISO), fmt.maxISO)
         t.d0 = d0
         t.iso0 = iso0
         t.info = String(format: "Свет по автоэкспозиции: ISO %.0f × %.4f с = %.0f (%@). Основная точка: %.3f с, ISO %.0f, фокус %.3f. Пределы: выдержка %.5f-%.2f с, ISO %.0f-%.0f",
@@ -5387,7 +5415,8 @@ extension LapseEngine {
             }
         }
         let foc = rows.filter { $0.step.group == "Фокус" }
-        let focQ = foc.filter { $0.q.stars >= 15 && $0.q.fwhm > 0 }
+        let focQ = foc.filter { $0.q.stars >= 50 && $0.q.fwhm > 0 && $0.m.median >= 3 }
+        if focQ.count < 3 && !foc.isEmpty { v.append("Фокус по звёздам: кадры слишком тёмные или звёзд мало - не оценить") }
         if focQ.count >= 3, let best = focQ.min(by: { $0.q.fwhm < $1.q.fwhm }), let worst = focQ.max(by: { $0.q.fwhm < $1.q.fwhm }) {
             v.append("Фокус по звёздам: лучший \(best.step.label) - звёзды \(f(best.q.fwhm, 1)) точки, нашлось \(best.q.stars); худший \(worst.step.label) - \(f(worst.q.fwhm, 1)) точки. "
                      + "Сейчас в приложении фокус \(f(Double(t.lens0), 2))" + (abs(best.step.lens - t.lens0) > 0.04 ? " - СТОИТ НЕ ТАМ" : " - ок"))
