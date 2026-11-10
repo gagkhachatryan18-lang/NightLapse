@@ -3032,6 +3032,28 @@ struct ExportSheet: View {
                         }
                         .pickerStyle(.segmented)
                     }
+                    if isVideo && frames > 1 {
+                        section("Длительность видео") {
+                            let rate = Double(opts.fps > 0 ? opts.fps : max(fps, 1))
+                            let orig = Double(frames) / Double(max(fps, 1))
+                            let lo = max(1.0, (Double(frames) / 120).rounded(.up))
+                            let hi = max(lo + 1, (Double(frames) / 8).rounded(.down))
+                            HStack {
+                                Text("исходно \(Int(orig.rounded())) с")
+                                    .font(.caption).foregroundStyle(.secondary)
+                                Spacer()
+                                Text("будет \(Int((Double(frames) / rate).rounded())) с")
+                                    .font(.headline)
+                            }
+                            Slider(value: Binding(get: { min(max(Double(frames) / rate, lo), hi) }, set: { d in
+                                let f = min(max(Int((Double(frames) / max(d, 1)).rounded()), 8), 120)
+                                opts.fps = f == fps ? 0 : f
+                                preset = nil
+                            }), in: lo...hi, step: 1)
+                            Text("Кадры не пересчитываются: меняется только скорость, качество то же")
+                                .font(.caption2).foregroundStyle(.secondary)
+                        }
+                    }
                     if isVideo {
                         section("Кадров в секунду") {
                             Picker("Кадров в секунду", selection: Binding(get: { opts.fps == 0 ? fps : opts.fps }, set: { v in

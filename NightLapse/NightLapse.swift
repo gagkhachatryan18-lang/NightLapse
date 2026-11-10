@@ -750,6 +750,8 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     private var framesDir: URL?
     private var videoIndex: Int64 = 0
     private var outIndex = 0
+    private var dropFirstFrame = false
+    private var dropped = false
     /// Starlapse трёх длин и фото со следами собираются прямо во время съёмки
     private struct LiveOut {
         let writer: AVAssetWriter
@@ -1467,7 +1469,10 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         if plTest { return plTestDone(pb, mean: mean, n: n) }
         width = CVPixelBufferGetWidth(pb)
         height = CVPixelBufferGetHeight(pb)
+        // Первый ночной кадр снят до подстройки баланса белого - в видео и в кадры его не берём
+        dropFirstFrame = plNight && outIndex == 0
         writeFrame(pb)
+        dropFirstFrame = false
         if outIndex == 1 { DispatchQueue.main.async { if self.phase == .recording { self.status = "Съёмка" } } }
         let ms = (CACurrentMediaTime() - t0) * 1000
         let since = recStartQ.map { Date().timeIntervalSince($0) } ?? 0
@@ -2407,6 +2412,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             self.framesDir = nil
             self.videoIndex = 0
             self.outIndex = 0
+            self.dropped = false
             self.live = []
             self.trailMax = nil
             self.nightFrames = 0
@@ -3447,7 +3453,10 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     }
 
     private func writeFrame(_ out: CVPixelBuffer) {
-        if cfg.saveVideo {
+        let drop = dropFirstFrame
+        let fileNo = outIndex + (drop ? 0 : (dropped ? 0 : 1))
+        if drop { dropped = true }
+        if cfg.saveVideo && !drop {
             if writer == nil { setupWriter() }
             if let input = writerInput, let ad = adaptor {
                 var tries = 0
@@ -3462,7 +3471,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             }
         }
 
-        if cfg.saveFrames {
+        if cfg.saveFrames && !drop {
             if framesDir == nil {
                 let dir = Self.docs().appendingPathComponent(cfg.name + "_frames", isDirectory: true)
                 try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -3478,7 +3487,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             if let dir = framesDir, let cs = CGColorSpace(name: CGColorSpace.sRGB) {
                 var img = CIImage(cvPixelBuffer: out)
                 if cfg.vertical { img = img.oriented(.right) }
-                let url = dir.appendingPathComponent(String(format: "frame_%05d.jpg", outIndex + 1))
+                let url = dir.appendingPathComponent(String(format: "frame_%05d.jpg", fileNo))
                 let q = CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String)
                 try? ci.writeJPEGRepresentation(of: img, to: url, colorSpace: cs, options: [q: 0.95])
             }
@@ -4195,7 +4204,7 @@ struct ContentView: View {
     }
 
     private var showStatus: Bool {
-        !idle || (e.status != "Готово" && !e.status.isEmpty)
+        !statusLine.isEmpty
     }
 
     /// Кнопки зума, как в Камере: круглые, выбранная жёлтая
@@ -4261,7 +4270,9 @@ struct ContentView: View {
     }
 
     private var statusLine: String {
-        var s = e.status
+        // Обычные подписи («Готовлюсь», «Снимаю», «Съёмка») не показываем - только важное
+        let routine: Set<String> = ["Готово", "Готовлюсь...", "Снимаю...", "Съёмка", "Фокусируюсь..."]
+        var s = routine.contains(e.status) ? "" : e.status
         if e.pauses > 0 && (e.phase == .recording || e.phase == .paused) { s += " · пауз: \(e.pauses)" }
         let cool = e.cooling && (e.phase == .recording || e.phase == .paused)
         if cool { s += " · нагрев: пауза +\(Int(e.coolExtra)) с" }
@@ -4269,6 +4280,7 @@ struct ContentView: View {
             s += " · сейчас \(expText(e.effExposure))"
         }
         if e.hot && !cool { s += " · телефон перегрет" }
+        if s.hasPrefix(" · ") { s = String(s.dropFirst(3)) }
         return s
     }
 
