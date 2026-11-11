@@ -751,6 +751,7 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     private var videoIndex: Int64 = 0
     private var outIndex = 0
     private var dropFirstFrame = false
+    private var dawnRefLight = 0.0
     private var dropped = false
     /// Starlapse трёх длин и фото со следами собираются прямо во время съёмки
     private struct LiveOut {
@@ -3502,7 +3503,12 @@ final class LapseEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             lastQ = q.csv
             // Звёзды и фокус по звёздам - только ночью (днём «звёзды» - это снег, капли, блики)
             if (c == 1 || c % 50 == 0) && (plNight || cfg.scene == LapseScene.stars.rawValue) {
-                Diag.event("Кадр \(c): " + q.verdict.map { $0.0 }.joined(separator: "; "))
+                // Светает: небо подсвечено, звёзды тонут - оценка фокуса по ним врёт
+                let light = Double(curISO) * CMTimeGetSeconds(curDur)
+                if c == 1 { dawnRefLight = light }
+                let dawn = dawnRefLight > 0 && light < dawnRefLight * 0.5
+                let notes = q.verdict.map { $0.0 }.filter { !dawn || !$0.hasPrefix("Фокус") && !$0.hasPrefix("Мимо фокуса") && !$0.hasPrefix("Звёзды вытянуты") }
+                Diag.event("Кадр \(c): " + (dawn ? ["Светает - фокус по звёздам не оценить"] + notes : notes).joined(separator: "; "))
             }
         } else {
             lastQ = ["", "", "", "", ""]
